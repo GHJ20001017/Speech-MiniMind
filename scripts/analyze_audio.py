@@ -38,21 +38,29 @@ def describe(audio: np.ndarray, sample_rate: int) -> None:
     print(f"peak_amplitude: {np.max(np.abs(audio)):.4f}")
     print(f"rms: {rms:.4f}")
     print(f"zero_crossing_rate: {zcr:.4f}")
+    print(f"fft_bins: {audio.size // 2 + 1} (real FFT, including DC)")
+    print(f"fft_frequency_resolution: {sample_rate / audio.size:.4f} Hz")
 
 
 def plot(audio: np.ndarray, sample_rate: int, output: Path) -> None:
     import matplotlib.pyplot as plt
 
     time = np.arange(audio.size) / sample_rate
-    figure, axes = plt.subplots(2, 1, figsize=(12, 6), constrained_layout=True)
-    axes[0].plot(time, audio, linewidth=0.5)
-    axes[0].set(title="Waveform", xlabel="Time (s)", ylabel="Amplitude")
-
-    spectrum = np.abs(np.fft.rfft(audio * np.hanning(audio.size)))
+    window = np.hanning(audio.size)
+    windowed_audio = audio * window
+    spectrum = np.abs(np.fft.rfft(windowed_audio))
     frequencies = np.fft.rfftfreq(audio.size, 1 / sample_rate)
-    axes[1].plot(frequencies, 20 * np.log10(np.maximum(spectrum, 1e-8)), linewidth=0.5)
-    axes[1].set(title="Magnitude spectrum", xlabel="Frequency (Hz)", ylabel="Magnitude (dB)")
-    axes[1].set_xlim(0, min(sample_rate / 2, 8000))
+
+    figure, axes = plt.subplots(4, 1, figsize=(12, 10), constrained_layout=True)
+    axes[0].plot(time, audio, linewidth=0.5)
+    axes[0].set(title="1. Normalized waveform (time domain)", xlabel="Time (s)", ylabel="Amplitude")
+    axes[1].plot(time, window, linewidth=0.8, color="tab:orange")
+    axes[1].set(title="2. Hann window applied before FFT", xlabel="Time (s)", ylabel="Window value")
+    axes[2].plot(time, windowed_audio, linewidth=0.5, color="tab:green")
+    axes[2].set(title="3. Windowed waveform (the actual FFT input)", xlabel="Time (s)", ylabel="Amplitude")
+    axes[3].plot(frequencies, 20 * np.log10(np.maximum(spectrum, 1e-8)), linewidth=0.5)
+    axes[3].set(title="4. Magnitude spectrum |FFT(x)| in dB", xlabel="Frequency (Hz)", ylabel="Magnitude (dB)")
+    axes[3].set_xlim(0, min(sample_rate / 2, 8000))
     figure.savefig(output, dpi=150)
     print(f"plot_saved: {output}")
 
