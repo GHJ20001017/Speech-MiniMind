@@ -52,11 +52,12 @@ def plot(audio: np.ndarray, sample_rate: int, output: Path, frame_ms: float) -> 
     frame = audio[:frame_size]
     window = np.hanning(frame_size)
     windowed_frame = frame * window
-    spectrum = np.abs(np.fft.rfft(windowed_frame))
+    fft_values = np.fft.rfft(windowed_frame)
+    spectrum = np.abs(fft_values)
     frequencies = np.fft.rfftfreq(frame_size, 1 / sample_rate)
     frame_time = np.arange(frame_size) * 1000 / sample_rate
 
-    figure, axes = plt.subplots(4, 1, figsize=(12, 10), constrained_layout=True)
+    figure, axes = plt.subplots(5, 1, figsize=(12, 12), constrained_layout=True)
     axes[0].plot(time, audio, linewidth=0.5)
     axes[0].set(title="1. Normalized waveform (time domain)", xlabel="Time (s)", ylabel="Amplitude")
     axes[1].plot(frame_time, frame, linewidth=0.8, label="waveform")
@@ -71,9 +72,15 @@ def plot(audio: np.ndarray, sample_rate: int, output: Path, frame_ms: float) -> 
     step = max(1, frame_size // 80)
     axes[2].scatter(frame_time[::step], windowed_frame[::step], s=8, color="tab:green")
     axes[2].set(title="3. Windowed samples (actual FFT input)", xlabel="Time (ms)", ylabel="Amplitude")
-    axes[3].plot(frequencies, 20 * np.log10(np.maximum(spectrum, 1e-8)), linewidth=0.8)
-    axes[3].set(title=f"4. FFT of one frame (bin spacing: {sample_rate / frame_size:.1f} Hz)", xlabel="Frequency (Hz)", ylabel="Magnitude (dB re 1.0)")
+    axes[3].plot(frequencies, fft_values.real, linewidth=0.8, label="real part: cosine match")
+    axes[3].plot(frequencies, fft_values.imag, linewidth=0.8, label="imaginary part: sine match")
+    axes[3].axhline(0, color="0.4", linewidth=0.5)
+    axes[3].set(title="4. FFT output: one complex value per frequency bin", xlabel="Frequency (Hz)", ylabel="Coefficient value")
+    axes[3].legend(loc="upper right")
     axes[3].set_xlim(0, min(sample_rate / 2, 8000))
+    axes[4].plot(frequencies, 20 * np.log10(np.maximum(spectrum, 1e-8)), linewidth=0.8)
+    axes[4].set(title=f"5. Magnitude = sqrt(real² + imag²), bin spacing: {sample_rate / frame_size:.1f} Hz", xlabel="Frequency (Hz)", ylabel="Magnitude (dB re 1.0)")
+    axes[4].set_xlim(0, min(sample_rate / 2, 8000))
     figure.savefig(output, dpi=150)
     print(f"plot_saved: {output}")
 
