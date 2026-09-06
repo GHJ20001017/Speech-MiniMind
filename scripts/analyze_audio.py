@@ -62,6 +62,11 @@ def main() -> None:
     parser.add_argument("audio", type=Path, help="path to a 16-bit PCM WAV file")
     parser.add_argument("--plot", type=Path, help="optional output PNG path")
     args = parser.parse_args()
+    if not args.audio.is_file():
+        parser.error(
+            f"audio file not found: {args.audio}\n"
+            "Use a real WAV path; 'path/to/example.wav' is only a placeholder."
+        )
     audio, sample_rate = read_wav(args.audio)
     describe(audio, sample_rate)
     if args.plot:
