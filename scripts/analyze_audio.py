@@ -25,7 +25,7 @@ def read_wav(path: Path) -> tuple[np.ndarray, int]:
     return audio, sample_rate
 
 
-def describe(audio: np.ndarray, sample_rate: int) -> None:
+def describe(audio: np.ndarray, sample_rate: int, frame_ms: float) -> None:
     if audio.size == 0:
         raise ValueError("the WAV file contains no samples")
     zero_crossings = np.count_nonzero(np.signbit(audio[1:]) != np.signbit(audio[:-1]))
@@ -38,28 +38,41 @@ def describe(audio: np.ndarray, sample_rate: int) -> None:
     print(f"peak_amplitude: {np.max(np.abs(audio)):.4f}")
     print(f"rms: {rms:.4f}")
     print(f"zero_crossing_rate: {zcr:.4f}")
-    print(f"fft_bins: {audio.size // 2 + 1} (real FFT, including DC)")
-    print(f"fft_frequency_resolution: {sample_rate / audio.size:.4f} Hz")
+    frame_size = min(audio.size, max(2, round(sample_rate * frame_ms / 1000)))
+    print(f"analysis_frame: {frame_size} samples ({frame_size / sample_rate * 1000:.2f} ms)")
+    print(f"fft_bins: {frame_size // 2 + 1} (real FFT, including DC)")
+    print(f"fft_frequency_resolution: {sample_rate / frame_size:.2f} Hz")
 
 
-def plot(audio: np.ndarray, sample_rate: int, output: Path) -> None:
+def plot(audio: np.ndarray, sample_rate: int, output: Path, frame_ms: float) -> None:
     import matplotlib.pyplot as plt
 
     time = np.arange(audio.size) / sample_rate
-    window = np.hanning(audio.size)
-    windowed_audio = audio * window
-    spectrum = np.abs(np.fft.rfft(windowed_audio))
-    frequencies = np.fft.rfftfreq(audio.size, 1 / sample_rate)
+    frame_size = min(audio.size, max(2, round(sample_rate * frame_ms / 1000)))
+    frame = audio[:frame_size]
+    window = np.hanning(frame_size)
+    windowed_frame = frame * window
+    spectrum = np.abs(np.fft.rfft(windowed_frame))
+    frequencies = np.fft.rfftfreq(frame_size, 1 / sample_rate)
+    frame_time = np.arange(frame_size) * 1000 / sample_rate
 
     figure, axes = plt.subplots(4, 1, figsize=(12, 10), constrained_layout=True)
     axes[0].plot(time, audio, linewidth=0.5)
     axes[0].set(title="1. Normalized waveform (time domain)", xlabel="Time (s)", ylabel="Amplitude")
-    axes[1].plot(time, window, linewidth=0.8, color="tab:orange")
-    axes[1].set(title="2. Hann window applied before FFT", xlabel="Time (s)", ylabel="Window value")
-    axes[2].plot(time, windowed_audio, linewidth=0.5, color="tab:green")
-    axes[2].set(title="3. Windowed waveform (the actual FFT input)", xlabel="Time (s)", ylabel="Amplitude")
-    axes[3].plot(frequencies, 20 * np.log10(np.maximum(spectrum, 1e-8)), linewidth=0.5)
-    axes[3].set(title="4. Magnitude spectrum |FFT(x)| in dB", xlabel="Frequency (Hz)", ylabel="Magnitude (dB)")
+    axes[1].plot(frame_time, frame, linewidth=0.8, label="waveform")
+    axes[1].set(title=f"2. First {frame_ms:g} ms: signal and Hann window", xlabel="Time (ms)", ylabel="Waveform amplitude")
+    window_axis = axes[1].twinx()
+    window_axis.plot(frame_time, window, linewidth=1.5, color="tab:orange", label="Hann window")
+    window_axis.set_ylabel("Window weight", color="tab:orange")
+    window_axis.tick_params(axis="y", labelcolor="tab:orange")
+    axes[1].legend(loc="upper left")
+    window_axis.legend(loc="upper right")
+    axes[2].plot(frame_time, windowed_frame, linewidth=0.8, color="tab:green")
+    step = max(1, frame_size // 80)
+    axes[2].scatter(frame_time[::step], windowed_frame[::step], s=8, color="tab:green")
+    axes[2].set(title="3. Windowed samples (actual FFT input)", xlabel="Time (ms)", ylabel="Amplitude")
+    axes[3].plot(frequencies, 20 * np.log10(np.maximum(spectrum, 1e-8)), linewidth=0.8)
+    axes[3].set(title=f"4. FFT of one frame (bin spacing: {sample_rate / frame_size:.1f} Hz)", xlabel="Frequency (Hz)", ylabel="Magnitude (dB)")
     axes[3].set_xlim(0, min(sample_rate / 2, 8000))
     figure.savefig(output, dpi=150)
     print(f"plot_saved: {output}")
@@ -69,17 +82,20 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("audio", type=Path, help="path to a 16-bit PCM WAV file")
     parser.add_argument("--plot", type=Path, help="optional output PNG path")
+    parser.add_argument("--frame-ms", type=float, default=25.0, help="analysis frame length for the teaching plot (default: 25 ms)")
     args = parser.parse_args()
+    if args.frame_ms <= 0:
+        parser.error("--frame-ms must be greater than 0")
     if not args.audio.is_file():
         parser.error(
             f"audio file not found: {args.audio}\n"
             "Use a real WAV path; 'path/to/example.wav' is only a placeholder."
         )
     audio, sample_rate = read_wav(args.audio)
-    describe(audio, sample_rate)
+    describe(audio, sample_rate, args.frame_ms)
     if args.plot:
         args.plot.parent.mkdir(parents=True, exist_ok=True)
-        plot(audio, sample_rate, args.plot)
+        plot(audio, sample_rate, args.plot, args.frame_ms)
 
 
 if __name__ == "__main__":

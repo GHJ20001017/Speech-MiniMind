@@ -162,6 +162,13 @@ f[k] = k * sample_rate / N
 python scripts/analyze_audio.py examples/disgusted_to_happy.wav --plot outputs/example.png
 ```
 
+为了避免把 12 秒长音频和窗函数画在同一尺度上，图表将“整体”和“局部”分开。默认放大第一个 25 ms 窗口；可以用 `--frame-ms` 修改窗口长度：
+
+```bash
+python scripts/analyze_audio.py examples/disgusted_to_happy.wav \
+  --frame-ms 25 --plot outputs/example.png
+```
+
 图中四个面板依次展示：
 
 ```text
@@ -176,10 +183,10 @@ PCM 整数采样点
 幅度频谱 |X[k]|
 ```
 
-1. **Normalized waveform**：从 PCM 整数归一化得到的 `x[n]`。
-2. **Hann window**：即将乘到波形上的 `w[n]`。
-3. **Windowed waveform**：FFT 的真实输入 `x[n] * w[n]`。
-4. **Magnitude spectrum**：FFT 结果取绝对值得到的 `|X[k]|`，并转为 dB 绘制。
+1. **整体波形**：先看到完整音频中哪里有语音、哪里接近静音。
+2. **25 ms 局部波形和 Hann 窗**：把同一时间轴上的原始采样值与窗权重放在一起比较。
+3. **加窗后的采样点**：散点让初学者看到 FFT 输入确实是一组离散数字，而不是连续曲线。
+4. **单帧频谱**：标题直接显示 bin 间距，帮助理解窗口长度如何决定频率分辨率。
 
 终端还会打印采样率、采样点数量、时长、峰值振幅、RMS、过零率、FFT bin 数和频率分辨率。
 
