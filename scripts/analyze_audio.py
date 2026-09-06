@@ -72,7 +72,7 @@ def plot(audio: np.ndarray, sample_rate: int, output: Path, frame_ms: float) -> 
     axes[2].scatter(frame_time[::step], windowed_frame[::step], s=8, color="tab:green")
     axes[2].set(title="3. Windowed samples (actual FFT input)", xlabel="Time (ms)", ylabel="Amplitude")
     axes[3].plot(frequencies, 20 * np.log10(np.maximum(spectrum, 1e-8)), linewidth=0.8)
-    axes[3].set(title=f"4. FFT of one frame (bin spacing: {sample_rate / frame_size:.1f} Hz)", xlabel="Frequency (Hz)", ylabel="Magnitude (dB)")
+    axes[3].set(title=f"4. FFT of one frame (bin spacing: {sample_rate / frame_size:.1f} Hz)", xlabel="Frequency (Hz)", ylabel="Magnitude (dB re 1.0)")
     axes[3].set_xlim(0, min(sample_rate / 2, 8000))
     figure.savefig(output, dpi=150)
     print(f"plot_saved: {output}")
