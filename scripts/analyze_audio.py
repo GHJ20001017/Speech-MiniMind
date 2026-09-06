@@ -127,7 +127,9 @@ def animate_stft(audio: np.ndarray, sample_rate: int, output: Path, frame_ms: fl
     time = np.arange(audio.size) / sample_rate
     axes[0].plot(time, audio, linewidth=0.5, color="0.35")
     axes[0].set(title="1. Sliding analysis window", xlabel="Time (s)", ylabel="Amplitude")
-    window_line = axes[0].axvspan(0, frame_size / sample_rate, color="tab:orange", alpha=0.35)
+    window_start = axes[0].axvline(0, color="tab:orange", linewidth=2, label="window start")
+    window_end = axes[0].axvline(frame_size / sample_rate, color="tab:red", linewidth=2, label="window end")
+    axes[0].legend(loc="upper right")
     axes[0].set_xlim(0, time[-1])
     frame_axis = axes[1]
     frame_axis.set(title="2. Current frame and its spectrum", xlabel="Frequency (Hz)", ylabel="Magnitude (dB)")
@@ -141,15 +143,14 @@ def animate_stft(audio: np.ndarray, sample_rate: int, output: Path, frame_ms: fl
 
     def update(position: int):
         index = int(frame_indices[position])
-        start = index * hop_size
-        end = min(start + frame_size, audio.size)
-        window_line.set_xy([[times[index], 0], [times[index], 1], [times[index] + frame_size / sample_rate, 1], [times[index] + frame_size / sample_rate, 0], [times[index], 0]])
+        window_start.set_xdata([times[index], times[index]])
+        window_end.set_xdata([times[index] + frame_size / sample_rate, times[index] + frame_size / sample_rate])
         spectrum_line.set_data(frequencies, db[index])
         accumulated = np.full_like(db.T, min_db)
         accumulated[:, : index + 1] = db[: index + 1].T
         image.set_data(accumulated)
         axes[0].set_title(f"1. Sliding analysis window: frame {index + 1}/{len(times)} ({times[index]:.2f} s)")
-        return window_line, spectrum_line, image
+        return window_start, window_end, spectrum_line, image
 
     animation = FuncAnimation(figure, update, frames=len(frame_indices), interval=1000 / max(fps, 1), blit=False)
     animation.save(output, writer=PillowWriter(fps=fps))
