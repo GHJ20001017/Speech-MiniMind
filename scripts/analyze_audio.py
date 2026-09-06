@@ -110,18 +110,70 @@ def plot_stft(audio: np.ndarray, sample_rate: int, output: Path, frame_ms: float
     print(f"stft_plot_saved: {output}")
 
 
+def animate_stft(audio: np.ndarray, sample_rate: int, output: Path, frame_ms: float, hop_ms: float, fps: int) -> None:
+    import matplotlib.pyplot as plt
+    from matplotlib.animation import FuncAnimation, PillowWriter
+
+    spectra, times, frequencies = stft(audio, sample_rate, frame_ms, hop_ms)
+    frame_size = max(2, round(sample_rate * frame_ms / 1000))
+    hop_size = max(1, round(sample_rate * hop_ms / 1000))
+    window = np.hanning(frame_size)
+    db = 20 * np.log10(np.maximum(spectra, 1e-8))
+    frame_indices = np.unique(np.linspace(0, len(times) - 1, min(len(times), 240), dtype=int))
+    max_db = float(np.max(db))
+    min_db = max_db - 80
+
+    figure, axes = plt.subplots(3, 1, figsize=(12, 9), constrained_layout=True)
+    time = np.arange(audio.size) / sample_rate
+    axes[0].plot(time, audio, linewidth=0.5, color="0.35")
+    axes[0].set(title="1. Sliding analysis window", xlabel="Time (s)", ylabel="Amplitude")
+    window_line = axes[0].axvspan(0, frame_size / sample_rate, color="tab:orange", alpha=0.35)
+    axes[0].set_xlim(0, time[-1])
+    frame_axis = axes[1]
+    frame_axis.set(title="2. Current frame and its spectrum", xlabel="Frequency (Hz)", ylabel="Magnitude (dB)")
+    spectrum_line, = frame_axis.plot([], [], color="tab:blue")
+    frame_axis.set_xlim(0, min(sample_rate / 2, 8000))
+    frame_axis.set_ylim(min_db, max_db + 3)
+    image = axes[2].imshow(np.full_like(db.T, min_db), origin="lower", aspect="auto", extent=[times[0], times[-1], frequencies[0], frequencies[-1]], cmap="magma", vmin=min_db, vmax=max_db)
+    axes[2].set(title="3. STFT columns accumulated over time", xlabel="Time (s)", ylabel="Frequency (Hz)")
+    axes[2].set_ylim(0, min(sample_rate / 2, 8000))
+    figure.colorbar(image, ax=axes[2], label="Magnitude (dB)")
+
+    def update(position: int):
+        index = int(frame_indices[position])
+        start = index * hop_size
+        end = min(start + frame_size, audio.size)
+        window_line.set_xy([[times[index], 0], [times[index], 1], [times[index] + frame_size / sample_rate, 1], [times[index] + frame_size / sample_rate, 0], [times[index], 0]])
+        spectrum_line.set_data(frequencies, db[index])
+        accumulated = np.full_like(db.T, min_db)
+        accumulated[:, : index + 1] = db[: index + 1].T
+        image.set_data(accumulated)
+        axes[0].set_title(f"1. Sliding analysis window: frame {index + 1}/{len(times)} ({times[index]:.2f} s)")
+        return window_line, spectrum_line, image
+
+    animation = FuncAnimation(figure, update, frames=len(frame_indices), interval=1000 / max(fps, 1), blit=False)
+    animation.save(output, writer=PillowWriter(fps=fps))
+    plt.close(figure)
+    print(f"stft_animation_frames: {len(frame_indices)}")
+    print(f"stft_animation_saved: {output}")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("audio", type=Path, help="path to a 16-bit PCM WAV file")
     parser.add_argument("--plot", type=Path, help="optional output PNG path")
     parser.add_argument("--stft-plot", type=Path, help="optional STFT spectrogram PNG path")
+    parser.add_argument("--stft-gif", type=Path, help="optional animated STFT GIF path")
     parser.add_argument("--frame-ms", type=float, default=25.0, help="analysis frame length for the teaching plot (default: 25 ms)")
     parser.add_argument("--hop-ms", type=float, default=10.0, help="STFT hop length in milliseconds (default: 10 ms)")
+    parser.add_argument("--fps", type=int, default=12, help="frames per second for --stft-gif (default: 12)")
     args = parser.parse_args()
     if args.frame_ms <= 0:
         parser.error("--frame-ms must be greater than 0")
     if args.hop_ms <= 0:
         parser.error("--hop-ms must be greater than 0")
+    if args.fps <= 0:
+        parser.error("--fps must be greater than 0")
     if not args.audio.is_file():
         parser.error(
             f"audio file not found: {args.audio}\n"
@@ -135,6 +187,9 @@ def main() -> None:
     if args.stft_plot:
         args.stft_plot.parent.mkdir(parents=True, exist_ok=True)
         plot_stft(audio, sample_rate, args.stft_plot, args.frame_ms, args.hop_ms)
+    if args.stft_gif:
+        args.stft_gif.parent.mkdir(parents=True, exist_ok=True)
+        animate_stft(audio, sample_rate, args.stft_gif, args.frame_ms, args.hop_ms, args.fps)
 
 
 if __name__ == "__main__":

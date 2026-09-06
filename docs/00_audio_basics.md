@@ -273,3 +273,12 @@ python scripts/analyze_audio.py examples/disgusted_to_happy.wav \
 这张图比整段音频的一维频谱更适合语音，因为它能显示元音、辅音和停顿在不同时间出现的频率变化。终端会打印类似 `stft_shape: (1274, 301)` 的信息，分别表示帧数和每帧的频率 bin 数。
 
 改变 `--hop-ms` 可以观察时间采样密度的变化；改变 `--frame-ms` 可以观察频率分辨率和时间分辨率之间的折中。下一步会在 STFT 之上实现 Mel 滤波器组和 log-Mel 频谱。
+
+如果只看静态图，仍然看不到“窗口是如何移动的”。可以生成一个教学动画：
+
+```bash
+python scripts/analyze_audio.py examples/disgusted_to_happy.wav \
+  --stft-gif outputs/stft_process.gif
+```
+
+动画中，橙色区域沿着完整波形向右移动；每移动一次，就对当前 25 ms 片段加窗并计算一次 FFT；下方时频图随之增加一列。为了控制文件大小，脚本默认从全部窗口中均匀抽取最多 240 帧用于 GIF 展示，数值计算仍然覆盖整段音频。
