@@ -144,13 +144,15 @@ def animate_stft(audio: np.ndarray, sample_rate: int, output: Path, frame_ms: fl
 
     def update(position: int):
         index = int(frame_indices[position])
-        window_start.set_xdata([times[index], times[index]])
-        window_end.set_xdata([times[index] + frame_size / sample_rate, times[index] + frame_size / sample_rate])
+        start_time = index * hop_size / sample_rate
+        end_time = start_time + frame_size / sample_rate
+        window_start.set_xdata([start_time, start_time])
+        window_end.set_xdata([end_time, end_time])
         spectrum_line.set_data(frequencies, db[index])
         accumulated = np.full_like(db.T, min_db)
         accumulated[:, : index + 1] = db[: index + 1].T
         image.set_data(accumulated)
-        axes[0].set_title(f"1. Sliding analysis window: frame {index + 1}/{len(times)} ({times[index]:.2f} s)")
+        axes[0].set_title(f"1. Sliding analysis window: frame {index + 1}/{len(times)} ({start_time:.2f}-{end_time:.2f} s)")
         return window_start, window_end, spectrum_line, image
 
     animation = FuncAnimation(figure, update, frames=len(frame_indices), interval=1000 / max(fps, 1), blit=False)
