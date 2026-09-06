@@ -119,11 +119,12 @@ def animate_stft(audio: np.ndarray, sample_rate: int, output: Path, frame_ms: fl
     hop_size = max(1, round(sample_rate * hop_ms / 1000))
     window = np.hanning(frame_size)
     db = 20 * np.log10(np.maximum(spectra, 1e-8))
-    frame_indices = np.unique(np.linspace(0, len(times) - 1, min(len(times), 240), dtype=int))
+    frame_indices = np.unique(np.linspace(0, len(times) - 1, min(len(times), 120), dtype=int))
     max_db = float(np.max(db))
     min_db = max_db - 80
 
-    figure, axes = plt.subplots(3, 1, figsize=(12, 9), constrained_layout=True)
+    figure, axes = plt.subplots(3, 1, figsize=(9, 6.75), constrained_layout=True)
+    figure.set_dpi(80)
     time = np.arange(audio.size) / sample_rate
     axes[0].plot(time, audio, linewidth=0.5, color="0.35")
     axes[0].set(title="1. Sliding analysis window", xlabel="Time (s)", ylabel="Amplitude")

@@ -26,4 +26,4 @@ python scripts/analyze_audio.py examples/disgusted_to_happy.wav \
 仓库自带的 `examples/disgusted_to_happy.wav` 是一个真实的 16-bit PCM WAV 示例。你也可以把命令中的路径替换为其他 WAV 文件。脚本会打印音频的采样率、时长、通道数、振幅范围、RMS 和过零率，并可生成波形与频谱图。音频文件不会被修改。
 
 使用 `--stft-plot` 会把音频切成默认 25 ms 窗口、10 ms 帧移的多个片段，生成随时间变化的 STFT 时频图。
-使用 `--stft-gif` 会生成动画：窗口沿波形移动，同时展示当前帧的频谱，并逐步累积 STFT 图。动画最多采样 240 个展示帧，避免 GIF 过大。
+使用 `--stft-gif` 会生成动画：窗口沿波形移动，同时展示当前帧的频谱，并逐步累积 STFT 图。动画最多采样 120 个展示帧，并使用适合教学预览的分辨率。
