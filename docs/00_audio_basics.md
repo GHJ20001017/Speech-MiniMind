@@ -248,3 +248,28 @@ STFT → |X|² → Mel filter bank → log-Mel spectrogram
 3. 将采样率改成 16 kHz，观察 Nyquist 频率和频谱范围的变化。
 4. 暂时去掉 Hann 窗，对比加窗前后的频谱泄漏。
 5. 对一段短纯音运行脚本，观察频谱峰值是否出现在预期频率附近。
+
+## 14. 第一个 STFT 时频图
+
+运行：
+
+```bash
+python scripts/analyze_audio.py examples/disgusted_to_happy.wav \
+  --stft-plot outputs/stft.png
+```
+
+脚本默认使用 25 ms 窗长和 10 ms 帧移。对每一个窗口，它都会重复执行：
+
+```text
+取出一帧 → 乘 Hann 窗 → rFFT → 取幅度
+```
+
+然后把所有帧的幅度频谱按照时间堆叠起来。结果是一张二维图：
+
+- 横轴：窗口中心的时间
+- 纵轴：频率
+- 颜色：该时间和频率上的幅度，颜色越亮表示能量越强
+
+这张图比整段音频的一维频谱更适合语音，因为它能显示元音、辅音和停顿在不同时间出现的频率变化。终端会打印类似 `stft_shape: (1274, 301)` 的信息，分别表示帧数和每帧的频率 bin 数。
+
+改变 `--hop-ms` 可以观察时间采样密度的变化；改变 `--frame-ms` 可以观察频率分辨率和时间分辨率之间的折中。下一步会在 STFT 之上实现 Mel 滤波器组和 log-Mel 频谱。

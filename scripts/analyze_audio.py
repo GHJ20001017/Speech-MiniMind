@@ -78,14 +78,50 @@ def plot(audio: np.ndarray, sample_rate: int, output: Path, frame_ms: float) -> 
     print(f"plot_saved: {output}")
 
 
+def stft(audio: np.ndarray, sample_rate: int, frame_ms: float, hop_ms: float) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Return magnitude spectra, frame-center times, and frequency bins."""
+    frame_size = max(2, round(sample_rate * frame_ms / 1000))
+    hop_size = max(1, round(sample_rate * hop_ms / 1000))
+    if audio.size < frame_size:
+        audio = np.pad(audio, (0, frame_size - audio.size))
+    frame_count = 1 + (audio.size - frame_size) // hop_size
+    window = np.hanning(frame_size)
+    frames = np.stack(
+        [audio[start : start + frame_size] * window for start in range(0, frame_count * hop_size, hop_size)]
+    )
+    spectra = np.abs(np.fft.rfft(frames, axis=1))
+    times = (np.arange(frame_count) * hop_size + frame_size / 2) / sample_rate
+    frequencies = np.fft.rfftfreq(frame_size, 1 / sample_rate)
+    return spectra, times, frequencies
+
+
+def plot_stft(audio: np.ndarray, sample_rate: int, output: Path, frame_ms: float, hop_ms: float) -> None:
+    import matplotlib.pyplot as plt
+
+    spectra, times, frequencies = stft(audio, sample_rate, frame_ms, hop_ms)
+    db = 20 * np.log10(np.maximum(spectra, 1e-8))
+    figure, axis = plt.subplots(figsize=(12, 6), constrained_layout=True)
+    image = axis.pcolormesh(times, frequencies, db.T, shading="auto", cmap="magma")
+    axis.set(title=f"STFT: {frame_ms:g} ms window, {hop_ms:g} ms hop ({spectra.shape[0]} frames)", xlabel="Time (s)", ylabel="Frequency (Hz)")
+    axis.set_ylim(0, min(sample_rate / 2, 8000))
+    figure.colorbar(image, ax=axis, label="Magnitude (dB)")
+    figure.savefig(output, dpi=150)
+    print(f"stft_shape: {spectra.shape} (frames, frequency_bins)")
+    print(f"stft_plot_saved: {output}")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("audio", type=Path, help="path to a 16-bit PCM WAV file")
     parser.add_argument("--plot", type=Path, help="optional output PNG path")
+    parser.add_argument("--stft-plot", type=Path, help="optional STFT spectrogram PNG path")
     parser.add_argument("--frame-ms", type=float, default=25.0, help="analysis frame length for the teaching plot (default: 25 ms)")
+    parser.add_argument("--hop-ms", type=float, default=10.0, help="STFT hop length in milliseconds (default: 10 ms)")
     args = parser.parse_args()
     if args.frame_ms <= 0:
         parser.error("--frame-ms must be greater than 0")
+    if args.hop_ms <= 0:
+        parser.error("--hop-ms must be greater than 0")
     if not args.audio.is_file():
         parser.error(
             f"audio file not found: {args.audio}\n"
@@ -96,6 +132,9 @@ def main() -> None:
     if args.plot:
         args.plot.parent.mkdir(parents=True, exist_ok=True)
         plot(audio, sample_rate, args.plot, args.frame_ms)
+    if args.stft_plot:
+        args.stft_plot.parent.mkdir(parents=True, exist_ok=True)
+        plot_stft(audio, sample_rate, args.stft_plot, args.frame_ms, args.hop_ms)
 
 
 if __name__ == "__main__":
