@@ -110,3 +110,15 @@ python scripts/train_audio_classifier.py \
 ```
 
 本章结束后，已经完成了“手工音频特征 → 神经网络 → 任务输出”的闭环。下一章可以把分类头替换成 CTC，并将每个时间帧映射到文字 token，开始真正的 ASR。
+
+## 6. 中文 Tiny Conformer 训练
+
+如果目标是训练后续可复用的中文编码器，请使用 AISHELL-1 的 CTC 任务：
+
+```bash
+python scripts/download_aishell1.py
+python scripts/prepare_aishell1.py
+python scripts/train_conformer_ctc.py --data data/aishell1/processed
+```
+
+当前配置是 4 层、hidden=256、4 个注意力头、卷积 kernel=31。训练脚本会打印实际参数量，CTC 输出层的大小会随 AISHELL-1 字符表变化。训练完成后，`tiny_conformer_ctc.pt` 中的 `model.encoder` 就是可以在后续任务中复用的中文声学编码器。正式评估时应在 AISHELL-1 dev/test 上计算 CER，而不是只看训练 loss。

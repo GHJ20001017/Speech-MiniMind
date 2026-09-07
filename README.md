@@ -8,7 +8,7 @@
 1. [语音基础](docs/00_audio_basics.md)：从 WAV、波形和频谱开始认识语音信号
 2. [Mel 频谱](docs/01_mel_spectrogram.md)：从 STFT 到 log-Mel 语音特征
 3. [声学编码器与音频分类](docs/02_acoustic_encoder.md)：第一次训练神经网络理解音频
-4. CTC/Attention 语音识别
+4. Tiny Conformer 中文 CTC 语音识别
 5. 音频表示接入 MiniMind 语言模型
 6. 语音指令微调与语音问答
 7. 流式推理与语音输出
@@ -34,4 +34,12 @@ python scripts/analyze_audio.py examples/disgusted_to_happy.wav \
 ```bash
 python scripts/make_audio_classification_dataset.py
 python scripts/train_audio_classifier.py --data data/audio_classification
+```
+
+AISHELL-1 中文 CTC 训练：
+
+```bash
+python scripts/download_aishell1.py
+python scripts/prepare_aishell1.py
+python scripts/train_conformer_ctc.py --data data/aishell1/processed
 ```
