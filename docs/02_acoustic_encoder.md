@@ -1,124 +1,174 @@
-# 02. 声学编码器：从 log-Mel 到音频分类
+# 02. 声学编码器：从 log-Mel 到中文语音识别
 
-前两章把音频变成了二维特征：
+前两章完成了信号处理部分：
 
 ```text
-音频 → STFT → Mel 滤波器组 → log-Mel
+WAV 波形 → 分帧加窗 → STFT → Mel 滤波器组 → log-Mel
 ```
 
-本章第一次把特征送进神经网络，完成一个最小的音频分类任务：判断 1 秒片段是 `speech` 还是 `non_speech`。
+本章把每一帧的 80 维 log-Mel 特征送入一个 Tiny Conformer，使用 AISHELL-1 中文语音数据集训练字符级 CTC 语音识别模型。目标不是立刻得到商用 ASR，而是把“声学特征 → 编码器 → 中文文字”的完整链路跑通。
 
-## 1. 数据集
+## 1. 准备环境
 
-为了让教程可以离线复现，数据集脚本使用仓库中的 `examples/disgusted_to_happy.wav`：
-
-- `speech=1`：从真实语音中随机裁剪 1 秒片段；
-- `non_speech=0`：生成不同频率的低幅纯音并叠加少量噪声。
-
-这不是用于发表结果的 benchmark，而是一个能让初学者看懂训练链路的 toy dataset。它的目的，是让模型先学会区分明显不同的声学模式。
-
-生成数据：
+本地开发环境：
 
 ```bash
-python scripts/make_audio_classification_dataset.py \
-  --source examples/disgusted_to_happy.wav \
-  --output data/audio_classification \
-  --clips-per-class 40
-```
-
-输出目录包括：
-
-```text
-data/audio_classification/
-├── speech_0000.wav ...
-├── non_speech_0000.wav ...
-├── train.csv
-└── valid.csv
-```
-
-manifest 中每一行记录音频路径、整数标签和类别名。固定随机种子后，数据可以重复生成。
-
-## 2. 单个样本的特征形状
-
-每个 1 秒、24 kHz 的音频片段经过和前面相同的参数：
-
-```text
-25 ms 窗口，10 ms 帧移，80 个 Mel 频带
-```
-
-得到约 99 个时间帧：
-
-```text
-一个样本：log-Mel.shape = (99, 80)
-一个 batch：features.shape = (batch, 99, 80)
-```
-
-第一维是时间，第二维是 Mel 频带。模型不会把整段 1 秒音频压成一个数字，而是先逐帧处理，再学习时间上下文。
-
-## 3. 模型结构
-
-本章使用一个容易追踪的声学编码器：
-
-```text
-(batch, time, 80)
-        ↓ Linear(80 → 128)
-(batch, time, 128)
-        ↓ ReLU + Linear(128 → 128)
-(batch, time, 128)
-        ↓ Conv1d(kernel=5)
-(batch, time, 128)
-        ↓ 沿时间取平均 mean(dim=1)
-(batch, 128)
-        ↓ Linear(128 → 2)
-(batch, 2) logits
-```
-
-`Conv1d(kernel=5)` 让每一帧可以利用附近约 5 帧的局部上下文；平均池化把可变长度的时间序列变成一个固定长度向量；最后的线性层输出两个类别的 logits。
-
-## 4. 训练
-
-先安装 PyTorch：
-
-```bash
+conda activate speech-llm
+cd Speech-MiniMind
 python -m pip install -r requirements.txt
 ```
 
-然后运行：
+95 服务器环境：
 
 ```bash
-python scripts/train_audio_classifier.py \
-  --data data/audio_classification \
-  --epochs 8
+source /gpu/anaconda3/etc/profile.d/conda.sh
+conda activate /gpu3/guhj/envs/speech-llm
+cd /gpu3/guhj/Speech-MiniMind
 ```
 
-每轮会输出训练 loss 和验证集准确率。交叉熵损失会比较模型输出的两个 logits 与真实标签，反向传播则更新 Linear 和 Conv1d 的参数。
+服务器环境包含 Python 3.12、PyTorch 2.10.0+cu128，并可以使用 A800 GPU。后文的 `python` 均指当前已经激活的环境。
 
-## 5. 从一个样本看完整链路
+## 2. 下载 AISHELL-1
 
-```text
-1 秒 WAV
-  → 读取、归一化
-  → 分帧、加窗、FFT
-  → 功率谱、Mel 聚合、log
-  → (99, 80) log-Mel
-  → Linear/Conv1d
-  → (99, 128) 隐藏表示
-  → 时间平均池化
-  → (128,) 音频向量
-  → 分类器
-  → [speech logit, non_speech logit]
-```
-
-本章结束后，已经完成了“手工音频特征 → 神经网络 → 任务输出”的闭环。下一章可以把分类头替换成 CTC，并将每个时间帧映射到文字 token，开始真正的 ASR。
-
-## 6. 中文 Tiny Conformer 训练
-
-如果目标是训练后续可复用的中文编码器，请使用 AISHELL-1 的 CTC 任务：
+AISHELL-1 是中文普通话朗读语料，包含训练、开发和测试划分。下载脚本从 OpenSLR 获取数据，并解压到 `data/aishell1`：
 
 ```bash
 python scripts/download_aishell1.py
-python scripts/prepare_aishell1.py
-python scripts/train_conformer_ctc.py --data data/aishell1/processed
 ```
 
-当前配置是 4 层、hidden=256、4 个注意力头、卷积 kernel=31。训练脚本会打印实际参数量，CTC 输出层的大小会随 AISHELL-1 字符表变化。训练完成后，`tiny_conformer_ctc.pt` 中的 `model.encoder` 就是可以在后续任务中复用的中文声学编码器。正式评估时应在 AISHELL-1 dev/test 上计算 CER，而不是只看训练 loss。
+脚本会创建 `.extracted` 标记，再次运行时不会重复解压。目录大致如下：
+
+```text
+data/aishell1/
+├── data_aishell/
+│   ├── wav/
+│   ├── transcript/
+│   └── resource_aishell/
+└── data_aishell.tgz
+```
+
+## 3. 生成 manifest 和词表
+
+训练脚本需要 CSV manifest 和字符词表：
+
+```bash
+python scripts/prepare_aishell1.py
+```
+
+结果位于 `data/aishell1/processed`：
+
+```text
+processed/
+├── train.csv
+├── dev.csv
+├── test.csv
+└── vocab.txt
+```
+
+每一行 CSV 记录音频路径和中文文本。`vocab.txt` 是字符级词表，第 0 行固定为 `<blank>`，这是 CTC 使用的空白符；后面的每一行是一个汉字。模型直接学习“声学帧 → 汉字序列”，不需要先做分词。
+
+## 4. 一条样本如何变成模型输入
+
+训练时沿用前面章节的参数：
+
+```text
+采样率       16 kHz（AISHELL-1 原始音频）
+窗口长度     25 ms = 400 个采样点
+帧移         10 ms = 160 个采样点
+Mel 频带数   80
+```
+
+一段音频会得到二维矩阵：
+
+```text
+log-Mel.shape = (帧数, 80)
+batch.shape   = (batch_size, 最大帧数, 80)
+```
+
+不同音频时长不同，组成 batch 时会在末尾补零，并保留每个样本的真实帧数。padding mask 会告诉注意力层哪些位置是补出来的，避免补零帧参与计算。
+
+## 5. Tiny Conformer 结构
+
+当前配置约 9M 参数，便于单张 GPU 训练，也保留后续复用价值：
+
+```text
+(batch, time, 80) log-Mel
+        ↓ 两层 Conv2d(kernel=3, stride=2)
+(batch, time/4, 19, 256)
+        ↓ 展平频率维 + Linear
+(batch, time/4, 256)
+        ↓ 4 个 Conformer block
+(batch, time/4, 256)
+        ↓ Linear(vocab_size)
+(batch, time/4, vocab_size) logits
+```
+
+每个 block 包含半步前馈网络、Multi-Head Self-Attention、深度可分离卷积、半步前馈网络和 LayerNorm。
+
+| 参数 | 当前值 |
+|---|---:|
+| Conformer 层数 | 4 |
+| hidden dimension | 256 |
+| 注意力头数 | 4 |
+| FFN dimension | 1024 |
+| 卷积 kernel size | 31 |
+| 时间下采样 | 4 倍 |
+| 总参数量 | 约 9.2M（随词表大小变化） |
+
+下采样不是简单地把长度除以 4。两次无 padding 卷积的真实输出长度是：
+
+```text
+L1 = floor((L - 3) / 2) + 1
+L2 = floor((L1 - 3) / 2) + 1
+```
+
+训练脚本使用这个长度传给 CTC，保证变长音频的损失计算正确。
+
+## 6. CTC 在解决什么问题
+
+音频帧数通常比汉字数多，但数据集没有标出每个汉字对应哪些帧。CTC 允许模型输出更长的帧级序列，其中可以出现 `<blank>` 和重复字符；解码时合并连续重复并删除 blank：
+
+```text
+帧级输出：我  <blank>  我  爱  <blank>  北  京
+CTC 解码：我爱北京
+```
+
+训练时，`CTCLoss` 比较整段帧级 logits 和目标汉字序列，自动汇总所有可能的对齐路径。因此只需要音频级文本，不需要人工标注每个字的起止时间。
+
+## 7. 开始训练
+
+确认 `train.csv`、`vocab.txt` 已生成后运行：
+
+```bash
+python scripts/train_conformer_ctc.py \
+  --data data/aishell1/processed \
+  --epochs 20 \
+  --batch-size 8 \
+  --lr 2e-4
+```
+
+脚本会自动选择 CUDA，打印每轮 CTC loss，并保存：
+
+```text
+data/aishell1/processed/tiny_conformer_ctc.pt
+```
+
+checkpoint 包含 `model`（编码器和 CTC head 参数）及 `vocab`（字符到整数 id 的映射）。后续做语音理解时可以只加载 `model.encoder`，再替换任务头或接入 MiniMind。
+
+## 8. 如何判断训练是否有效
+
+训练 loss 下降只能说明模型拟合了训练集，不能代表识别准确率。下一步应补充贪心 CTC 解码，并在 `dev.csv`、`test.csv` 上计算 CER（字符错误率）：
+
+```text
+CER = (替换数 + 删除数 + 插入数) / 参考文本字符数
+```
+
+本章先完成可复现的训练闭环；评估脚本和 beam search 解码将在后续章节加入。
+
+## 9. 常见问题
+
+**显存不足怎么办？** 将 `--batch-size` 从 8 降到 4 或 2。长样本会决定一个 batch 的显存占用。
+
+**为什么没有 dev/test 训练循环？** 当前脚本是最小教学版本，只训练 `train.csv` 并保存 checkpoint；开发集和测试集留给后续 CER 评估。
+
+**为什么参数量不是固定的 8M？** CTC head 的参数量是 `hidden_dim × vocab_size`。词表不同，最终总参数量会略有变化；当前 AISHELL-1 配置约为 9.2M。
