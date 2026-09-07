@@ -48,7 +48,7 @@ AISHELL-1 压缩包约 15.6 GB，下载中断后直接重新运行下载命令�
 
 训练完成后，checkpoint 位于 `data/aishell1/processed/tiny_conformer_ctc.pt`。当前模型为 4 层、hidden=256、4 头注意力、约 9.2M 参数；服务器训练时会自动使用 CUDA。
 
-## 在 95 服务器训练
+## 服务器训练
 
 项目已经同步到：
 
@@ -63,5 +63,3 @@ source /gpu/anaconda3/etc/profile.d/conda.sh
 conda activate /gpu3/guhj/envs/speech-llm
 cd /gpu3/guhj/Speech-MiniMind
 ```
-
-然后执行上面的 AISHELL-1 下载、准备和训练命令即可。数据集和 checkpoint 默认保存在服务器项目目录下，不会被提交到 GitHub。
