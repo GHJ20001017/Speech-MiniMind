@@ -30,11 +30,13 @@ cd /gpu3/guhj/Speech-MiniMind
 
 ## 2. 下载 AISHELL-1
 
-AISHELL-1 是中文普通话朗读语料，包含训练、开发和测试划分。下载脚本从 OpenSLR 获取数据，并解压到 `data/aishell1`：
+AISHELL-1 是中文普通话朗读语料，包含训练、开发和测试划分。下载脚本默认从国内 ModelScope 镜像获取数据，并解压到 `data/aishell1`：
 
 ```bash
 python scripts/download_aishell1.py
 ```
+
+也可以直接用浏览器下载 [ModelScope 上的 `data_aishell.tgz`](https://www.modelscope.cn/datasets/OmniData/AISHELL-1/tree/master/raw/33)，再将文件放到 `data/aishell1/data_aishell.tgz`。如需切换回 OpenSLR，可传入 `--url https://www.openslr.org/resources/33/data_aishell.tgz`。
 
 脚本使用 `curl` 的断点续传和自动重试；如果网络中断，直接再次运行同一命令即可从已有文件继续。下载完成后会创建 `.extracted` 标记，再次运行时不会重复下载或解压。目录大致如下：
 

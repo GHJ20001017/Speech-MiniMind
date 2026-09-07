@@ -44,6 +44,7 @@ python scripts/train_conformer_ctc.py --data data/aishell1/processed
 ```
 
 AISHELL-1 压缩包约 15.6 GB，下载中断后直接重新运行下载命令即可断点续传。
+脚本默认使用国内 [ModelScope 镜像](https://www.modelscope.cn/datasets/OmniData/AISHELL-1/tree/master/raw/33)；也可以在网页中下载 `data_aishell.tgz` 后放入 `data/aishell1/`。
 
 训练完成后，checkpoint 位于 `data/aishell1/processed/tiny_conformer_ctc.pt`。当前模型为 4 层、hidden=256、4 头注意力、约 9.2M 参数；服务器训练时会自动使用 CUDA。
 

@@ -10,7 +10,8 @@ import urllib.request
 from pathlib import Path
 
 
-URL = "https://www.openslr.org/resources/33/data_aishell.tgz"
+# The ModelScope mirror is usually faster for users in mainland China.
+URL = "https://www.modelscope.cn/datasets/OmniData/AISHELL-1/resolve/master/raw/33/data_aishell.tgz"
 
 
 def download_archive(url: str, archive: Path) -> None:
@@ -39,16 +40,17 @@ def download_archive(url: str, archive: Path) -> None:
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", type=Path, default=Path("data/aishell1"))
+    parser.add_argument("--url", default=URL, help="dataset archive URL (defaults to the ModelScope mirror)")
     args = parser.parse_args()
     args.output.mkdir(parents=True, exist_ok=True)
     archive = args.output / "data_aishell.tgz"
     marker = args.output / ".extracted"
     if not marker.exists() and not archive.exists():
-        print(f"downloading: {URL}")
-        download_archive(URL, archive)
+        print(f"downloading: {args.url}")
+        download_archive(args.url, archive)
     elif not marker.exists():
         print(f"resuming download if needed: {archive}")
-        download_archive(URL, archive)
+        download_archive(args.url, archive)
     if not marker.exists():
         print(f"extracting: {archive}")
         with tarfile.open(archive, "r:gz") as handle:
