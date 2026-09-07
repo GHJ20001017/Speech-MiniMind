@@ -2,4 +2,8 @@ __pycache__/
 *.py[cod]
 .DS_Store
 outputs/
-data/audio_classification/
+data/
+*.tgz
+*.tar.gz
+*.pt
+*.pth
