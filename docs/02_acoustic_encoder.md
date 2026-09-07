@@ -36,7 +36,7 @@ AISHELL-1 是中文普通话朗读语料，包含训练、开发和测试划分�
 python scripts/download_aishell1.py
 ```
 
-脚本会创建 `.extracted` 标记，再次运行时不会重复解压。目录大致如下：
+脚本使用 `curl` 的断点续传和自动重试；如果网络中断，直接再次运行同一命令即可从已有文件继续。下载完成后会创建 `.extracted` 标记，再次运行时不会重复下载或解压。目录大致如下：
 
 ```text
 data/aishell1/
