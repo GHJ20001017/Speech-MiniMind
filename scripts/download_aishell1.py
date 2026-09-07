@@ -37,6 +37,20 @@ def download_archive(url: str, archive: Path) -> None:
     urllib.request.urlretrieve(url, archive)
 
 
+def extract_speaker_archives(dataset_root: Path) -> None:
+    """Expand AISHELL's per-speaker wav archives into real WAV files."""
+    wav_root = dataset_root / "wav"
+    marker = dataset_root.parent / ".wav_extracted"
+    archives = sorted(wav_root.glob("S*.tar.gz"))
+    if marker.exists() or not archives:
+        return
+    print(f"extracting {len(archives)} speaker audio archives")
+    for archive in archives:
+        with tarfile.open(archive, "r:gz") as handle:
+            handle.extractall(wav_root)
+    marker.touch()
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", type=Path, default=Path("data/aishell1"))
@@ -56,6 +70,7 @@ def main() -> None:
         with tarfile.open(archive, "r:gz") as handle:
             handle.extractall(args.output)
         marker.touch()
+    extract_speaker_archives(args.output / "data_aishell")
     print(f"dataset_root: {args.output}")
 
 
