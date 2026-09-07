@@ -7,11 +7,11 @@
 
 1. [语音基础](docs/00_audio_basics.md)：从 WAV、波形和频谱开始认识语音信号
 2. [Mel 频谱](docs/01_mel_spectrogram.md)：从 STFT 到 log-Mel 语音特征
-3. 语音特征与小型声学编码器
+3. [声学编码器与音频分类](docs/02_acoustic_encoder.md)：第一次训练神经网络理解音频
 4. CTC/Attention 语音识别
-4. 音频表示接入 MiniMind 语言模型
-5. 语音指令微调与语音问答
-6. 流式推理与语音输出
+5. 音频表示接入 MiniMind 语言模型
+6. 语音指令微调与语音问答
+7. 流式推理与语音输出
 
 ## 快速开始：语音基础
 
@@ -28,3 +28,10 @@ python scripts/analyze_audio.py examples/disgusted_to_happy.wav \
 
 使用 `--stft-plot` 会把音频切成默认 25 ms 窗口、10 ms 帧移的多个片段，生成随时间变化的 STFT 时频图。
 使用 `--stft-gif` 会生成动画：窗口沿波形移动，同时展示当前帧的频谱，并逐步累积 STFT 图。动画最多采样 120 个展示帧，并使用适合教学预览的分辨率。
+
+## 02：训练第一个音频分类器
+
+```bash
+python scripts/make_audio_classification_dataset.py
+python scripts/train_audio_classifier.py --data data/audio_classification
+```
