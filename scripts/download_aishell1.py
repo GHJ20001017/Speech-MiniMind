@@ -1,4 +1,4 @@
-"""Download AISHELL-1 from OpenSLR (Apache 2.0)."""
+"""Download AISHELL-1 from the ModelScope mirror (Apache 2.0 dataset)."""
 
 from __future__ import annotations
 
