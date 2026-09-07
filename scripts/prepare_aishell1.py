@@ -21,10 +21,12 @@ def collect_ids(path: Path) -> list[str]:
     return [line.strip() for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
 
 
-def find_audio(root: Path, subset: str, utterance_id: str) -> Path | None:
-    """Find an utterance inside AISHELL's subset/speaker directory tree."""
-    matches = list((root / "wav" / subset).glob(f"*/{utterance_id}.wav"))
-    return matches[0] if matches else None
+def collect_subset_ids(root: Path, subset: str) -> list[str]:
+    """Read official split lists, or infer them from a ModelScope mirror."""
+    split_file = root / f"resource_aishell/{subset}.txt"
+    if split_file.exists():
+        return collect_ids(split_file)
+    return sorted(path.stem for path in (root / "wav" / subset).glob("*/*.wav"))
 
 
 def main() -> None:
@@ -38,10 +40,14 @@ def main() -> None:
     vocabulary = sorted({char for text in transcripts.values() for char in text})
     (args.output / "vocab.txt").write_text("<blank>\n" + "\n".join(vocabulary) + "\n", encoding="utf-8")
     for subset in ("train", "dev", "test"):
-        ids = collect_ids(root / f"resource_aishell/{subset}.txt")
+        ids = collect_subset_ids(root, subset)
+        audio_by_id = {
+            path.stem: path
+            for path in (root / "wav" / subset).glob("*/*.wav")
+        }
         rows = []
         for utterance_id in ids:
-            audio = find_audio(root, subset, utterance_id)
+            audio = audio_by_id.get(utterance_id)
             text = transcripts.get(utterance_id)
             if text and audio is not None:
                 rows.append({"path": str(audio), "text": text})
