@@ -66,9 +66,11 @@ def main() -> None:
         model.train()
         total_loss = 0.0
         for features, lengths, targets, target_lengths in train_loader:
-            features, targets = features.to(device), targets.to(device)
-            logits = model(features)
-            input_lengths = torch.div(lengths, 4, rounding_mode="floor").clamp_min(1)
+            features, lengths, targets = features.to(device), lengths.to(device), targets.to(device)
+            frame_steps = torch.arange(features.size(1), device=device).unsqueeze(0)
+            padding_mask = frame_steps >= lengths.unsqueeze(1)
+            logits = model(features, padding_mask)
+            input_lengths = model.encoder.subsampled_lengths(lengths).clamp_max(logits.size(1))
             loss = loss_fn(logits.log_softmax(-1).transpose(0, 1), targets, input_lengths, target_lengths)
             optimizer.zero_grad()
             loss.backward()

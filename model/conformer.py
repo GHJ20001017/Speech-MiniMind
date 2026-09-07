@@ -82,14 +82,23 @@ class TinyConformer(nn.Module):
         self.layers = nn.ModuleList([ConformerBlock(hidden_dim, heads, 4, 31, dropout) for _ in range(layers)])
         self.norm = nn.LayerNorm(hidden_dim)
 
+    @staticmethod
+    def subsampled_lengths(lengths: torch.Tensor) -> torch.Tensor:
+        """Map feature-frame lengths through the two valid 3x3, stride-2 convolutions."""
+        lengths = torch.div(lengths - 3, 2, rounding_mode="floor") + 1
+        lengths = torch.div(lengths - 3, 2, rounding_mode="floor") + 1
+        return lengths.clamp_min(1)
+
     def forward(self, features: torch.Tensor, padding_mask: torch.Tensor | None = None) -> torch.Tensor:
         hidden = self.subsampling(features.unsqueeze(1))
         batch, channels, time, frequency = hidden.shape
         hidden = hidden.transpose(1, 2).contiguous().view(batch, time, channels * frequency)
         hidden = self.input_projection(hidden)
         if padding_mask is not None:
-            padding_mask = padding_mask[:, : hidden.size(1) * 4 : 4]
-            padding_mask = padding_mask[:, : hidden.size(1)]
+            lengths = (~padding_mask).sum(dim=1)
+            output_lengths = self.subsampled_lengths(lengths).clamp_max(hidden.size(1))
+            steps = torch.arange(hidden.size(1), device=hidden.device).unsqueeze(0)
+            padding_mask = steps >= output_lengths.unsqueeze(1)
         for layer in self.layers:
             hidden = layer(hidden, padding_mask)
         return self.norm(hidden)
