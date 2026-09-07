@@ -16,6 +16,7 @@ try:
 except ImportError as error:
     raise SystemExit("PyTorch is required. Install dependencies with: python -m pip install -r requirements.txt") from error
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from analyze_audio import log_mel, read_wav  # noqa: E402
 from model.audio_classifier import AudioClassifier  # noqa: E402
