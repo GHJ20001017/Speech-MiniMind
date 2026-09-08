@@ -15,6 +15,7 @@ import matplotlib.pyplot as plt
 from torch import nn
 from torch.nn.utils.rnn import pad_sequence
 from torch.utils.data import DataLoader, Dataset
+from tqdm import tqdm
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
@@ -97,7 +98,8 @@ def main() -> None:
         epoch_start = time.perf_counter()
         model.train()
         total_loss = 0.0
-        for features, lengths, targets, target_lengths in train_loader:
+        progress = tqdm(train_loader, desc=f"epoch {epoch:02d}/{args.epochs}", unit="batch")
+        for features, lengths, targets, target_lengths in progress:
             features, targets = features.to(device), targets.to(device)
             frame_steps = torch.arange(features.size(1), device=device).unsqueeze(0)
             padding_mask = frame_steps >= lengths.to(device).unsqueeze(1)
@@ -108,7 +110,9 @@ def main() -> None:
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 5.0)
             optimizer.step()
-            total_loss += float(loss)
+            loss_value = loss.detach().item()
+            total_loss += loss_value
+            progress.set_postfix(loss=f"{loss_value:.4f}", avg=f"{total_loss / (progress.n):.4f}")
         train_loss = total_loss / max(len(train_loader), 1)
         dev_loss = evaluate(model, dev_loader, device, loss_fn)
         seconds = time.perf_counter() - epoch_start
