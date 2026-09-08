@@ -34,6 +34,18 @@ def forward_inputs_embeds(model: nn.Module, inputs_embeds: torch.Tensor, attenti
     This small equivalent path preserves its rotary embeddings and decoder
     blocks while allowing a speech projector to provide the initial embeddings.
     """
+    # Current minimind-3 is exported as a standard Qwen3ForCausalLM and
+    # already supports inputs_embeds. Prefer that public interface.
+    try:
+        output = model(
+            inputs_embeds=inputs_embeds,
+            attention_mask=attention_mask,
+            use_cache=False,
+        )
+        return output.logits
+    except (TypeError, AttributeError):
+        pass
+
     core = model.model
     batch_size, sequence_length, _ = inputs_embeds.shape
     hidden = core.dropout(inputs_embeds)
