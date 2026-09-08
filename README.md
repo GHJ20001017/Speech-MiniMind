@@ -167,6 +167,17 @@ checkpoint → log-Mel → Conformer + CTC
 
 下一步将加入评估脚本，输出 dev/test CER，并保存参考文本与预测文本样例。
 
+评估已有 checkpoint：
+
+~~~bash
+python scripts/evaluate_conformer_ctc.py \
+  --data data/aishell1/processed \
+  --checkpoint outputs/02_acoustic_encoder/checkpoint_epoch_020.pt \
+  --split dev
+~~~
+
+结果会保存为 `dev_metrics.json` 和 `dev_predictions.csv`；将 `--split` 改为 `test` 即可评估测试集。`cer` 越低越好。
+
 ## 目录结构
 
 ~~~text
