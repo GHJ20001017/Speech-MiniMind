@@ -12,6 +12,7 @@ from pathlib import Path
 import numpy as np
 import torch
 import matplotlib.pyplot as plt
+from matplotlib.ticker import MaxNLocator
 from torch import nn
 from torch.nn.utils.rnn import pad_sequence
 from torch.utils.data import DataLoader, Dataset
@@ -129,17 +130,22 @@ def main() -> None:
     final_checkpoint = args.output / "tiny_conformer_ctc.pt"
     torch.save({"model": model.state_dict(), "vocab": vocab, "epoch": args.epochs}, final_checkpoint)
     metrics = list(csv.DictReader(metrics_path.open(encoding="utf-8")))
-    plt.figure(figsize=(7, 4))
-    plt.plot([row["epoch"] for row in metrics], [row["train_ctc_loss"] for row in metrics], label="train")
-    plt.plot([row["epoch"] for row in metrics], [row["dev_ctc_loss"] for row in metrics], label="dev")
-    plt.xlabel("epoch")
-    plt.ylabel("CTC loss")
-    plt.title("Tiny Conformer training")
-    plt.grid(alpha=0.25)
-    plt.legend()
-    plt.tight_layout()
-    plt.savefig(args.output / "loss_curve.png", dpi=150)
-    plt.close()
+    epochs = [int(row["epoch"]) for row in metrics]
+    train_losses = [float(row["train_ctc_loss"]) for row in metrics]
+    dev_losses = [float(row["dev_ctc_loss"]) for row in metrics]
+    figure, axis = plt.subplots(figsize=(8, 5), dpi=160)
+    axis.plot(epochs, train_losses, marker="o", markersize=4, linewidth=2, label="train")
+    axis.plot(epochs, dev_losses, marker="o", markersize=4, linewidth=2, label="dev")
+    axis.set_xlabel("Epoch")
+    axis.set_ylabel("CTC loss")
+    axis.set_title("Tiny Conformer CTC loss")
+    axis.set_xticks(epochs)
+    axis.yaxis.set_major_locator(MaxNLocator(nbins=8))
+    axis.grid(axis="y", alpha=0.25)
+    axis.legend(frameon=False)
+    figure.tight_layout()
+    figure.savefig(args.output / "loss_curve.png")
+    plt.close(figure)
     print(f"metrics_saved: {metrics_path}")
     print(f"loss_curve_saved: {args.output / 'loss_curve.png'}")
     print(f"checkpoint_saved: {final_checkpoint}")
