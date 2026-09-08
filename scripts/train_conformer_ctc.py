@@ -60,7 +60,7 @@ def evaluate(model: TinyConformerCTC, loader: DataLoader, device: torch.device, 
             logits = model(features, padding_mask)
             input_lengths = model.encoder.subsampled_lengths(lengths).clamp_max(logits.size(1))
             loss = loss_fn(logits.log_softmax(-1).transpose(0, 1), targets, input_lengths, target_lengths)
-            total_loss += float(loss)
+            total_loss += loss.detach().item()
     return total_loss / max(len(loader), 1)
 
 
