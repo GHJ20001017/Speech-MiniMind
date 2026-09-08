@@ -158,14 +158,41 @@ nvidia-smi
 
 ## 训练完成后
 
-当前训练脚本记录 CTC loss。完整评估还需要 CTC 解码和 CER：
+当前训练脚本记录 CTC loss。完整评估使用 CTC 贪心解码并计算 CER：
 
 ~~~text
 checkpoint → log-Mel → Conformer + CTC
           → greedy CTC decode → 中文文本 → CER
 ~~~
 
-下一步将加入评估脚本，输出 dev/test CER，并保存参考文本与预测文本样例。
+推荐使用一键报告脚本。它会一次性评估 dev/test、比较多个 checkpoint、统计参数量和模型前向推理速度，并保存文本样例和错误案例：
+
+~~~bash
+# 先用 1 个 checkpoint 做快速检查
+python scripts/evaluate_conformer_report.py \
+  --data data/aishell1/processed \
+  --output outputs/02_acoustic_encoder \
+  --split both \
+  --max-checkpoints 1 \
+  --samples 20 \
+  --batch-size 16
+
+# 完整比较 outputs/02_acoustic_encoder 下的所有 checkpoint
+python scripts/evaluate_conformer_report.py \
+  --data data/aishell1/processed \
+  --output outputs/02_acoustic_encoder \
+  --split both \
+  --batch-size 16
+~~~
+
+输出文件位于 `outputs/02_acoustic_encoder/`：
+
+- `checkpoint_comparison.csv`：每个 checkpoint 在 dev/test 上的 CER、编辑距离、参数量、模型前向耗时、RTF 等；
+- `evaluation_samples.csv`：参考文本与预测文本样例；
+- `evaluation_errors.csv`：按单条样本 CER 排序的错误案例，便于定位替换、删除和插入；
+- `evaluation_report.json`：以上结果及每个 split 的最佳 checkpoint 汇总。
+
+其中 `inference_seconds` 只计模型前向计算，不含音频读取和 log-Mel 特征提取；`audio_duration_seconds_estimate` 根据 10 ms 的特征帧移估算，`real_time_factor < 1` 表示模型前向速度快于音频播放速度。
 
 评估已有 checkpoint：
 

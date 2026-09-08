@@ -165,7 +165,7 @@ checkpoint 包含 `model`（编码器和 CTC head 参数）及 `vocab`（字符�
 CER = (替换数 + 删除数 + 插入数) / 参考文本字符数
 ```
 
-本章先完成可复现的训练闭环；评估脚本和 beam search 解码将在后续章节加入。
+可以用 `scripts/evaluate_conformer_report.py` 一次性完成 dev/test CER、checkpoint 对比、文本样例、错误案例、参数量和推理速度统计。结果写入 `outputs/02_acoustic_encoder/`，其中 `evaluation_errors.csv` 会按单条样本 CER 排序，适合教学时逐条分析模型错在哪里。脚本当前使用 greedy CTC decode；beam search 可作为后续改进。
 
 ## 9. 常见问题
 
