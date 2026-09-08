@@ -71,3 +71,14 @@ python scripts/train_speech_minimind.py \
 ## 5. 这一步还不是什么
 
 AISHELL-1 只有语音和转写文本，没有“听完语音后回答问题”的标注。因此本章得到的是语音条件的转写桥接模型，还不是完整的 Speech LLM。下一步需要加入语音指令数据，训练问答、分类和信息抽取，并保留 CTC loss 作为辅助目标。
+
+可以先运行 `scripts/prepare_speech_instructions.py` 生成第二阶段统一格式：
+
+```bash
+python scripts/prepare_speech_instructions.py \
+  --input data/aishell1/processed \
+  --output data/speech_instructions \
+  --include-text-ops
+```
+
+输出为 `train.jsonl`、`dev.jsonl`、`test.jsonl` 和 `metadata.json`。主任务是 `transcription`；可选的 `char_count`、`first_character`、`last_character` 是由转写文本直接验证的辅助指令任务。它们用于先验证数据接口和 instruction-following，不能替代真实的语音摘要、问答或意图识别标注。

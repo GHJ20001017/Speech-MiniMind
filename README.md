@@ -72,6 +72,24 @@ python scripts/train_speech_minimind.py \
 
 该版本默认冻结 Tiny Conformer 和 MiniMind，只训练约 0.8M 参数的 Projector。AISHELL-1 仍然只提供“语音→文字”监督，因此这是语音接入语言模型的教学桥接实验，不是完整的语音问答训练。训练日志会写入 `outputs/03_speech_minimind/metrics.csv`，Projector checkpoint 写入同目录。
 
+### 构造第二阶段语音指令数据
+
+可以把 AISHELL-1 的转写标注转换为统一的语音指令格式：
+
+```bash
+python scripts/prepare_speech_instructions.py \
+  --input data/aishell1/processed \
+  --output data/speech_instructions
+```
+
+每行是一个 JSON 对象：
+
+```json
+{"audio":"...wav","instruction":"请将这段语音准确转写为中文文本。","answer":"今天天气很好。","task":"transcription"}
+```
+
+如果需要少量可验证的指令跟随样例，可以额外打开 `--include-text-ops`，它会加入“转写后统计汉字数、找首字、找末字”任务。它们只使用已有转写文本推导答案，不伪造音频中没有的信息；真正的语音摘要、问答和意图识别仍需要额外的人工标注或公开语音指令数据。
+
 ## 快速开始
 
 ~~~bash
