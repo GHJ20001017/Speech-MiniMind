@@ -82,3 +82,5 @@ python scripts/prepare_speech_instructions.py \
 ```
 
 输出为 `train.jsonl`、`dev.jsonl`、`test.jsonl` 和 `metadata.json`。主任务是 `transcription`；可选的 `char_count`、`first_character`、`last_character` 是由转写文本直接验证的辅助指令任务。它们用于先验证数据接口和 instruction-following，不能替代真实的语音摘要、问答或意图识别标注。
+
+为了让小模型先跑通第二阶段，可以使用 `scripts/build_stage2_mixture.py` 生成 5,000 条左右的混合数据。它预留 50% 中文 ASR、20% 会议、20% 语音指令、10% 理解任务的配额，并从 `data/external_speech_instructions/` 读取后面补充的真实 JSONL。外部数据没有准备好时，脚本会使用带有 `aishell1_fallback` 标记的转写样本填充空缺，方便测试数据管线，但这些样本不能用于宣称模型已经学会语音问答。

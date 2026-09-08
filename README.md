@@ -90,6 +90,20 @@ python scripts/prepare_speech_instructions.py \
 
 如果需要少量可验证的指令跟随样例，可以额外打开 `--include-text-ops`，它会加入“转写后统计汉字数、找首字、找末字”任务。它们只使用已有转写文本推导答案，不伪造音频中没有的信息；真正的语音摘要、问答和意图识别仍需要额外的人工标注或公开语音指令数据。
 
+### 构建小规模第二阶段混合数据
+
+为了控制小模型的训练成本，可以用混合构建脚本先生成约 5,000 条数据：
+
+```bash
+python scripts/build_stage2_mixture.py \
+  --aishell data/aishell1/processed \
+  --sources data/external_speech_instructions \
+  --output data/stage2_mixture \
+  --total 5000
+```
+
+可选外部文件放在 `data/external_speech_instructions/`：`meeting.jsonl`、`instruction.jsonl`、`understanding.jsonl`，格式与 `speech_instructions/*.jsonl` 相同。脚本按 50% ASR、20% 会议、20% 指令、10% 理解分配配额，并输出 `train.jsonl`、`dev.jsonl` 和 `metadata.json`。外部文件缺失时会明确标记 `aishell1_fallback`，不会把 AISHELL-1 派生样本伪装成真实问答数据。
+
 ## 快速开始
 
 ~~~bash
