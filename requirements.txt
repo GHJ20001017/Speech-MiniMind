@@ -3,3 +3,4 @@ matplotlib>=3.7
 pillow>=10.0
 torch>=2.2
 tqdm>=4.66
+transformers>=4.57

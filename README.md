@@ -25,7 +25,7 @@ Speech-MiniMind 是一个面向初学者的 Speech LLM 学习项目。它不从�
 | [00. 语音基础](docs/00_audio_basics.md) | WAV、波形、FFT、频谱泄漏、STFT | 已完成 |
 | [01. Mel 频谱](docs/01_mel_spectrogram.md) | 功率谱、Mel 滤波器组、log-Mel | 已完成 |
 | [02. 声学编码器](docs/02_acoustic_encoder.md) | Tiny Conformer、AISHELL-1、CTC | 训练中 |
-| 03. 语音接入 MiniMind | 声学 token 与语言模型连接 | 计划中 |
+| [03. 语音接入 MiniMind](docs/03_speech_minimind.md) | Speech Projector、语音前缀、MiniMind | 实现中 |
 | 04. 流式语音理解 | 实时推理和语音输出 | 计划中 |
 
 ## 当前完成内容
@@ -37,6 +37,40 @@ Speech-MiniMind 是一个面向初学者的 Speech LLM 学习项目。它不从�
 - AISHELL-1 字符级 CTC 训练；
 - train/dev loss、loss 曲线和逐 epoch checkpoint；
 - ModelScope 国内镜像、变长 batch 和 padding mask。
+- Speech Projector 的最小桥接训练脚本（将继续完善推理和指令数据）。
+
+## 03. 将声学编码器接入 MiniMind
+
+02 中的 Conformer 输出是 `[语音帧数, 256]`，而 MiniMind 的词向量维度通常是 768，不能直接拼接。03 增加一个可训练的 `SpeechProjector`：先用一维卷积将约 10 ms 一帧的声学序列降采样，再用 MLP 映射到 MiniMind hidden size。
+
+```text
+log-Mel [T, 80] → Tiny Conformer [T/4, 256]
+                         ↓ SpeechProjector
+                    speech prefix [T/16, 768]
+                         ↓ 拼到文本 embedding 前
+                    MiniMind → 中文文本
+```
+
+### 准备 MiniMind 模型
+
+MiniMind 源码和权重不复制进本仓库。请从 [MiniMind 官方仓库](https://github.com/jingyaogong/minimind) 的模型链接下载 Transformers 格式权重，例如 [minimind-3](https://huggingface.co/jingyaogong/minimind-3)，保存到本地目录。目录中应包含 `config.json`、tokenizer 文件和模型权重。
+
+### 运行最小桥接训练
+
+先确认 02 的 CTC checkpoint 已存在，并安装 `transformers`：
+
+```bash
+python -m pip install transformers
+python scripts/train_speech_minimind.py \
+  --data data/aishell1/processed \
+  --encoder-checkpoint outputs/02_acoustic_encoder/tiny_conformer_ctc.pt \
+  --minimind-model /path/to/minimind-3 \
+  --output outputs/03_speech_minimind \
+  --epochs 3 \
+  --batch-size 2
+```
+
+该版本默认冻结 Tiny Conformer 和 MiniMind，只训练约 0.8M 参数的 Projector。AISHELL-1 仍然只提供“语音→文字”监督，因此这是语音接入语言模型的教学桥接实验，不是完整的语音问答训练。训练日志会写入 `outputs/03_speech_minimind/metrics.csv`，Projector checkpoint 写入同目录。
 
 ## 快速开始
 

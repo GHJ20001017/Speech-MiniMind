@@ -167,6 +167,8 @@ CER = (替换数 + 删除数 + 插入数) / 参考文本字符数
 
 可以用 `scripts/evaluate_conformer_report.py` 一次性完成 dev/test CER、checkpoint 对比、文本样例、错误案例、参数量和推理速度统计。结果写入 `outputs/02_acoustic_encoder/`，其中 `evaluation_errors.csv` 会按单条样本 CER 排序，适合教学时逐条分析模型错在哪里。脚本当前使用 greedy CTC decode；beam search 可作为后续改进。
 
+评估完成后，编码器可以作为独立的声学前端使用。下一章会取出 CTC Head 之前的隐藏状态 `[T/4, 256]`，通过 Speech Projector 映射到 MiniMind 的词向量维度，并把它作为语言模型的语音前缀。CTC Head 仍可保留为辅助训练目标，帮助声学编码器不丢失语音识别能力。
+
 ## 9. 常见问题
 
 **显存不足怎么办？** 将 `--batch-size` 从 8 降到 4 或 2。长样本会决定一个 batch 的显存占用。
