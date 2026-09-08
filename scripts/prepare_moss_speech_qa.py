@@ -21,10 +21,14 @@ def main():
         try: obj=json.loads(raw)
         except Exception: continue
         turns=[]
-        for t in obj.get('chat',[]) if isinstance(obj.get('chat'),list) else []:
+        chat=obj.get('chat',{})
+        values=chat.values() if isinstance(chat,dict) else chat if isinstance(chat,list) else []
+        for t in values:
           if isinstance(t,dict):
             h=(t.get('Human') or '').strip(); m=(t.get('MOSS') or '').strip()
-            if h and m: turns.append((h,m))
+            h=re.sub(r'^<\|Human\|>:\s*','',h).replace('<eoh>','').strip()
+            m=re.sub(r'^<\|MOSS\|>:\s*','',m).replace('<eom>','').strip()
+            if h and m and h.lower()!='none' and m.lower()!='none': turns.append((h,m))
         if len(turns)<2: continue
         # use the final turn, retaining preceding text as context
         q,ans=turns[-1]; alltext=''.join(x+y for x,y in turns)
