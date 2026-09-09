@@ -165,7 +165,14 @@ class StreamingConformerBlock(nn.Module):
         # Context rows attend everything (their outputs are thrown away anyway);
         # only the chunk rows carry the causal constraint.
         fully_open = rows < n_context
-        return causal | fully_open  # True == allowed
+        allow = causal | fully_open
+        # ``nn.MultiheadAttention`` treats a 2D bool ``attn_mask`` element as
+        # *True == blocked* (it maps them to ``-inf`` additive biases), the
+        # opposite of ``allow`` above. Flip so the causal pattern survives the
+        # hand-off; otherwise every allowed key is masked and, on CUDA, the
+        # softmax can hit an all-``-inf`` row and emit NaN (the CPU math kernel
+        # happens not to). See ``merge_masks`` in ``torch.nn.modules.activation``.
+        return ~allow  # True == blocked
 
     def forward(
         self,
@@ -174,7 +181,7 @@ class StreamingConformerBlock(nn.Module):
         n_context: int,
         padding_mask: torch.Tensor | None = None,  # (B, n_context + n_chunk) True == pad
     ) -> torch.Tensor:
-        mask = self._mask_for(n_chunk, n_context, x.device)  # (n_chunk, total)
+        mask = self._mask_for(n_chunk, n_context, x.device)  # (n_chunk, total) True == blocked
         x = x + 0.5 * self.ffn1(x)
         normalized = self.attn_norm(x)
         attended, _ = self.attention(

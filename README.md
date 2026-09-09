@@ -5,7 +5,7 @@
 目标：能看懂、能运行、能修改的整套教学流水线。
 
 ```text
-00 语音基础 → 01 Mel 频谱 → 02 声学编码器（Tiny Conformer + CTC，含流式版） → 03 接入 MiniMind
+00 语音基础 → 01 Mel 频谱 → 02 声学编码器（Tiny Conformer + CTC，含流式版） → 03 接入 MiniMind → 04 指令微调语音 LLM
 ```
 
 分章教学文档见 [`docs/`](docs/)：
@@ -16,6 +16,7 @@
 | 01 Mel 频谱 | 功率谱、Mel 滤波器组、log-Mel | [docs/01_mel_spectrogram.md](docs/01_mel_spectrogram.md) |
 | 02 声学编码器 | Tiny Conformer、AISHELL-1、CTC；流式 Conformer（因果分块版） | [docs/02_acoustic_encoder.md](docs/02_acoustic_encoder.md) |
 | 03 接入 MiniMind | Speech Projector、语音前缀 | [docs/03_speech_minimind.md](docs/03_speech_minimind.md) |
+| 04 指令微调语音 LLM | 合并指令数据、LoRA 微调 MiniMind | 见下方第 7/8 节 |
 
 ## 环境安装
 
@@ -84,9 +85,25 @@ python scripts/evaluate_conformer_ctc.py \
 
 同目录还有 `scripts/plot_training_metrics.py` 可绘制训练曲线。
 
-### 5. 构建第二阶段的语音指令数据（03）
+### 5. 训练语音投影器连接 MiniMind（03，Speech Projector）
 
-把 AISHELL-1 转写标注转成统一的语音指令格式：
+先下载 [MiniMind Transformers 权重](https://github.com/jingyaogong/minimind)（如 `minimind-3`）到本地目录，然后：
+
+```bash
+python scripts/train_speech_projector.py \
+  --data data/aishell1/processed \
+  --encoder-checkpoint outputs/02_acoustic_encoder/tiny_conformer_ctc.pt \
+  --minimind-model /path/to/minimind-3 \
+  --output outputs/03_speech_minimind --epochs 3 --batch-size 2
+```
+
+冻结 Conformer 和 MiniMind，只训练约 0.8M 参数的 `SpeechProjector`。这一步得到的是**语音条件的转写桥接模型**，还不是完整的 Speech LLM。
+
+### 6. 构建指令微调数据（用于下一阶段）
+
+> 说明：本节为**下一步完整语音指令微调（Speech LLM）**准备数据；训练第 5 节的 Projector **不需要**它——`train_speech_projector.py` 默认用 `data/aishell1/processed`（CSV）即可。仅当你想用指令格式（`--data-format jsonl`）训练 Projector 时才需运行本节。
+
+先直接把 AISHELL-1 转写标注转成统一的语音指令格式：
 
 ```bash
 python scripts/prepare_speech_instructions.py \
@@ -105,21 +122,9 @@ python scripts/build_stage2_mixture.py \
 
 （`data/external_speech_instructions/` 下可选放 `meeting.jsonl`、`instruction.jsonl`、`understanding.jsonl`。）
 
-### 6. 语音接入 MiniMind（03，训练 Projector）
+### 7. 构建并合成语音问答数据 + 合并统一指令集
 
-先下载 [MiniMind Transformers 权重](https://github.com/jingyaogong/minimind)（如 `minimind-3`）到本地目录，然后：
-
-```bash
-python scripts/train_speech_minimind.py \
-  --data data/aishell1/processed \
-  --encoder-checkpoint outputs/02_acoustic_encoder/tiny_conformer_ctc.pt \
-  --minimind-model /path/to/minimind-3 \
-  --output outputs/03_speech_minimind --epochs 3 --batch-size 2
-```
-
-冻结 Conformer 和 MiniMind，只训练约 0.8M 参数的 `SpeechProjector`。
-
-### 7. 构建并合成语音问答数据（用于下一阶段）
+从多个来源构建问答类语音数据，并合并成一份标准指令微调数据集：
 
 ```bash
 # 从 moss-003 SFT 抽取中文多轮子集
@@ -130,7 +135,37 @@ python scripts/generate_moss_speech_qa_tts.py --data data/moss_speech_qa
 
 # 从 VoiceAssistant-400K 随机抽样并下载本地音频
 python scripts/prepare_voiceassistant_400k.py --num-samples 50000 --output data/voiceassistant400k_50k
+
+# 把 speech_instructions / moss_speech_qa / voiceassistant400k_50k 合并为一份标准指令集
+python scripts/merge_speech_instruction_datasets.py \
+  --data-root data --output data/stage2_mixed
 ```
+
+合并脚本输出 `data/stage2_mixed/{train,dev}.jsonl`，每行统一为：
+`{"audio": "<绝对路径>", "instruction": "...", "answer": "...", "task": "...", "source": "...", "lang": "zh|en"}`
+并把三类数据的音频路径统一解析为绝对路径（三者的相对基准原本不同），moss 的多轮 `history` 会按单轮格式丢弃。可以配合 `--skip-missing-audio` 跳过缺失音频的条目。
+
+### 8. 指令微调语音 LLM（04，真正的 Speech-MiniMind）
+
+在第 5 节的 Projector 桥接基础上，用第 6/7 节的指令数据**微调 MiniMind 本身**（LoRA），让它变成能听语音、理解指令、生成回答的完整 Speech LLM：
+
+```bash
+python scripts/train_speech_minimind.py \
+  --data data/stage2_mixed \
+  --encoder-checkpoint outputs/02_acoustic_encoder/tiny_conformer_ctc.pt \
+  --projector-checkpoint outputs/03_speech_minimind/projector_epoch_005.pt \
+  --minimind-model /path/to/minimind-3 \
+  --output outputs/04_speech_minimind_sft --epochs 2 --batch-size 2 \
+  --lora-r 8 --lora-alpha 16
+```
+
+- 冻结 Conformer 和 Speech Projector（语音前端），只对 MiniMind 做指令微调，支持两种方式（`--tune`）：
+  - `--tune lora`（默认）：只对 MiniMind 注入并训练 **LoRA adapter**（约 0.5% 可训练参数），省显存、速度快。
+  - `--tune full`：**全参数微调**全部 MiniMind 权重（100% 参数可训练），效果更强但需要更大显存、更慢。
+- 损失只在 `answer` 部分计算（prompt 与语音前缀用 -100 mask），标准 SFT。
+- 常见参数：`--tune lora|full`、`--lang-filter zh|en`（只练单一语言）、`--limit N`（先小规模试跑）、`--lora-r/--lora-alpha`（LoRA 秩）、`--epochs`、`--wandb`。
+- `--tune lora` 依赖 `peft`：`python -m pip install peft`。
+- 输出 `outputs/04_speech_minimind_sft/`：`config.json`、`metrics.csv`、`lora_epoch_XXX/adapter_model.safetensors`（lora 模式）或 `model_epoch_XXX/model.safetensors`（full 模式，完整可加载模型）。
 
 ## 模型配置（02 Tiny Conformer）
 

@@ -9,7 +9,7 @@ parent directory), and leaves every other JSONL field untouched.
 
 Design notes:
 - Only the `instruction` text is synthesized (single-turn), matching the
-  text-supervised projector training path in train_speech_minimind.py.
+  text-supervised projector training path in train_speech_projector.py.
 - `read_wav` in analyze_audio.py requires 16-bit PCM WAV, so results are
   written with soundfile subtype="PCM_16".
 - Output audio path stays relative (`audio/NNNNNN.wav`) so both this machine
