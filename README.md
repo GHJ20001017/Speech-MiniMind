@@ -85,6 +85,8 @@ python scripts/evaluate_conformer_ctc.py \
 
 同目录还有 `scripts/plot_training_metrics.py` 可绘制训练曲线。
 
+我们训练好的 02 章「Tiny Conformer + CTC」编码器权重（**流式**与**非流式**）会发布在 ModelScope 仓库：<https://www.modelscope.cn/models/ghjghj1017/Tiny_Conformer>。你可以直接下载使用，省去本地重新训练，例如拿非流式 `tiny_conformer_ctc.pt` 作为第 5 节 Projector 或第 8 节指令微调的 `--encoder-checkpoint`。
+
 ### 5. 训练语音投影器连接 MiniMind（03，Speech Projector）
 
 先下载 [MiniMind Transformers 权重](https://github.com/jingyaogong/minimind)（如 `minimind-3`）到本地目录，然后：
@@ -167,38 +169,7 @@ python scripts/train_speech_minimind.py \
 - `--tune lora` 依赖 `peft`：`python -m pip install peft`。
 - 输出 `outputs/04_speech_minimind_sft/`：`config.json`、`metrics.csv`、`lora_epoch_XXX/adapter_model.safetensors`（lora 模式）或 `model_epoch_XXX/model.safetensors`（full 模式，完整可加载模型）。
 
-## 模型配置（02 Tiny Conformer）
-
-| 项 | 值 |
-|---|---:|
-| 输入 | 80 维 log-Mel |
-| 层数 / hidden / heads | 4 / 256 / 4 |
-| FFN | 1024 |
-| 卷积 kernel | 31 |
-| 时间下采样 | 4× |
-| 参数量 | 约 9.0M（随词表变） |
-| 训练目标 | 字符级 CTC |
-
-## 在 GPU 服务器训练
-
-```bash
-source /gpu/anaconda3/etc/profile.d/conda.sh
-conda activate /gpu3/guhj/envs/speech-llm
-cd /gpu3/guhj/Speech-MiniMind
-
-CUDA_VISIBLE_DEVICES=7 python scripts/train_conformer_ctc.py \
-  --data data/aishell1/processed --epochs 20 --batch-size 32 --lr 2e-4
-```
-
-后台运行并看日志：
-
-```bash
-mkdir -p outputs/02_acoustic_encoder
-nohup env CUDA_VISIBLE_DEVICES=7 python scripts/train_conformer_ctc.py \
-  --data data/aishell1/processed --epochs 20 --batch-size 32 --lr 2e-4 \
-  > outputs/02_acoustic_encoder/train.log 2>&1 &
-tail -f outputs/02_acoustic_encoder/train.log
-```
+Tiny Conformer 的详细架构与参数规格见 [`docs/02_acoustic_encoder.md`](docs/02_acoustic_encoder.md) 第 5 节（含结构图、参数表、4× 下采样推导）。
 
 ## 目录结构
 
