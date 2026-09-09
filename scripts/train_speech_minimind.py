@@ -26,6 +26,11 @@ from torch.nn.utils.rnn import pad_sequence
 from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
 
+try:
+    import wandb
+except ImportError:  # pragma: no cover - wandb optional
+    wandb = None
+
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 from model.ctc_model import TinyConformerCTC  # noqa: E402
@@ -165,6 +170,8 @@ def run_epoch(args, encoder, projector, lm, tokenizer, loader, device, optimizer
             loss.backward()
             torch.nn.utils.clip_grad_norm_(projector.parameters(), 1.0)
             optimizer.step()
+            if args.wandb:
+                wandb.log({"train/loss_step": loss.detach().item()})
         total_loss += loss.detach().item()
     return total_loss / max(len(loader), 1)
 
@@ -226,9 +233,16 @@ def main() -> None:
     parser.add_argument("--prompt", default="请将这段语音转写为文字：")
     parser.add_argument("--data-format", choices=("auto", "csv", "jsonl"), default="auto")
     parser.add_argument("--limit", type=int, default=0, help="limit examples for a quick smoke test")
+    parser.add_argument("--wandb", action=argparse.BooleanOptionalAction, default=False, help="log metrics to Weights & Biases")
+    parser.add_argument("--wandb-project", default="Speech-MiniMind")
+    parser.add_argument("--wandb-name", default=None)
     args = parser.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    if args.wandb:
+        if wandb is None:
+            raise SystemExit("wandb not installed. Run: python -m pip install -r requirements.txt")
+        wandb.init(project=args.wandb_project, name=args.wandb_name, config=vars(args))
     checkpoint = torch.load(args.encoder_checkpoint, map_location=device, weights_only=False)
     encoder_model = TinyConformerCTC(len(checkpoint["vocab"]))
     encoder_model.load_state_dict(checkpoint["model"])
@@ -283,6 +297,10 @@ def main() -> None:
                 {"epoch": epoch, "train_loss": f"{train_loss:.6f}", "dev_loss": f"{dev_loss:.6f}"}
             )
         print(f"epoch={epoch:03d} train_loss={train_loss:.4f} dev_loss={dev_loss:.4f}")
+        if args.wandb:
+            wandb.log({"train/loss": train_loss, "dev/loss": dev_loss, "epoch": epoch})
+    if args.wandb:
+        wandb.finish()
 
 
 if __name__ == "__main__":

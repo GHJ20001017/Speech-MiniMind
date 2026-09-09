@@ -1,4 +1,15 @@
-"""Train the 4-layer Tiny Conformer on AISHELL-1 with character CTC."""
+"""Train the streaming (chunk-based) Tiny Conformer on AISHELL-1 with character CTC.
+
+Streaming counterpart of :mod:`scripts.train_conformer_ctc`. It trains
+:class:`model.ctc_streaming.TinyStreamingConformerCTC`, whose encoder is causal
+(:class:`model.conformer_streaming.StreamingConformer`), so it can be decoded
+incrementally for real-time ASR. The training loop is otherwise identical to
+the non-streaming version: character CTC loss, per-epoch checkpoints,
+``metrics.csv`` and a loss curve.
+
+Override the streaming latency/quality trade-off with ``--chunk-size`` and
+``--left-context`` (in post-subsampling block-frame units).
+"""
 
 from __future__ import annotations
 
@@ -25,7 +36,7 @@ except ImportError:  # pragma: no cover - wandb optional
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
-from model.ctc_model import TinyConformerCTC  # noqa: E402
+from model.ctc_streaming import TinyStreamingConformerCTC  # noqa: E402
 from scripts.analyze_audio import log_mel, read_wav  # noqa: E402
 
 
@@ -55,7 +66,7 @@ def collate(batch: list[tuple[torch.Tensor, torch.Tensor]]) -> tuple[torch.Tenso
     return padded_features, lengths, padded_targets, target_lengths
 
 
-def evaluate(model: TinyConformerCTC, loader: DataLoader, device: torch.device, loss_fn: nn.Module) -> float:
+def evaluate(model: TinyStreamingConformerCTC, loader: DataLoader, device: torch.device, loss_fn: nn.Module) -> float:
     model.eval()
     total_loss = 0.0
     with torch.no_grad():
@@ -77,7 +88,9 @@ def main() -> None:
     parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--lr", type=float, default=2e-4)
     parser.add_argument("--seed", type=int, default=7)
-    parser.add_argument("--output", type=Path, default=Path("outputs/02_acoustic_encoder"))
+    parser.add_argument("--chunk-size", type=int, default=32, help="streaming frames per chunk (block space)")
+    parser.add_argument("--left-context", type=int, default=16, help="streaming left-context frames cached (block space)")
+    parser.add_argument("--output", type=Path, default=Path("outputs/04_streaming_acoustic_encoder"))
     parser.add_argument("--wandb", action=argparse.BooleanOptionalAction, default=False, help="log metrics to Weights & Biases")
     parser.add_argument("--wandb-project", default="Speech-MiniMind")
     parser.add_argument("--wandb-name", default=None)
@@ -87,7 +100,7 @@ def main() -> None:
     train_loader = DataLoader(AishellDataset(args.data / "train.csv", vocab), batch_size=args.batch_size, shuffle=True, collate_fn=collate)
     dev_loader = DataLoader(AishellDataset(args.data / "dev.csv", vocab), batch_size=args.batch_size, shuffle=False, collate_fn=collate)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = TinyConformerCTC(len(vocab)).to(device)
+    model = TinyStreamingConformerCTC(len(vocab), chunk_size=args.chunk_size, left_context=args.left_context).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)
     loss_fn = nn.CTCLoss(blank=0, zero_infinity=True)
 
@@ -98,7 +111,7 @@ def main() -> None:
     args.output.mkdir(parents=True, exist_ok=True)
     (args.output / "config.json").write_text(json.dumps({
         "data": str(args.data), "epochs": args.epochs, "batch_size": args.batch_size,
-        "learning_rate": args.lr, "seed": args.seed,
+        "learning_rate": args.lr, "seed": args.seed, "chunk_size": args.chunk_size, "left_context": args.left_context,
         "parameters": sum(parameter.numel() for parameter in model.parameters()),
         "device": str(device), "vocab_size": len(vocab),
     }, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
@@ -108,6 +121,7 @@ def main() -> None:
         metrics_writer.writeheader()
     print(f"device: {device}")
     print(f"parameters: {sum(parameter.numel() for parameter in model.parameters()):,}")
+    print(f"streaming: chunk_size={args.chunk_size} left_context={args.left_context}")
     for epoch in range(1, args.epochs + 1):
         epoch_start = time.perf_counter()
         model.train()
@@ -150,7 +164,7 @@ def main() -> None:
         checkpoint = args.output / f"checkpoint_epoch_{epoch:03d}.pt"
         torch.save({"model": model.state_dict(), "vocab": vocab, "epoch": epoch, "train_ctc_loss": train_loss, "dev_ctc_loss": dev_loss}, checkpoint)
         print(f"epoch={epoch:02d} train_ctc_loss={train_loss:.4f} dev_ctc_loss={dev_loss:.4f} seconds={seconds:.1f}")
-    final_checkpoint = args.output / "tiny_conformer_ctc.pt"
+    final_checkpoint = args.output / "tiny_streaming_conformer_ctc.pt"
     torch.save({"model": model.state_dict(), "vocab": vocab, "epoch": args.epochs}, final_checkpoint)
     metrics = list(csv.DictReader(metrics_path.open(encoding="utf-8")))
     epochs = [int(row["epoch"]) for row in metrics]
@@ -161,7 +175,7 @@ def main() -> None:
     axis.plot(epochs, dev_losses, marker="o", markersize=4, linewidth=2, label="dev")
     axis.set_xlabel("Epoch")
     axis.set_ylabel("CTC loss")
-    axis.set_title("Tiny Conformer CTC loss")
+    axis.set_title("Tiny Streaming Conformer CTC loss")
     axis.set_xticks(epochs)
     axis.yaxis.set_major_locator(MaxNLocator(nbins=8))
     axis.grid(axis="y", alpha=0.25)
