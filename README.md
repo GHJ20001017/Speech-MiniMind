@@ -183,7 +183,8 @@ python scripts/train_speech_projector.py \
   --encoder-type paraformer \
   --paraformer-model outputs/paraformer-streaming \
   --minimind-model /path/to/minimind-3 \
-  --output outputs/03_speech_minimind_paraformer --epochs 5 --batch-size 2
+  --output outputs/03_speech_minimind_paraformer --epochs 5 --batch-size 2 \
+  --wandb --wandb-name projector_paraformer
 ```
 
 **换用 Tiny Conformer + CTC 作为冻结编码器**（教学主线，替代上面的 Paraformer）：先按第 2 节训练得到 `outputs/02_acoustic_encoder/tiny_conformer_ctc.pt`，保持默认 `--encoder-type conformer`（或用 `--encoder-checkpoint` 显式指定），其余参数与上面一致：
@@ -193,7 +194,8 @@ python scripts/train_speech_projector.py \
   --data data/aishell1/processed \
   --encoder-checkpoint outputs/02_acoustic_encoder/tiny_conformer_ctc.pt \
   --minimind-model /path/to/minimind-3 \
-  --output outputs/03_speech_minimind --epochs 5 --batch-size 2
+  --output outputs/03_speech_minimind --epochs 5 --batch-size 2 \
+  --wandb --wandb-name projector_conformer
 ```
 
 无论用哪个后端，都冻结编码器和 MiniMind，只训练约 0.8M 参数的 `SpeechProjector`。这一步得到的是**语音条件的转写桥接模型**，还不是完整的 Speech LLM。
@@ -277,14 +279,15 @@ python scripts/train_speech_minimind.py \
   --projector-checkpoint outputs/03_speech_minimind_paraformer/projector_epoch_005.pt \
   --minimind-model /path/to/minimind-3 \
   --output outputs/04_speech_minimind_sft --epochs 3 --batch-size 2 \
-  --lora-r 8 --lora-alpha 16
+  --lora-r 8 --lora-alpha 16 \
+  --wandb --wandb-name speech_minimind_sft
 ```
 
 - 冻结语音编码器（`--encoder-type` 选 Paraformer 或 Conformer）和 Speech Projector（语音前端），只对 MiniMind 做指令微调，支持两种方式（`--tune`）：
   - `--tune lora`（默认）：只对 MiniMind 注入并训练 **LoRA adapter**（约 0.5% 可训练参数），省显存、速度快。
   - `--tune full`：**全参数微调**全部 MiniMind 权重（100% 参数可训练），效果更强但需要更大显存、更慢。
 - 损失只在 `answer` 部分计算（prompt 与语音前缀用 -100 mask），标准 SFT。
-- 常见参数：`--tune lora|full`、`--lang-filter zh|en`（只练单一语言）、`--limit N`（先小规模试跑）、`--lora-r/--lora-alpha`（LoRA 秩）、`--epochs`、`--wandb`。
+- 常见参数：`--tune lora|full`、`--lang-filter zh|en`（只练单一语言）、`--limit N`（先小规模试跑）、`--lora-r/--lora-alpha`（LoRA 秩）、`--epochs`、`--wandb`（上传指标，可选 `--wandb-project <name>`、`--wandb-name <run>`，project 默认 `Speech-MiniMind`）。
 - `--tune lora` 依赖 `peft`：`python -m pip install peft`。
 - 输出 `outputs/04_speech_minimind_sft/`：`config.json`、`metrics.csv`、`lora_epoch_XXX/adapter_model.safetensors`（lora 模式）或 `model_epoch_XXX/model.safetensors`（full 模式，完整可加载模型）。
 
