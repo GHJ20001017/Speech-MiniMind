@@ -175,19 +175,7 @@ model.eval()
 
 ### 5. 训练语音投影器连接 MiniMind（03，Speech Projector）
 
-先下载 [MiniMind Transformers 权重](https://github.com/jingyaogong/minimind)（如 `minimind-3`）到本地目录，然后：
-
-```bash
-python scripts/train_speech_projector.py \
-  --data data/aishell1/processed \
-  --encoder-checkpoint outputs/02_acoustic_encoder/tiny_conformer_ctc.pt \
-  --minimind-model /path/to/minimind-3 \
-  --output outputs/03_speech_minimind --epochs 3 --batch-size 2
-```
-
-冻结 Conformer 和 MiniMind，只训练约 0.8M 参数的 `SpeechProjector`。这一步得到的是**语音条件的转写桥接模型**，还不是完整的 Speech LLM。
-
-**换用 Paraformer-zh-streaming 作为冻结编码器**（推荐，替代上面的 Tiny Conformer）：先按第 4 节下载权重，再选 `--encoder-type paraformer`，其余参数与上面一致：
+先用 **Paraformer-zh-streaming 作为冻结编码器**（推荐，工业级中文流式 ASR 前端）。先下载 [MiniMind Transformers 权重](https://github.com/jingyaogong/minimind)（如 `minimind-3`）到本地目录，并按第 4 节下载 Paraformer 权重，然后：
 
 ```bash
 python scripts/train_speech_projector.py \
@@ -195,10 +183,30 @@ python scripts/train_speech_projector.py \
   --encoder-type paraformer \
   --paraformer-model outputs/paraformer-streaming \
   --minimind-model /path/to/minimind-3 \
-  --output outputs/03_speech_minimind_paraformer --epochs 3 --batch-size 2
+  --output outputs/03_speech_minimind_paraformer --epochs 5 --batch-size 2
 ```
 
-仍用 Tiny Conformer 时保持默认（`--encoder-type conformer`）即可，行为与之前完全一致。脚本会按所选后端自动设置 `SpeechProjector.acoustic_dim`（Conformer=256，Paraformer=512），并把输入统一为 16kHz 波形（Paraformer 前端要求 16kHz，非 16kHz 会被校验拦截）。对较长训练集可用 `--hidden-cache <dir>` 把每段音频的 encoder hidden state 缓存到本地（按 sha1(path) 命名），避免每个 epoch 重复跑前端（Paraformer 前端较耗时）。后续第 8 节的 `train_speech_minimind.py` 也支持同样的 `--encoder-type` / `--paraformer-model`，保证前后两阶段用同一编码器。
+**换用 Tiny Conformer + CTC 作为冻结编码器**（教学主线，替代上面的 Paraformer）：先按第 2 节训练得到 `outputs/02_acoustic_encoder/tiny_conformer_ctc.pt`，保持默认 `--encoder-type conformer`（或用 `--encoder-checkpoint` 显式指定），其余参数与上面一致：
+
+```bash
+python scripts/train_speech_projector.py \
+  --data data/aishell1/processed \
+  --encoder-checkpoint outputs/02_acoustic_encoder/tiny_conformer_ctc.pt \
+  --minimind-model /path/to/minimind-3 \
+  --output outputs/03_speech_minimind --epochs 5 --batch-size 2
+```
+
+无论用哪个后端，都冻结编码器和 MiniMind，只训练约 0.8M 参数的 `SpeechProjector`。这一步得到的是**语音条件的转写桥接模型**，还不是完整的 Speech LLM。
+
+脚本会按所选后端自动设置 `SpeechProjector.acoustic_dim`（Conformer=256，Paraformer=512），并把输入统一为 16kHz 波形（Paraformer 前端要求 16kHz，非 16kHz 会被校验拦截）。对较长训练集可用 `--hidden-cache <dir>` 把每段音频的 encoder hidden state 缓存到本地（按 sha1(path) 命名），避免每个 epoch 重复跑前端（Paraformer 前端较耗时）。后续第 8 节的 `train_speech_minimind.py` 也支持同样的 `--encoder-type` / `--paraformer-model`，保证前后两阶段用同一编码器。
+
+训练过程（AISHELL-1，约 9.5k step）的 loss 曲线：
+
+| train/loss_step | dev/loss |
+|---|---|
+| ![语音投影器训练 loss](assets/03_speech_projector_train_loss.png) | ![语音投影器 dev loss](assets/03_speech_projector_dev_loss.png) |
+
+train loss 从约 8.5 收敛到约 0.5；dev loss 从约 0.96 稳定下降到约 0.64。
 
 ### 6. 构建指令微调数据（用于下一阶段）
 
