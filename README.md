@@ -140,7 +140,19 @@ for p in model.parameters():
 model.eval()
 ```
 
-> **注意**：Paraformer-zh-streaming 是**完整的流式 ASR 模型**（输入 16kHz 波形 → 输出文本/时间戳），不像 `WhisperModel.from_pretrained(...).encoder` 那样直接暴露帧级 encoder hidden state。要拿它当喂养 `SpeechProjector` 的冻结声学编码器，需要在 FunASR 内部取出流式 encoder 的帧级输出（或分块推理时捕获 encoder 状态），并按其输出维度/帧率对齐 `SpeechProjector` 的 `acoustic_dim` 与长度换算。这部分属于「换用成熟编码器」的接入实现，还没在仓库里落地——下载完权重后仍需做 Adapter 层才能连上第 5 节的「冻结编码器、只训 Projector」流程。
+> **注意**：Paraformer-zh-streaming 是**完整的流式 ASR 模型**（输入 16kHz 波形 → 输出文本/时间戳），不像 `WhisperModel.from_pretrained(...).encoder` 那样直接暴露帧级 encoder hidden state。仓库已提供统一封装 `model/frozen_encoder.py`（`FrozenSpeechEncoder` 基类 + `TinyConformerEncoder` / `ParaformerFrozenEncoder` 两个后端），它在 FunASR 内部取出流式 encoder（`SANMEncoderChunkOpt`）的帧级输出作为 `acoustic_dim=512` 的声学表示，并自动完成 waveform→fbank→LFR 前端，因此可以像 Tiny Conformer 一样直接喂给 `SpeechProjector`：
+
+```bash
+# 用 Paraformer 当冻结声学编码器（ModelScope-first 下载见上），其余参数不变
+python scripts/train_speech_projector.py \
+  --data data/aishell1/processed \
+  --encoder-type paraformer \
+  --paraformer-model outputs/paraformer-streaming \
+  --minimind-model /path/to/minimind-3 \
+  --output outputs/03_speech_minimind_paraformer --epochs 3 --batch-size 2
+```
+
+仍用 Tiny Conformer 时保持默认（`--encoder-type conformer`）即可，行为与之前完全一致。`train_speech_projector.py` 会按所选后端自动设置 `SpeechProjector.acoustic_dim`（Conformer=256，Paraformer=512）并把输入统一为 16kHz 波形；对较长训练集可用 `--hidden-cache <dir>` 把每段音频的 encoder hidden state 缓存到本地（按 sha1(path) 命名），避免每个 epoch 重复跑前端（Paraformer 前端较耗时）。`train_speech_minimind.py` 也支持同样的 `--encoder-type` / `--paraformer-model`，保证前后两阶段用同一编码器。
 
 下载后可沿用前面第 5 节「冻结编码器、只训 Projector」的总体思路。
 

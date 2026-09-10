@@ -38,10 +38,12 @@ from tqdm import tqdm
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from model.ctc_model import TinyConformerCTC  # noqa: E402
+from model.frozen_encoder import build_frozen_encoder  # noqa: E402
 from model.minimind_adapter import forward_inputs_embeds, load_minimind  # noqa: E402
 from model.speech_projector import SpeechProjector  # noqa: E402
-from scripts.analyze_audio import log_mel, read_wav  # noqa: E402
+from scripts.analyze_audio import read_wav  # noqa: E402
+
+SAMPLE_RATE = 16000
 
 try:
     import wandb
@@ -74,20 +76,21 @@ class SpeechInstructionDataset(Dataset):
     def __len__(self) -> int:
         return len(self.rows)
 
-    def __getitem__(self, index: int) -> tuple[torch.Tensor, str, str]:
+    def __getitem__(self, index: int) -> tuple[torch.Tensor, int, str, str]:
         row = self.rows[index]
         audio_path = Path(row["audio"])
         if not audio_path.is_absolute():
             audio_path = self.manifest.parent / audio_path
         audio_array, rate = read_wav(audio_path)
-        features, _, _, _ = log_mel(audio_array, rate, 25, 10, 80)
-        return torch.from_numpy(features.astype(np.float32)), row["instruction"], row["answer"]
+        if rate != SAMPLE_RATE:
+            raise ValueError(f"expected {SAMPLE_RATE} Hz waveform, got {rate} (path={audio_path})")
+        return torch.from_numpy(audio_array.astype(np.float32)), rate, row["instruction"], row["answer"]
 
 
-def collate(batch: list[tuple[torch.Tensor, str, str]]) -> tuple[torch.Tensor, torch.Tensor, list[str], list[str]]:
-    features, instructions, answers = zip(*batch)
-    lengths = torch.tensor([item.size(0) for item in features], dtype=torch.long)
-    return pad_sequence(features, batch_first=True), lengths, list(instructions), list(answers)
+def collate(batch: list[tuple[torch.Tensor, int, str, str]]) -> tuple[torch.Tensor, torch.Tensor, list[str], list[str]]:
+    waveforms, rates, instructions, answers = zip(*batch)
+    lengths = torch.tensor([item.size(0) for item in waveforms], dtype=torch.long)
+    return pad_sequence(waveforms, batch_first=True), lengths, list(instructions), list(answers)
 
 
 def make_sft_batch(
@@ -151,14 +154,10 @@ def run_epoch(args, encoder, projector, lm, tokenizer, loader, device, optimizer
     lm.train(training)
     total_loss = 0.0
     steps = 0
-    for features, lengths, instructions, answers in tqdm(loader, desc="train" if training else "dev", unit="batch"):
-        features, lengths = features.to(device), lengths.to(device)
-        frame_steps = torch.arange(features.size(1), device=device).unsqueeze(0)
-        padding_mask = frame_steps >= lengths.unsqueeze(1)
+    for waveforms, lengths, instructions, answers in tqdm(loader, desc="train" if training else "dev", unit="batch"):
         with torch.no_grad():
-            acoustic = encoder(features, padding_mask)
+            acoustic, acoustic_lengths = encoder.encode(waveforms.to(device), lengths.to(device), SAMPLE_RATE)
             projected = projector(acoustic)
-            acoustic_lengths = encoder.subsampled_lengths(lengths).clamp_max(acoustic.size(1))
             projected_lengths = projector.output_lengths(acoustic_lengths).clamp_max(projected.size(1))
 
         inputs_embeds, attention_mask, labels = make_sft_batch(
@@ -227,6 +226,10 @@ def main() -> None:
                         help="dir or single JSONL with {train,dev}.jsonl (audio/instruction/answer)")
     parser.add_argument("--encoder-checkpoint", type=Path,
                         default=Path("outputs/02_acoustic_encoder/tiny_conformer_ctc.pt"))
+    parser.add_argument("--encoder-type", choices=("conformer", "paraformer"), default="conformer",
+                        help="frozen acoustic encoder backend")
+    parser.add_argument("--paraformer-model", default=None,
+                        help="FunASR model id/dir for --encoder-type paraformer")
     parser.add_argument("--projector-checkpoint", type=Path, required=True,
                         help="trained SpeechProjector ckpt (outputs/03_speech_minimind/projector_epoch_XXX.pt)")
     parser.add_argument("--minimind-model", type=Path, required=True,
@@ -265,16 +268,17 @@ def main() -> None:
         wandb.init(project=args.wandb_project, name=args.wandb_name, config=vars(args))
 
     # ---- load frozen frontend ----
-    enc_ckpt = torch.load(args.encoder_checkpoint, map_location=device, weights_only=False)
-    encoder_model = TinyConformerCTC(len(enc_ckpt["vocab"]))
-    encoder_model.load_state_dict(enc_ckpt["model"])
-    encoder_model.to(device).eval()
-    for p in encoder_model.parameters():
-        p.requires_grad_(False)
+    encoder = build_frozen_encoder(
+        args.encoder_type,
+        checkpoint=str(args.encoder_checkpoint) if args.encoder_type == "conformer" else None,
+        model_id=args.paraformer_model,
+        device=device,
+    )
+    acoustic_dim = encoder.output_dim
 
     proj_ckpt = torch.load(args.projector_checkpoint, map_location=device, weights_only=False)
     llm_dim = int(proj_ckpt.get("llm_hidden_size", 768))
-    projector = SpeechProjector(256, llm_dim).to(device)
+    projector = SpeechProjector(acoustic_dim, llm_dim).to(device)
     projector.load_state_dict(proj_ckpt["projector"])
     projector.eval()
     for p in projector.parameters():
@@ -345,10 +349,10 @@ def main() -> None:
 
     ckpt_dir = args.output if args.tune == "full" else args.output
     for epoch in range(1, args.epochs + 1):
-        train_loss = run_epoch(args, encoder_model.encoder, projector, lm, tokenizer,
+        train_loss = run_epoch(args, encoder, projector, lm, tokenizer,
                                train_loader, device, optimizer)
         with torch.no_grad():
-            dev_loss = run_epoch(args, encoder_model.encoder, projector, lm, tokenizer,
+            dev_loss = run_epoch(args, encoder, projector, lm, tokenizer,
                                  dev_loader, device)
         if args.tune == "full":
             # full: save whole model + tokenizer (safetensors / bin)

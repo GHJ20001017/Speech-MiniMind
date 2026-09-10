@@ -33,10 +33,12 @@ except ImportError:  # pragma: no cover - wandb optional
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
-from model.ctc_model import TinyConformerCTC  # noqa: E402
+from model.frozen_encoder import FrozenSpeechEncoder, build_frozen_encoder  # noqa: E402
 from model.minimind_adapter import forward_inputs_embeds, load_minimind, token_embeddings  # noqa: E402
 from model.speech_projector import SpeechProjector  # noqa: E402
-from scripts.analyze_audio import log_mel, read_wav  # noqa: E402
+from scripts.analyze_audio import read_wav  # noqa: E402
+
+SAMPLE_RATE = 16000
 
 
 class AishellCSVDataset(Dataset):
@@ -49,13 +51,14 @@ class AishellCSVDataset(Dataset):
     def __len__(self) -> int:
         return len(self.rows)
 
-    def __getitem__(self, index: int) -> tuple[torch.Tensor, str, str, str]:
+    def __getitem__(self, index: int) -> tuple[torch.Tensor, int, str, str, str]:
         row = self.rows[index]
         audio = Path(row["path"])
         audio_array, rate = read_wav(audio)
-        features, _, _, _ = log_mel(audio_array, rate, 25, 10, 80)
+        if rate != SAMPLE_RATE:
+            raise ValueError(f"expected {SAMPLE_RATE} Hz waveform, got {rate} (path={audio})")
         text = "".join(row["text"].split())
-        return torch.from_numpy(features.astype(np.float32)), self.prompt, text, row["path"]
+        return torch.from_numpy(audio_array.astype(np.float32)), rate, self.prompt, text, row["path"]
 
 
 class InstructionJSONLDataset(Dataset):
@@ -85,20 +88,21 @@ class InstructionJSONLDataset(Dataset):
     def __len__(self) -> int:
         return len(self.rows)
 
-    def __getitem__(self, index: int) -> tuple[torch.Tensor, str, str, str]:
+    def __getitem__(self, index: int) -> tuple[torch.Tensor, int, str, str, str]:
         row = self.rows[index]
         audio_path = Path(row["audio"])
         if not audio_path.is_absolute():
             audio_path = self.manifest.parent / audio_path
         audio_array, rate = read_wav(audio_path)
-        features, _, _, _ = log_mel(audio_array, rate, 25, 10, 80)
-        return torch.from_numpy(features.astype(np.float32)), row["prompt"], row["answer"], str(audio_path)
+        if rate != SAMPLE_RATE:
+            raise ValueError(f"expected {SAMPLE_RATE} Hz waveform, got {rate} (path={audio_path})")
+        return torch.from_numpy(audio_array.astype(np.float32)), rate, row["prompt"], row["answer"], str(audio_path)
 
 
-def collate(batch: list[tuple[torch.Tensor, str, str, str]]) -> tuple[torch.Tensor, torch.Tensor, list[str], list[str], list[str]]:
-    features, prompts, texts, paths = zip(*batch)
-    lengths = torch.tensor([item.size(0) for item in features], dtype=torch.long)
-    return pad_sequence(features, batch_first=True), lengths, list(prompts), list(texts), list(paths)
+def collate(batch: list[tuple[torch.Tensor, int, str, str, str]]) -> tuple[torch.Tensor, torch.Tensor, list[str], list[str], list[str]]:
+    waveforms, rates, prompts, texts, paths = zip(*batch)
+    lengths = torch.tensor([item.size(0) for item in waveforms], dtype=torch.long)
+    return pad_sequence(waveforms, batch_first=True), lengths, list(prompts), list(texts), list(paths)
 
 
 def make_batch_embeddings(
@@ -134,18 +138,59 @@ def make_batch_embeddings(
     return padded, attention_mask, padded_labels
 
 
-def run_epoch(args, encoder, projector, lm, tokenizer, loader, device, optimizer=None):
+def encode_batch(encoder, waveforms, lengths, device):
+    """Encode one batch through the unified FrozenSpeechEncoder interface."""
+    with torch.no_grad():
+        acoustic, acoustic_lengths = encoder.encode(waveforms.to(device), lengths.to(device), SAMPLE_RATE)
+    return acoustic, acoustic_lengths
+
+
+def load_or_encode_batch(encoder, waveforms, lengths, paths, cache_dir, device):
+    """Return cached (hidden, hidden_lengths) per sample, else encode and write.
+
+    Cache files are ``{cache_dir}/<sha1(path)>.pt``. We always recompute in the
+    same batch when any member is missing, then persist what we computed.
+    """
+    import hashlib
+
+    cache = {}
+    to_encode = []
+    cache_dir = Path(cache_dir)
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    for i, path in enumerate(paths):
+        key = hashlib.sha1(path.encode()).hexdigest()[:16]
+        cache_file = cache_dir / f"{key}.pt"
+        if cache_file.exists():
+            cache[i] = torch.load(cache_file, weights_only=True, map_location=device)
+        else:
+            to_encode.append(i)
+    if to_encode:
+        idx = torch.tensor(to_encode, dtype=torch.long, device=waveforms.device)
+        sub = torch.index_select(waveforms, 0, idx)
+        sub_lens = torch.index_select(lengths, 0, idx)
+        hidden, hidden_lengths = encode_batch(encoder, sub, sub_lens, device)
+        for pos, i in enumerate(to_encode):
+            key = hashlib.sha1(paths[i].encode()).hexdigest()[:16]
+            cache_file = cache_dir / f"{key}.pt"
+            entry = (hidden[pos].cpu(), hidden_lengths[pos].cpu())
+            torch.save(entry, cache_file)
+            cache[i] = tuple(v.to(device) for v in entry)
+    # reassemble in original order
+    batch_hidden = torch.stack([cache[i][0] for i in range(len(paths))], dim=0)
+    batch_lengths = torch.stack([cache[i][1] for i in range(len(paths))], dim=0)
+    return batch_hidden, batch_lengths
+
+
+def run_epoch(args, encoder, projector, lm, tokenizer, loader, device, optimizer=None, cache_dir=None):
     training = optimizer is not None
     projector.train(training)
     total_loss = 0.0
-    for features, lengths, prompts, texts, _ in tqdm(loader, desc="train" if training else "dev", unit="batch"):
-        features, lengths = features.to(device), lengths.to(device)
-        frame_steps = torch.arange(features.size(1), device=device).unsqueeze(0)
-        padding_mask = frame_steps >= lengths.unsqueeze(1)
-        with torch.no_grad():
-            acoustic = encoder(features, padding_mask)
+    for waveforms, lengths, prompts, texts, paths in tqdm(loader, desc="train" if training else "dev", unit="batch"):
+        if cache_dir is not None:
+            acoustic, acoustic_lengths = load_or_encode_batch(encoder, waveforms, lengths, paths, cache_dir, device)
+        else:
+            acoustic, acoustic_lengths = encode_batch(encoder, waveforms, lengths, device)
         projected = projector(acoustic)
-        acoustic_lengths = encoder.subsampled_lengths(lengths).clamp_max(acoustic.size(1))
         projected_lengths = projector.output_lengths(acoustic_lengths).clamp_max(projected.size(1))
         inputs_embeds, attention_mask, labels = make_batch_embeddings(
             lm,
@@ -222,7 +267,13 @@ def resolve_dataset(
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--data", type=Path, default=Path("data/aishell1/processed"))
+    parser.add_argument("--encoder-type", choices=("conformer", "paraformer"), default="conformer",
+                        help="frozen acoustic encoder backend (conformer=offline default, paraformer=FunASR streaming)")
     parser.add_argument("--encoder-checkpoint", type=Path, default=Path("outputs/02_acoustic_encoder/tiny_conformer_ctc.pt"))
+    parser.add_argument("--paraformer-model", default=None,
+                        help="FunASR model id/dir for --encoder-type paraformer (default ModelScope iic/...-online)")
+    parser.add_argument("--hidden-cache", type=Path, default=None,
+                        help="directory to cache per-utterance encoder hidden states across epochs (.pt, keyed by sha1(path))")
     parser.add_argument("--minimind-model", type=Path, required=True, help="local Transformers-format MiniMind model directory")
     parser.add_argument("--output", type=Path, default=Path("outputs/03_speech_minimind"))
     parser.add_argument("--epochs", type=int, default=3)
@@ -243,20 +294,20 @@ def main() -> None:
         if wandb is None:
             raise SystemExit("wandb not installed. Run: python -m pip install -r requirements.txt")
         wandb.init(project=args.wandb_project, name=args.wandb_name, config=vars(args))
-    checkpoint = torch.load(args.encoder_checkpoint, map_location=device, weights_only=False)
-    encoder_model = TinyConformerCTC(len(checkpoint["vocab"]))
-    encoder_model.load_state_dict(checkpoint["model"])
-    encoder_model.to(device)
-    encoder_model.eval()
-    for parameter in encoder_model.parameters():
-        parameter.requires_grad_(False)
+    encoder = build_frozen_encoder(
+        encoder_type=args.encoder_type,
+        checkpoint=str(args.encoder_checkpoint) if args.encoder_type == "conformer" else None,
+        model_id=args.paraformer_model,
+        device=device,
+    )
+    acoustic_dim = encoder.output_dim
 
     lm, tokenizer = load_minimind(args.minimind_model, device)
     for parameter in lm.parameters():
         parameter.requires_grad_(False)
 
     llm_dim = int(lm.config.hidden_size)
-    projector = SpeechProjector(256, llm_dim).to(device)
+    projector = SpeechProjector(acoustic_dim, llm_dim).to(device)
     optimizer = torch.optim.AdamW(projector.parameters(), lr=args.lr)
 
     train_set, train_format = resolve_dataset(args.data, "train", args.data_format, args.prompt)
@@ -282,15 +333,18 @@ def main() -> None:
         csv.DictWriter(handle, fieldnames=["epoch", "train_loss", "dev_loss"]).writeheader()
 
     print(f"device: {device}")
+    print(f"acoustic_dim: {acoustic_dim} (frame_shift_ms={encoder.output_frame_shift_ms})")
     print(f"projector_parameters: {sum(p.numel() for p in projector.parameters()):,}")
     print(f"data_format: {train_format}")
     print(f"train_set_rows: {len(train_set)}")
     print(f"dev_set_rows: {len(dev_set)}")
 
     for epoch in range(1, args.epochs + 1):
-        train_loss = run_epoch(args, encoder_model.encoder, projector, lm, tokenizer, train_loader, device, optimizer)
+        train_loss = run_epoch(args, encoder, projector, lm, tokenizer, train_loader, device, optimizer,
+                               cache_dir=args.hidden_cache)
         with torch.no_grad():
-            dev_loss = run_epoch(args, encoder_model.encoder, projector, lm, tokenizer, dev_loader, device)
+            dev_loss = run_epoch(args, encoder, projector, lm, tokenizer, dev_loader, device,
+                                 cache_dir=args.hidden_cache)
         torch.save({"projector": projector.state_dict(), "epoch": epoch, "llm_hidden_size": llm_dim}, args.output / f"projector_epoch_{epoch:03d}.pt")
         with (args.output / "metrics.csv").open("a", newline="", encoding="utf-8") as handle:
             csv.DictWriter(handle, fieldnames=["epoch", "train_loss", "dev_loss"]).writerow(
