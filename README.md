@@ -272,22 +272,21 @@ python scripts/resample_stage2_mixed.py --data data/stage2_mixed --sr 16000
 ```bash
 python scripts/train_speech_minimind.py \
   --data data/stage2_mixed \
-  --encoder-checkpoint outputs/02_acoustic_encoder/tiny_conformer_ctc.pt \
-  --projector-checkpoint outputs/03_speech_minimind/projector_epoch_005.pt \
+  --encoder-type paraformer \
+  --paraformer-model outputs/paraformer-streaming \
+  --projector-checkpoint outputs/03_speech_minimind_paraformer/projector_epoch_005.pt \
   --minimind-model /path/to/minimind-3 \
-  --output outputs/04_speech_minimind_sft --epochs 2 --batch-size 2 \
+  --output outputs/04_speech_minimind_sft --epochs 3 --batch-size 2 \
   --lora-r 8 --lora-alpha 16
 ```
 
-- 冻结 Conformer 和 Speech Projector（语音前端），只对 MiniMind 做指令微调，支持两种方式（`--tune`）：
+- 冻结语音编码器（`--encoder-type` 选 Paraformer 或 Conformer）和 Speech Projector（语音前端），只对 MiniMind 做指令微调，支持两种方式（`--tune`）：
   - `--tune lora`（默认）：只对 MiniMind 注入并训练 **LoRA adapter**（约 0.5% 可训练参数），省显存、速度快。
   - `--tune full`：**全参数微调**全部 MiniMind 权重（100% 参数可训练），效果更强但需要更大显存、更慢。
 - 损失只在 `answer` 部分计算（prompt 与语音前缀用 -100 mask），标准 SFT。
 - 常见参数：`--tune lora|full`、`--lang-filter zh|en`（只练单一语言）、`--limit N`（先小规模试跑）、`--lora-r/--lora-alpha`（LoRA 秩）、`--epochs`、`--wandb`。
 - `--tune lora` 依赖 `peft`：`python -m pip install peft`。
 - 输出 `outputs/04_speech_minimind_sft/`：`config.json`、`metrics.csv`、`lora_epoch_XXX/adapter_model.safetensors`（lora 模式）或 `model_epoch_XXX/model.safetensors`（full 模式，完整可加载模型）。
-
-Tiny Conformer 的详细架构与参数规格见 [`docs/02_acoustic_encoder.md`](docs/02_acoustic_encoder.md) 第 5 节（含结构图、参数表、4× 下采样推导）。
 
 ## 路线 B：音频专属 LLM（离散 codebook 端到端）— 待补充
 
