@@ -55,6 +55,7 @@ HOP_MS = 10
 N_MELS = 80
 BLANK = 0
 FPS = 1000 // HOP_MS  # log-mel frames per second (always 100 for HOP_MS=10)
+PLAY_TICK_S = 0.2  # auto-play advances this much *audio* time per real-time tick (1:1 with gr.Timer below)
 
 
 def greedy_collapse(token_ids: list[int] | np.ndarray, id_to_char: dict[int, str]) -> str:
@@ -321,14 +322,14 @@ def main() -> None:
             inputs=[play_toggle],
             outputs=[play_state],
         )
-        timer = gr.Timer(value=0.2)
+        timer = gr.Timer(value=PLAY_TICK_S)
 
         def tick(play_on: bool, pos: float | None) -> tuple:
             # NOTE: values must arrive via `inputs`; reading the component
             # object's ``.value`` would only ever see the initial state.
             pos = pos if pos is not None else 0.0
             if play_on and state["dur_s"] > 0:
-                pos = min(pos + state["dur_s"] / 120.0, state["dur_s"])
+                pos = min(pos + PLAY_TICK_S, state["dur_s"])
             return pos, offline_final_view(pos), streaming_view(pos)
 
         timer.tick(
