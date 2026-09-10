@@ -217,7 +217,7 @@ class ParaformerFrozenEncoder(FrozenSpeechEncoder):
             parameter.requires_grad_(False)
         self._engine = self._encoder
 
-        from funasr.frontends.wav_frontend import WavFrontendOnline
+        from funasr.frontends.wav_frontend import WavFrontend
 
         front_conf = {
             "fs": 16000,
@@ -229,7 +229,12 @@ class ParaformerFrozenEncoder(FrozenSpeechEncoder):
             "lfr_n": 6,
             "dither": 0.0 if self._disable_dither else 1.0,
         }
-        self._frontend = WavFrontendOnline(**front_conf)
+        # Use the stateless offline WavFrontend (fbank -> LFR, same parameters
+        # as the streaming one) instead of WavFrontendOnline: the online variant
+        # keeps per-utterance fbank/LFR cache that leaks across calls (invalid
+        # for re-usable batched encoding). WavFrontend computes each utterance
+        # independently, so every call yields deterministic frames.
+        self._frontend = WavFrontend(**front_conf)
 
     @torch.no_grad()
     def encode(
@@ -246,34 +251,30 @@ class ParaformerFrozenEncoder(FrozenSpeechEncoder):
         waveforms = waveforms.to(self._device)
         lengths = lengths.to(self._device)
 
-        # FunASR's streaming frontend (WavFrontendOnline) hard-asserts
-        # batch_size == 1 and keeps per-utterance fbank/LFR state internally on
-        # fixed device. To support arbitrary batch and any requested device we
-        # run the frontend on CPU (it is a small numeric frontend; negligible
-        # cost) and only move the spliced fbank to the encoder device.
+        # FunASR's WavFrontend* run fbank/LFR one utterance at a time (they
+        # loop over the batch internally and the streaming frontend additionally
+        # hard-asserts batch_size == 1), so we extract features per-utterance on
+        # CPU (cheap) and collect them into one padded batch. The SANM encoder,
+        # however, does support a real batch - so we forward it exactly once
+        # over the whole batch instead of once per utterance.
         self._frontend = self._frontend.to("cpu")
-        hidden_parts: list[torch.Tensor] = []
-        length_parts: list[torch.Tensor] = []
+        feats_parts: list[torch.Tensor] = []
+        feats_lengths_parts: list[torch.Tensor] = []
         for i in range(waveforms.size(0)):
-            wav = waveforms[i : i + 1].cpu()
-            wav_len = lengths[i : i + 1].cpu()
-            feats, feats_lengths = self._frontend(wav, wav_len)
-            encoder_out, encoder_out_lens, _ = self._encoder(
-                feats.to(self._device), feats_lengths.to(self._device)
+            feats, feats_lengths = self._frontend(
+                waveforms[i : i + 1].cpu(), lengths[i : i + 1].cpu()
             )
-            # Per-utterance encoder out is (1, T, D) (singleton batch dim) - or
-            # (1, 1, T, D) on some builds. Normalise to (T, D) before packing
-            # the padded batch, so pad_sequence aligns on the time axis.
-            if encoder_out.dim() == 4 and encoder_out.size(1) == 1:
-                encoder_out = encoder_out.squeeze(1)
-            encoder_out = encoder_out[0]  # drop singleton batch dim -> (T, D)
-            hidden_parts.append(encoder_out)
-            length_parts.append(encoder_out_lens.reshape(-1))
+            feats_parts.append(feats[0])  # (1, T, frontend_dim) -> (T, dim)
+            feats_lengths_parts.append(feats_lengths.reshape(-1))
+        feats_pad = torch.nn.utils.rnn.pad_sequence(feats_parts, batch_first=True).to(self._device)
+        feats_lengths = torch.cat(feats_lengths_parts, dim=0).to(self._device)
 
-        # hidden_parts all share the same trailing dim (output_dim); pad time.
-        hidden = torch.nn.utils.rnn.pad_sequence(hidden_parts, batch_first=True)
-        hidden_lengths = torch.cat(length_parts, dim=0)
-        return hidden, hidden_lengths
+        encoder_out, encoder_out_lens, _ = self._encoder(feats_pad, feats_lengths)
+        # Per-utterance encoder out is (B, T, D) - or (B, 1, T, D) on some
+        # builds. Normalise the channel dim away if present.
+        if encoder_out.dim() == 4 and encoder_out.size(1) == 1:
+            encoder_out = encoder_out.squeeze(1)
+        return encoder_out, encoder_out_lens
 
 
 def build_frozen_encoder(
