@@ -93,6 +93,8 @@ python scripts/evaluate_conformer_ctc.py \
 
 同目录还有 `scripts/plot_training_metrics.py` 可绘制训练曲线。
 
+> **关于本套编码器的泛化性声明**：我们的 Tiny Conformer + CTC 编码器只在**中文 AISHELL-1**（16kHz 平稳播音、整句 2–6s）上训练，且**模型参数量较小**（约 Tiny 规模），因此对**训练分布外的输入难以有较好的泛化性能**——例如带口音/方言、语速异常、嘈杂或更长的音频，识别效果会明显下降甚至出现乱码。这属于预期行为，并非代码 bug；如果你需要更通用、更强的声学编码，**建议用开源的成熟编码器**（如 Whisper/OpenAI、语音自监督前端 wav2vec 2.0 / HuBERT 等）来达到更好的效果，本项目的编码器更多用于教学演示与完整流水线打通。
+
 我们训练好的 02 章「Tiny Conformer + CTC」编码器权重（**流式**与**非流式**）会发布在 ModelScope 仓库：<https://www.modelscope.cn/models/ghjghj1017/Tiny_Conformer>。你可以直接下载使用，省去本地重新训练，例如拿非流式 `tiny_conformer_ctc.pt` 作为第 5 节 Projector 或第 8 节指令微调的 `--encoder-checkpoint`。
 
 ### 5. 训练语音投影器连接 MiniMind（03，Speech Projector）
