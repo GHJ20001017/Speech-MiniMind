@@ -45,7 +45,11 @@
 | 03 接入 MiniMind | Speech Projector、语音前缀 | [docs/03_speech_minimind.md](docs/03_speech_minimind.md) |
 | 04 指令微调语音 LLM | 合并指令数据、LoRA 微调 MiniMind | 见下方第 7/8 节 |
 
-## 环境安装
+## 路线 A：级联式 Speech LLM 端到端实现（教学主线）
+
+下面从环境准备到最终微调，把**路线 A** 完整走一遍：编码器 → Projector → 指令微调语音 LLM →（文本回答，可接 TTS 输出语音）。
+
+### 环境安装
 
 ```bash
 conda create -n speech-llm python=3.11
@@ -265,6 +269,10 @@ python scripts/train_speech_minimind.py \
 - 输出 `outputs/04_speech_minimind_sft/`：`config.json`、`metrics.csv`、`lora_epoch_XXX/adapter_model.safetensors`（lora 模式）或 `model_epoch_XXX/model.safetensors`（full 模式，完整可加载模型）。
 
 Tiny Conformer 的详细架构与参数规格见 [`docs/02_acoustic_encoder.md`](docs/02_acoustic_encoder.md) 第 5 节（含结构图、参数表、4× 下采样推导）。
+
+## 路线 B：音频专属 LLM（离散 codebook 端到端）— 待补充
+
+> 路线 B 的实现（语音 → 量化编码器/codebook → 音频专属 LLM → 解码器 → 语音输出）将在此之后补充。本仓库当前教学主线为**路线 A**（见上文）。
 
 ## 目录结构
 
