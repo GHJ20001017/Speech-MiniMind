@@ -114,6 +114,33 @@ python scripts/visualize_asr_webui.py \
 
 我们训练好的 02 章「Tiny Conformer + CTC」编码器权重（**流式**与**非流式**）会发布在 ModelScope 仓库：<https://www.modelscope.cn/models/ghjghj1017/Tiny_Conformer>。你可以直接下载使用，省去本地重新训练。
 
+### 换用成熟开源编码器（推荐 Whisper-Small）
+
+如果后续要换成开源的成熟声学编码器，**推荐用 Whisper**（Apache-2.0 开源，权重与接口都很稳定），把前面的 Tiny Conformer + CTC 替换掉。先用脚本下载 **whisper-small**（约 244M 参数）的 Transformers 权重：
+
+```bash
+# 生成环境已通过 requirements.txt 带上 huggingface_hub；也可手动安装
+python -m pip install -U huggingface_hub
+
+# 默认走 ModelScope 镜像（openai-mirror/whisper-small，国内更快）
+python scripts/download_whisper.py --output outputs/whisper-small
+
+# 也可改走 Hugging Face 上游（openai/whisper-small）
+python scripts/download_whisper.py --source huggingface --output outputs/whisper-small
+```
+
+脚本会把权重、配置、processor/tokenizer 一起下载到 `outputs/whisper-small`，之后用 `transformers` 加载其 encoder 并冻结：
+
+```python
+from transformers import WhisperModel
+encoder = WhisperModel.from_pretrained("outputs/whisper-small").encoder
+for p in encoder.parameters():
+    p.requires_grad_(False)
+encoder.eval()
+```
+
+> Whisper encoder 也吃 **16kHz 的 80 维 log-mel**（25ms / 10ms），与本项目现有 `analyze_audio.log_mel` 一致；接入时需要把 `SpeechProjector` 的 `acoustic_dim` 改成对应维度（whisper-small 为 512）并适配帧率换算。下载后可沿用前面第 5 节「冻结编码器、只训 Projector」的流程。
+
 ### 5. 训练语音投影器连接 MiniMind（03，Speech Projector）
 
 先下载 [MiniMind Transformers 权重](https://github.com/jingyaogong/minimind)（如 `minimind-3`）到本地目录，然后：
