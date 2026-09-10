@@ -254,6 +254,17 @@ python scripts/merge_speech_instruction_datasets.py \
 `{"audio": "<绝对路径>", "instruction": "...", "answer": "...", "task": "...", "source": "...", "lang": "zh|en"}`
 并把三类数据的音频路径统一解析为绝对路径（三者的相对基准原本不同），moss 的多轮 `history` 会按单轮格式丢弃。可以配合 `--skip-missing-audio` 跳过缺失音频的条目。
 
+三个来源的音频原生采样率不一致（`speech_instructions`/AISHELL=16kHz、`moss_speech_qa`(Qwen3-TTS)=24kHz、`voiceassistant400k_50k`=22050Hz），而下游 `train_speech_minimind.py` 强制要求 **16kHz** 输入。合并后先统一重采样到 16kHz：
+
+```bash
+# 需要 soundfile + soxr（无 soxr 时自动回退 scipy）
+python -m pip install soundfile soxr
+
+python scripts/resample_stage2_mixed.py --data data/stage2_mixed --sr 16000
+```
+
+脚本把非 16kHz 的音频重采样为 16-bit PCM WAV，写入 `data/stage2_mixed/resampled_audio/{train,dev}/`，并把 `train/dev.jsonl` 中对应行的 `audio` 路径更新到新文件（原音频不动，其余字段保持不变）。脚本幂等：已是 16kHz 的行直接跳过。
+
 ### 8. 指令微调语音 LLM（04，真正的 Speech-MiniMind）
 
 在第 5 节的 Projector 桥接基础上，用第 6/7 节的指令数据**微调 MiniMind 本身**（LoRA），让它变成能听语音、理解指令、生成回答的完整 Speech LLM：
