@@ -5,20 +5,12 @@ It loads the *non-streaming* Tiny Conformer CTC model (:class:`model.ctc_model
 (:class:`model.ctc_streaming.TinyStreamingConformerCTC`), then lets you watch a
 long utterance be recognised two ways side by side:
 
-* **Left — non-streaming, "pseudo-streaming" (伪流式)**: a non-causal model has
-  no stable incremental output, so to force text out before the audio ends we
-  re-run it on the *growing prefix* each time.  Text does appear incrementally,
-  but it is expensive (O(N^2)) and **already-emitted words can be revised** as
-  more audio arrives.
+* **Left — non-streaming, whole utterance (整句)**: the model's real usage;
+  the full transcript appears only once the whole utterance has been read in.
 * **Right — streaming (增量)**: audio is fed chunk by chunk (``chunk_size``
   block-frames, left-context cache carried between chunks); recognised text
   appears *incrementally* and is **causal/stable** — once a word is out it is
   never rewritten.
-* **Bottom — non-streaming, whole utterance (整句)**: the model's real usage;
-  the full transcript only appears once the whole utterance has been read in.
-
-Seeing the left text flip while the right stays put is exactly the difference
-between a non-causal and a causal acoustic encoder.
 
 A wave plot + progress slider + optional auto-play simulate the streaming
 read-in, so the difference is visible without a microphone.
@@ -99,34 +91,6 @@ class OfflineASR:
             out_len = self.model.encoder.subsampled_lengths(lengths).clamp_max(logits.size(1))
             best = logits.argmax(dim=-1)[0, : int(out_len[0])].cpu().tolist()
         return greedy_collapse(best, self.id_to_char)
-
-    def incremental_prefix(
-        self, features: np.ndarray, device: torch.device, n_points: int = 20
-    ) -> list[tuple[float, str]]:
-        """Simulate streaming output from a NON-causal model.
-
-        The non-streaming encoder attends over the whole utterance, so it has
-        no stable incremental output.  The only faithful way to get text out of
-        it before the audio ends is to re-run the model on the *growing prefix*
-        each time.  Returns ``[(end_seconds_k, text_on_prefix_k), ...]``.
-
-        This is deliberately labelled "pseudo-streaming" in the UI: it is
-        O(N^2) expensive and, because the model still sees future frames inside
-        each prefix, already-emitted text can be revised as more audio arrives.
-        """
-        n_raw = features.shape[0]
-        if n_raw == 0:
-            return []
-        # keep at least ~1s of audio per point (the 4x subsampling needs a few
-        # frames) and cap the number of re-runs so the pre-compute stays fast
-        max_points = max(2, n_raw // FPS)
-        n_points = max(2, min(n_points, max_points))
-        grid = sorted({int(round(k * n_raw / n_points)) for k in range(1, n_points + 1)})
-        grid[-1] = n_raw
-        milestones: list[tuple[float, str]] = []
-        for end in grid:
-            milestones.append((end / FPS, self.transcribe(features[:end], device)))
-        return milestones
 
 
 class StreamingASR:
@@ -235,14 +199,13 @@ def main() -> None:
     state = {
         "dur_s": 0.0,
         "offline_text": None,
-        "offline_prefix": None,
         "milestones": None,
         "fig": None,
     }
 
     def reset() -> None:
         state.update(
-            dur_s=0.0, offline_text=None, offline_prefix=None, milestones=None, fig=None
+            dur_s=0.0, offline_text=None, milestones=None, fig=None
         )
 
     def do_run(audio_path: str) -> tuple:
@@ -254,39 +217,16 @@ def main() -> None:
         state["dur_s"] = audio.size / rate
         state["fig"] = build_waveform(audio, rate)
         if offline is not None:
-            # true non-streaming output (needs the whole utterance) ...
+            # true non-streaming output (needs the whole utterance)
             state["offline_text"] = offline.transcribe(features, device)
-            # ... plus the growing-prefix re-runs that fake streaming output
-            state["offline_prefix"] = offline.incremental_prefix(features, device)
         if streaming is not None:
             state["milestones"] = streaming.incremental(features, device)
         # reset playback to 0 and set the slider max to the new duration
         return (
             state["fig"],
             gr.update(maximum=state["dur_s"], value=0.0),
-            offline_prefix_view(0.0),
-            streaming_view(0.0),
             offline_final_view(0.0),
-        )
-
-    def offline_prefix_view(pos: float) -> str:
-        """Pseudo-streaming: non-streaming model re-run on the growing prefix."""
-        if offline is None:
-            return "（非流式模型未加载：未提供 --checkpoint）"
-        prefix = state.get("offline_prefix")
-        if prefix is None:
-            return "⏳ 识别中…"
-        text = ""
-        for end_s, t in prefix:
-            if end_s <= pos + 1e-3:
-                text = t
-        if not text:
-            text = "…尚无输出…"
-        return (
-            f"**{text}**\n\n"
-            f"（已输入 {pos:.1f}s / {state['dur_s']:.1f}s）\n\n"
-            "> 非流式模型没有因果性，只能把“到目前为止的整段音频”反复重跑。"
-            "后面的音频一到，**已经出现的文字可能被改写**。"
+            streaming_view(0.0),
         )
 
     def offline_final_view(pos: float) -> str:
@@ -319,16 +259,14 @@ def main() -> None:
         )
 
     def on_slider(pos: float) -> tuple:
-        return (offline_prefix_view(pos), streaming_view(pos), offline_final_view(pos))
+        return (offline_final_view(pos), streaming_view(pos))
 
     with gr.Blocks(title="Speech-MiniMind · 第 02 章 ASR 编码器可视化") as demo:
         gr.Markdown(
             "# 声学编码器 ASR 可视化（流式 vs 非流式）\n\n"
-            "**左「非流式 · 伪流式」**：把非流式模型在“增长前缀”上反复重跑，"
-            "强行挤出的增量输出——会随音频增长被**修正**。\n\n"
+            "**左「非流式 · 整句」**：非流式模型真正的用法，只有整段音频输完才出最终结果。\n\n"
             "**右「流式 · 真流式」**：因果模型，文本随音频**边输入边生成**，"
-            "出现即稳定。\n\n"
-            "**底部「非流式 · 整句」**：非流式模型真正的用法，只有整段音频输完才出最终结果。"
+            "**一旦出现就不会被后续音频改写**。"
         )
         with gr.Row():
             audio_upload = gr.Audio(type="filepath", label="上传 / 选择 WAV（模型在 16kHz 中文朗读上训练，AISHELL 语料为佳）")
@@ -346,13 +284,11 @@ def main() -> None:
 
         with gr.Row():
             with gr.Column(scale=1):
-                gr.Markdown("### 左 — 非流式模型 · 伪流式（增长前缀重跑）")
-                offline_prefix_out = gr.Markdown()
+                gr.Markdown("### 左 — 非流式模型 · 整句（读完整段音频才有结果）")
+                offline_final_out = gr.Markdown()
             with gr.Column(scale=1):
                 gr.Markdown("### 右 — 流式模型 · 真流式（增量、稳定）")
                 streaming_out = gr.Markdown()
-        gr.Markdown("### 非流式模型 · 整句（真正的非流式用法）")
-        offline_final_out = gr.Markdown()
 
         if args.audio:
 
@@ -366,19 +302,19 @@ def main() -> None:
             ).then(
                 fn=do_run,
                 inputs=[audio_upload],
-                outputs=[fig, slider, offline_prefix_out, streaming_out, offline_final_out],
+                outputs=[fig, slider, offline_final_out, streaming_out],
             )
         else:
             run_btn.click(
                 fn=do_run,
                 inputs=[audio_upload],
-                outputs=[fig, slider, offline_prefix_out, streaming_out, offline_final_out],
+                outputs=[fig, slider, offline_final_out, streaming_out],
             )
 
         slider.release(
             fn=on_slider,
             inputs=[slider],
-            outputs=[offline_prefix_out, streaming_out, offline_final_out],
+            outputs=[offline_final_out, streaming_out],
         )
         play_toggle.change(
             fn=lambda on: on,
@@ -393,12 +329,12 @@ def main() -> None:
             pos = pos if pos is not None else 0.0
             if play_on and state["dur_s"] > 0:
                 pos = min(pos + state["dur_s"] / 120.0, state["dur_s"])
-            return pos, offline_prefix_view(pos), streaming_view(pos), offline_final_view(pos)
+            return pos, offline_final_view(pos), streaming_view(pos)
 
         timer.tick(
             fn=tick,
             inputs=[play_state, slider],
-            outputs=[slider, offline_prefix_out, streaming_out, offline_final_out],
+            outputs=[slider, offline_final_out, streaming_out],
         )
 
     demo.queue().launch(server_name=args.host, server_port=args.port, show_error=True, share=False)
