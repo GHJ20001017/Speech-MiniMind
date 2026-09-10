@@ -110,36 +110,39 @@ python scripts/visualize_asr_webui.py \
 
 ![评估声学编码器演示](assets/02_acoustic_encoder_demo.gif)
 
-> **关于本套编码器的泛化性声明**：我们的 Tiny Conformer + CTC 编码器只在**中文 AISHELL-1**（16kHz 平稳播音、整句 2–6s）上训练，且**模型参数量较小**（约 Tiny 规模），因此对**训练分布外的输入难以有较好的泛化性能**——例如带口音/方言、语速异常、嘈杂或更长的音频，识别效果会明显下降甚至出现乱码。这属于预期行为，并非代码 bug；如果你需要更通用、更强的声学编码，**建议用开源的成熟编码器**（如 Whisper/OpenAI、语音自监督前端 wav2vec 2.0 / HuBERT 等）来达到更好的效果，本项目的编码器更多用于教学演示与完整流水线打通。
+> **关于本套编码器的泛化性声明**：我们的 Tiny Conformer + CTC 编码器只在**中文 AISHELL-1**（16kHz 平稳播音、整句 2–6s）上训练，且**模型参数量较小**（约 Tiny 规模），因此对**训练分布外的输入难以有较好的泛化性能**——例如带口音/方言、语速异常、嘈杂或更长的音频，识别效果会明显下降甚至出现乱码。这属于预期行为，并非代码 bug；如果你需要更通用、更强的声学编码，**建议用开源的成熟编码器**（如 FunASR 的 Paraformer-zh-streaming、Whisper/OpenAI、语音自监督前端 wav2vec 2.0 / HuBERT 等）来达到更好的效果，本项目的编码器更多用于教学演示与完整流水线打通。
 
 我们训练好的 02 章「Tiny Conformer + CTC」编码器权重（**流式**与**非流式**）会发布在 ModelScope 仓库：<https://www.modelscope.cn/models/ghjghj1017/Tiny_Conformer>。你可以直接下载使用，省去本地重新训练。
 
-### 换用成熟开源编码器（推荐 Whisper-Small）
+### 换用成熟开源编码器（推荐 FunASR / Paraformer-zh-streaming）
 
-如果后续要换成开源的成熟声学编码器，**推荐用 Whisper**（Apache-2.0 开源，权重与接口都很稳定），把前面的 Tiny Conformer + CTC 替换掉。先用脚本下载 **whisper-small**（约 244M 参数）的 Transformers 权重：
+如果后续要换成开源的成熟声学编码器，**推荐用 FunASR 的 Paraformer-zh-streaming**（阿里达摩院开源，Apache-2.0，中文实时流式识别的工业级模型，约 220M 参数），把前面的 Tiny Conformer + CTC 替换掉。先用脚本下载权重：
 
 ```bash
-# 生成环境已通过 requirements.txt 带上 huggingface_hub；也可手动安装
-python -m pip install -U huggingface_hub
+# 首次需要 funasr 与 modelscope（均为可选依赖，手动安装即可）
+python -m pip install funasr modelscope
 
-# 默认走 ModelScope 镜像（openai-mirror/whisper-small，国内更快）
-python scripts/download_whisper.py --output outputs/whisper-small
+# 默认走 ModelScope 镜像（iic/speech_paraformer-large_asr_nat-zh-cn-16k-common-vocab8404-online，国内更快）
+python scripts/download_paraformer_streaming.py --output outputs/paraformer-streaming
 
-# 也可改走 Hugging Face 上游（openai/whisper-small）
-python scripts/download_whisper.py --source huggingface --output outputs/whisper-small
+# 也可改走 Hugging Face 上游（funasr/paraformer-zh-streaming）
+python scripts/download_paraformer_streaming.py --source huggingface --output outputs/paraformer-streaming
 ```
 
-脚本会把权重、配置、processor/tokenizer 一起下载到 `outputs/whisper-small`，之后用 `transformers` 加载其 encoder 并冻结：
+脚本会把权重、配置、tokens 一起下载到 `outputs/paraformer-streaming`。它**不是** `transformers` 模型，要用 FunASR 的 `AutoModel` 加载：
 
 ```python
-from transformers import WhisperModel
-encoder = WhisperModel.from_pretrained("outputs/whisper-small").encoder
-for p in encoder.parameters():
+from funasr import AutoModel
+
+model = AutoModel(model="outputs/paraformer-streaming", device="cuda")  # 支持 device="cpu"/"cuda"
+for p in model.parameters():
     p.requires_grad_(False)
-encoder.eval()
+model.eval()
 ```
 
-> Whisper encoder 也吃 **16kHz 的 80 维 log-mel**（25ms / 10ms），与本项目现有 `analyze_audio.log_mel` 一致；接入时需要把 `SpeechProjector` 的 `acoustic_dim` 改成对应维度（whisper-small 为 512）并适配帧率换算。下载后可沿用前面第 5 节「冻结编码器、只训 Projector」的流程。
+> **注意**：Paraformer-zh-streaming 是**完整的流式 ASR 模型**（输入 16kHz 波形 → 输出文本/时间戳），不像 `WhisperModel.from_pretrained(...).encoder` 那样直接暴露帧级 encoder hidden state。要拿它当喂养 `SpeechProjector` 的冻结声学编码器，需要在 FunASR 内部取出流式 encoder 的帧级输出（或分块推理时捕获 encoder 状态），并按其输出维度/帧率对齐 `SpeechProjector` 的 `acoustic_dim` 与长度换算。这部分属于「换用成熟编码器」的接入实现，还没在仓库里落地——下载完权重后仍需做 Adapter 层才能连上第 5 节的「冻结编码器、只训 Projector」流程。
+
+下载后可沿用前面第 5 节「冻结编码器、只训 Projector」的总体思路。
 
 ### 5. 训练语音投影器连接 MiniMind（03，Speech Projector）
 
