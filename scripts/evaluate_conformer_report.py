@@ -16,6 +16,7 @@ from tqdm import tqdm
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 from model.ctc_model import TinyConformerCTC  # noqa: E402
+from model.ctc_streaming import TinyStreamingConformerCTC  # noqa: E402
 from scripts.evaluate_conformer_ctc import (  # noqa: E402
     AishellEvalDataset,
     collate,
@@ -31,11 +32,19 @@ def evaluate_checkpoint(
     batch_size: int,
     device: torch.device,
     sample_count: int,
+    streaming: bool = False,
+    chunk_size: int = 32,
+    left_context: int = 16,
 ) -> tuple[dict[str, object], list[dict[str, str]], list[dict[str, object]]]:
     checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
     vocab = checkpoint["vocab"]
     id_to_char = {index: char for char, index in vocab.items()}
-    model = TinyConformerCTC(len(vocab)).to(device)
+    if streaming:
+        model = TinyStreamingConformerCTC(
+            len(vocab), chunk_size=chunk_size, left_context=left_context
+        ).to(device)
+    else:
+        model = TinyConformerCTC(len(vocab)).to(device)
     model.load_state_dict(checkpoint["model"])
     model.eval()
     dataset = AishellEvalDataset(data_dir / f"{split}.csv")
@@ -111,13 +120,17 @@ def main() -> None:
     parser.add_argument("--batch-size", type=int, default=16)
     parser.add_argument("--max-checkpoints", type=int, default=0, help="only evaluate the latest N checkpoints; 0 means all")
     parser.add_argument("--samples", type=int, default=20, help="number of reference/prediction samples per split")
+    parser.add_argument("--streaming", action="store_true", help="evaluate streaming CTC checkpoints (TinyStreamingConformerCTC)")
+    parser.add_argument("--chunk-size", type=int, default=32, help="streaming chunk-size (block frames); only used with --streaming")
+    parser.add_argument("--left-context", type=int, default=16, help="streaming left-context frames; only used with --streaming")
     args = parser.parse_args()
 
     checkpoint_dir = args.checkpoints or args.output
     checkpoints = sorted(checkpoint_dir.glob("checkpoint_epoch_*.pt"))
-    final_checkpoint = checkpoint_dir / "tiny_conformer_ctc.pt"
-    if final_checkpoint.exists() and final_checkpoint not in checkpoints:
-        checkpoints.append(final_checkpoint)
+    final_names = ("tiny_streaming_conformer_ctc.pt",) if args.streaming else ("tiny_conformer_ctc.pt",)
+    for final_checkpoint in (checkpoint_dir / name for name in final_names):
+        if final_checkpoint.exists() and final_checkpoint not in checkpoints:
+            checkpoints.append(final_checkpoint)
     if not checkpoints:
         raise FileNotFoundError(f"no checkpoints found in {checkpoint_dir}")
     if args.max_checkpoints:
@@ -131,7 +144,8 @@ def main() -> None:
     for checkpoint in checkpoints:
         for split in splits:
             metrics, examples, errors = evaluate_checkpoint(
-                checkpoint, args.data, split, args.batch_size, device, args.samples
+                checkpoint, args.data, split, args.batch_size, device, args.samples,
+                streaming=args.streaming, chunk_size=args.chunk_size, left_context=args.left_context,
             )
             all_metrics.append(metrics)
             sample_rows.extend({"checkpoint": str(checkpoint), "split": split, **row} for row in examples)

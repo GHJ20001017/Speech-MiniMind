@@ -62,7 +62,7 @@ FRAME_MS = 25
 HOP_MS = 10
 N_MELS = 80
 BLANK = 0
-FPS = 1000.0 / HOP_MS  # log-mel frames per second (~100)
+FPS = 1000 // HOP_MS  # log-mel frames per second (always 100 for HOP_MS=10)
 
 
 def greedy_collapse(token_ids: list[int] | np.ndarray, id_to_char: dict[int, str]) -> str:
@@ -331,7 +331,7 @@ def main() -> None:
             "**底部「非流式 · 整句」**：非流式模型真正的用法，只有整段音频输完才出最终结果。"
         )
         with gr.Row():
-            audio_upload = gr.Audio(type="filepath", label="上传 / 选择 WAV（建议 ≥ 1 分钟的长音频）")
+            audio_upload = gr.Audio(type="filepath", label="上传 / 选择 WAV（模型在 16kHz 中文朗读上训练，AISHELL 语料为佳）")
             run_btn = gr.Button("▶ 开始识别", variant="primary")
         audio_pick = gr.Dropdown(
             choices=[str(args.audio)] if args.audio else [],

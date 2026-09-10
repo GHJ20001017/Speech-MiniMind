@@ -17,6 +17,7 @@ from tqdm import tqdm
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 from model.ctc_model import TinyConformerCTC  # noqa: E402
+from model.ctc_streaming import TinyStreamingConformerCTC  # noqa: E402
 from scripts.analyze_audio import log_mel, read_wav  # noqa: E402
 
 
@@ -100,6 +101,9 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--data", type=Path, default=Path("data/aishell1/processed"))
     parser.add_argument("--checkpoint", type=Path, default=Path("outputs/02_acoustic_encoder/tiny_conformer_ctc.pt"))
+    parser.add_argument("--streaming", action="store_true", help="evaluate a streaming CTC checkpoint (TinyStreamingConformerCTC)")
+    parser.add_argument("--chunk-size", type=int, default=32, help="streaming chunk-size (block frames); only used with --streaming")
+    parser.add_argument("--left-context", type=int, default=16, help="streaming left-context frames; only used with --streaming")
     parser.add_argument("--split", choices=("dev", "test"), default="dev")
     parser.add_argument("--batch-size", type=int, default=16)
     parser.add_argument("--limit", type=int, default=0, help="evaluate only the first N examples; 0 means all")
@@ -110,7 +114,12 @@ def main() -> None:
     checkpoint = torch.load(args.checkpoint, map_location=device, weights_only=False)
     vocab = checkpoint["vocab"]
     id_to_char = {index: char for char, index in vocab.items()}
-    model = TinyConformerCTC(len(vocab)).to(device)
+    if args.streaming:
+        model = TinyStreamingConformerCTC(
+            len(vocab), chunk_size=args.chunk_size, left_context=args.left_context
+        ).to(device)
+    else:
+        model = TinyConformerCTC(len(vocab)).to(device)
     model.load_state_dict(checkpoint["model"])
     model.eval()
 
