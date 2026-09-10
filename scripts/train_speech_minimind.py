@@ -39,6 +39,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from model.frozen_encoder import build_frozen_encoder  # noqa: E402
+from model import ddp_utils  # noqa: E402
 from model.minimind_adapter import forward_inputs_embeds, load_minimind  # noqa: E402
 from model.speech_projector import SpeechProjector  # noqa: E402
 from scripts.analyze_audio import read_wav  # noqa: E402
@@ -126,8 +127,10 @@ def make_sft_batch(
         all_ids = torch.cat([prompt_ids, target_ids])[: max_length - speech.size(0)]
         prompt_count = min(prompt_ids.numel(), all_ids.numel())
 
-        # `model` may be a PeftModel; unwrap to reach the base LM's embeddings.
-        base_model = model.get_base_model() if hasattr(model, "get_base_model") else model
+        # `model` may be a PeftModel (optionally DDP-wrapped); unwrap to reach
+        # the base LM's embeddings.
+        base_model = ddp_utils.unwrap(model)
+        base_model = base_model.get_base_model() if hasattr(base_model, "get_base_model") else base_model
         text_embeds = base_model.model.embed_tokens(all_ids).unsqueeze(0)  # [1, T, H]
 
         emb = torch.cat([speech.unsqueeze(0), text_embeds], dim=1)  # [1, S+T, H]
@@ -147,14 +150,16 @@ def make_sft_batch(
     return torch.cat(seqs_emb, dim=0), torch.stack(seqs_mask), torch.stack(seqs_label)
 
 
-def run_epoch(args, encoder, projector, lm, tokenizer, loader, device, optimizer=None):
+def run_epoch(args, encoder, projector, lm, tokenizer, loader, device, optimizer=None, sampler=None, epoch=0):
     training = optimizer is not None
+    if sampler is not None:
+        ddp_utils.set_epoch(sampler, epoch)
     projector.train(False)  # frontend always frozen/eval
     encoder.train(False)
     lm.train(training)
     total_loss = 0.0
     steps = 0
-    for waveforms, lengths, instructions, answers in tqdm(loader, desc="train" if training else "dev", unit="batch"):
+    for waveforms, lengths, instructions, answers in tqdm(loader, desc="train" if training else "dev", unit="batch", disable=not ddp_utils.is_main()):
         with torch.no_grad():
             acoustic, acoustic_lengths = encoder.encode(waveforms.to(device), lengths.to(device), SAMPLE_RATE)
             projected = projector(acoustic)
@@ -178,11 +183,11 @@ def run_epoch(args, encoder, projector, lm, tokenizer, loader, device, optimizer
                 [p for p in lm.parameters() if p.requires_grad], args.grad_clip
             )
             optimizer.step()
-            if args.wandb:
+            if args.wandb and ddp_utils.is_main():
                 wandb.log({"train/loss_step": loss.detach().item()})
         total_loss += loss.detach().item()
         steps += 1
-    return total_loss / max(steps, 1)
+    return ddp_utils.all_reduce_mean(total_loss / max(steps, 1))
 
 
 def add_lora(
@@ -261,8 +266,9 @@ def main() -> None:
     args = parser.parse_args()
 
     torch.manual_seed(args.seed)
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    if args.wandb:
+    ddp_utils.setup()
+    device = ddp_utils.device()
+    if args.wandb and ddp_utils.is_main():
         if wandb is None:
             raise SystemExit("wandb not installed. Run: python -m pip install -r requirements.txt")
         wandb.init(project=args.wandb_project, name=args.wandb_name, config=vars(args))
@@ -302,7 +308,9 @@ def main() -> None:
             p.requires_grad_(True)
         print("full fine-tune: all MiniMind parameters trainable")
 
-    trainable_params = [p for p in lm.parameters() if p.requires_grad]
+    base_lm = ddp_utils.unwrap(lm)
+    lm = ddp_utils.wrap(lm)
+    trainable_params = [p for p in base_lm.parameters() if p.requires_grad]
     optimizer = torch.optim.AdamW(trainable_params, lr=args.lr)
 
     # ---- data ----
@@ -326,51 +334,57 @@ def main() -> None:
         train_set.rows = train_set.rows[: args.limit]
         dev_set.rows = dev_set.rows[: min(args.limit, len(dev_set))]
 
-    train_loader = DataLoader(train_set, batch_size=args.batch_size, shuffle=True, collate_fn=collate)
-    dev_loader = DataLoader(dev_set, batch_size=args.batch_size, shuffle=False, collate_fn=collate)
+    train_sampler = ddp_utils.make_sampler(train_set, shuffle=True)
+    dev_sampler = ddp_utils.make_sampler(dev_set, shuffle=False)
+    train_loader = DataLoader(train_set, batch_size=args.batch_size, shuffle=(train_sampler is None), sampler=train_sampler, collate_fn=collate)
+    dev_loader = DataLoader(dev_set, batch_size=args.batch_size, shuffle=False, sampler=dev_sampler, collate_fn=collate)
 
-    # save config + initial model/adapter reference
-    base_name = "minimind_base_lora" if args.tune == "lora" else "minimind_base"
-    lm.save_pretrained(args.output / base_name)
-    tokenizer.save_pretrained(args.output / base_name)
-    (args.output / "config.json").write_text(
-        json.dumps(vars(args) | {"device": str(device), "llm_hidden_size": llm_dim},
-                   default=str, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-    with (args.output / "metrics.csv").open("w", newline="", encoding="utf-8") as handle:
-        import csv
-        csv.DictWriter(handle, fieldnames=["epoch", "train_loss", "dev_loss"]).writeheader()
+    # save config + initial model/adapter reference (rank 0 only)
+    if ddp_utils.is_main():
+        args.output.mkdir(parents=True, exist_ok=True)
+        base_name = "minimind_base_lora" if args.tune == "lora" else "minimind_base"
+        base_lm.save_pretrained(args.output / base_name)
+        tokenizer.save_pretrained(args.output / base_name)
+        (args.output / "config.json").write_text(
+            json.dumps(vars(args) | {"device": str(device), "llm_hidden_size": llm_dim},
+                       default=str, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        with (args.output / "metrics.csv").open("w", newline="", encoding="utf-8") as handle:
+            import csv
+            csv.DictWriter(handle, fieldnames=["epoch", "train_loss", "dev_loss"]).writeheader()
 
-    print(f"device: {device}")
-    print(f"llm_hidden_size: {llm_dim}")
-    print(f"tune_mode: {args.tune}")
-    print(f"train_set_rows: {len(train_set)}  dev_set_rows: {len(dev_set)}")
-    print(f"trainable: {sum(p.numel() for p in trainable_params):,} "
-          f"({sum(p.numel() for p in trainable_params) * 100.0 / max(sum(p.numel() for p in lm.parameters()), 1):.2f}% of LLM)")
+    if ddp_utils.is_main():
+        print(f"device: {device}")
+        print(f"llm_hidden_size: {llm_dim}")
+        print(f"tune_mode: {args.tune}")
+        print(f"train_set_rows: {len(train_set)}  dev_set_rows: {len(dev_set)}")
+        print(f"trainable: {sum(p.numel() for p in trainable_params):,} "
+              f"({sum(p.numel() for p in trainable_params) * 100.0 / max(sum(p.numel() for p in base_lm.parameters()), 1):.2f}% of LLM)")
 
-    ckpt_dir = args.output if args.tune == "full" else args.output
     for epoch in range(1, args.epochs + 1):
         train_loss = run_epoch(args, encoder, projector, lm, tokenizer,
-                               train_loader, device, optimizer)
+                               train_loader, device, optimizer, sampler=train_sampler, epoch=epoch)
         with torch.no_grad():
             dev_loss = run_epoch(args, encoder, projector, lm, tokenizer,
                                  dev_loader, device)
-        if args.tune == "full":
-            # full: save whole model + tokenizer (safetensors / bin)
-            lm.save_pretrained(args.output / f"model_epoch_{epoch:03d}")
-            tokenizer.save_pretrained(args.output / f"model_epoch_{epoch:03d}")
-            ckpt_tag = f"model_epoch_{epoch:03d}"
-        else:
-            lm.save_pretrained(args.output / f"lora_epoch_{epoch:03d}")
-            ckpt_tag = f"lora_epoch_{epoch:03d}"
-        with (args.output / "metrics.csv").open("a", newline="", encoding="utf-8") as handle:
-            import csv
-            csv.DictWriter(handle, fieldnames=["epoch", "train_loss", "dev_loss"]).writerow(
-                {"epoch": epoch, "train_loss": f"{train_loss:.6f}", "dev_loss": f"{dev_loss:.6f}"})
-        print(f"epoch={epoch:03d} train_loss={train_loss:.4f} dev_loss={dev_loss:.4f} -> {ckpt_tag}")
-        if args.wandb:
+        if ddp_utils.is_main():
+            if args.tune == "full":
+                # full: save whole model + tokenizer (safetensors / bin)
+                base_lm.save_pretrained(args.output / f"model_epoch_{epoch:03d}")
+                tokenizer.save_pretrained(args.output / f"model_epoch_{epoch:03d}")
+                ckpt_tag = f"model_epoch_{epoch:03d}"
+            else:
+                base_lm.save_pretrained(args.output / f"lora_epoch_{epoch:03d}")
+                ckpt_tag = f"lora_epoch_{epoch:03d}"
+            with (args.output / "metrics.csv").open("a", newline="", encoding="utf-8") as handle:
+                import csv
+                csv.DictWriter(handle, fieldnames=["epoch", "train_loss", "dev_loss"]).writerow(
+                    {"epoch": epoch, "train_loss": f"{train_loss:.6f}", "dev_loss": f"{dev_loss:.6f}"})
+            print(f"epoch={epoch:03d} train_loss={train_loss:.4f} dev_loss={dev_loss:.4f} -> {ckpt_tag}")
+        if args.wandb and ddp_utils.is_main():
             wandb.log({"train/loss": train_loss, "dev/loss": dev_loss, "epoch": epoch})
-    if args.wandb:
+    if args.wandb and ddp_utils.is_main():
         wandb.finish()
+    ddp_utils.cleanup()
 
 
 if __name__ == "__main__":

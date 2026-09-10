@@ -36,6 +36,7 @@ except ImportError:  # pragma: no cover - wandb optional
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
+from model import ddp_utils  # noqa: E402
 from model.ctc_streaming import TinyStreamingConformerCTC  # noqa: E402
 from scripts.analyze_audio import log_mel, read_wav  # noqa: E402
 
@@ -66,7 +67,8 @@ def collate(batch: list[tuple[torch.Tensor, torch.Tensor]]) -> tuple[torch.Tenso
     return padded_features, lengths, padded_targets, target_lengths
 
 
-def evaluate(model: TinyStreamingConformerCTC, loader: DataLoader, device: torch.device, loss_fn: nn.Module) -> float:
+def evaluate(model, loader: DataLoader, device: torch.device, loss_fn: nn.Module) -> float:
+    base = ddp_utils.unwrap(model)
     model.eval()
     total_loss = 0.0
     with torch.no_grad():
@@ -75,7 +77,7 @@ def evaluate(model: TinyStreamingConformerCTC, loader: DataLoader, device: torch
             frame_steps = torch.arange(features.size(1), device=device).unsqueeze(0)
             padding_mask = frame_steps >= lengths.to(device).unsqueeze(1)
             logits = model(features, padding_mask)
-            input_lengths = model.encoder.subsampled_lengths(lengths).clamp_max(logits.size(1))
+            input_lengths = base.encoder.subsampled_lengths(lengths).clamp_max(logits.size(1))
             loss = loss_fn(logits.log_softmax(-1).transpose(0, 1), targets, input_lengths, target_lengths)
             total_loss += loss.detach().item()
     return total_loss / max(len(loader), 1)
@@ -96,44 +98,52 @@ def main() -> None:
     parser.add_argument("--wandb-name", default=None)
     args = parser.parse_args()
     torch.manual_seed(args.seed)
+    ddp_utils.setup()
     vocab = {line.strip(): index for index, line in enumerate((args.data / "vocab.txt").read_text(encoding="utf-8").splitlines()) if line.strip()}
-    train_loader = DataLoader(AishellDataset(args.data / "train.csv", vocab), batch_size=args.batch_size, shuffle=True, collate_fn=collate)
-    dev_loader = DataLoader(AishellDataset(args.data / "dev.csv", vocab), batch_size=args.batch_size, shuffle=False, collate_fn=collate)
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = TinyStreamingConformerCTC(len(vocab), chunk_size=args.chunk_size, left_context=args.left_context).to(device)
+    train_set = AishellDataset(args.data / "train.csv", vocab)
+    dev_set = AishellDataset(args.data / "dev.csv", vocab)
+    train_sampler = ddp_utils.make_sampler(train_set, shuffle=True)
+    dev_sampler = ddp_utils.make_sampler(dev_set, shuffle=False)
+    train_loader = DataLoader(train_set, batch_size=args.batch_size, shuffle=(train_sampler is None), sampler=train_sampler, collate_fn=collate)
+    dev_loader = DataLoader(dev_set, batch_size=args.batch_size, shuffle=False, sampler=dev_sampler, collate_fn=collate)
+    device = ddp_utils.device()
+    model = ddp_utils.wrap(TinyStreamingConformerCTC(len(vocab), chunk_size=args.chunk_size, left_context=args.left_context).to(device))
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)
     loss_fn = nn.CTCLoss(blank=0, zero_infinity=True)
 
-    if args.wandb:
+    if args.wandb and ddp_utils.is_main():
         if wandb is None:
             raise SystemExit("wandb not installed. Run: python -m pip install -r requirements.txt")
         wandb.init(project=args.wandb_project, name=args.wandb_name, config=vars(args))
-    args.output.mkdir(parents=True, exist_ok=True)
-    (args.output / "config.json").write_text(json.dumps({
-        "data": str(args.data), "epochs": args.epochs, "batch_size": args.batch_size,
-        "learning_rate": args.lr, "seed": args.seed, "chunk_size": args.chunk_size, "left_context": args.left_context,
-        "parameters": sum(parameter.numel() for parameter in model.parameters()),
-        "device": str(device), "vocab_size": len(vocab),
-    }, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     metrics_path = args.output / "metrics.csv"
-    with metrics_path.open("w", newline="") as metrics_file:
-        metrics_writer = csv.DictWriter(metrics_file, fieldnames=["epoch", "train_ctc_loss", "dev_ctc_loss", "learning_rate", "seconds"])
-        metrics_writer.writeheader()
-    print(f"device: {device}")
-    print(f"parameters: {sum(parameter.numel() for parameter in model.parameters()):,}")
-    print(f"streaming: chunk_size={args.chunk_size} left_context={args.left_context}")
+    if ddp_utils.is_main():
+        args.output.mkdir(parents=True, exist_ok=True)
+        (args.output / "config.json").write_text(json.dumps({
+            "data": str(args.data), "epochs": args.epochs, "batch_size": args.batch_size,
+            "learning_rate": args.lr, "seed": args.seed, "chunk_size": args.chunk_size, "left_context": args.left_context,
+            "parameters": sum(parameter.numel() for parameter in model.parameters()),
+            "device": str(device), "vocab_size": len(vocab),
+        }, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        with metrics_path.open("w", newline="") as metrics_file:
+            metrics_writer = csv.DictWriter(metrics_file, fieldnames=["epoch", "train_ctc_loss", "dev_ctc_loss", "learning_rate", "seconds"])
+            metrics_writer.writeheader()
+        print(f"device: {device}")
+        print(f"parameters: {sum(parameter.numel() for parameter in model.parameters()):,}")
+        print(f"streaming: chunk_size={args.chunk_size} left_context={args.left_context}")
     for epoch in range(1, args.epochs + 1):
         epoch_start = time.perf_counter()
+        ddp_utils.set_epoch(train_sampler, epoch)
+        base = ddp_utils.unwrap(model)
         model.train()
         total_loss = 0.0
-        progress = tqdm(train_loader, desc=f"epoch {epoch:02d}/{args.epochs}", unit="batch")
+        progress = tqdm(train_loader, desc=f"epoch {epoch:02d}/{args.epochs}", unit="batch", disable=not ddp_utils.is_main())
         batch_count = 0
         for features, lengths, targets, target_lengths in progress:
             features, targets = features.to(device), targets.to(device)
             frame_steps = torch.arange(features.size(1), device=device).unsqueeze(0)
             padding_mask = frame_steps >= lengths.to(device).unsqueeze(1)
             logits = model(features, padding_mask)
-            input_lengths = model.encoder.subsampled_lengths(lengths).clamp_max(logits.size(1))
+            input_lengths = base.encoder.subsampled_lengths(lengths).clamp_max(logits.size(1))
             loss = loss_fn(logits.log_softmax(-1).transpose(0, 1), targets, input_lengths, target_lengths)
             optimizer.zero_grad()
             loss.backward()
@@ -143,51 +153,54 @@ def main() -> None:
             total_loss += loss_value
             batch_count += 1
             progress.set_postfix(loss=f"{loss_value:.4f}", avg=f"{total_loss / batch_count:.4f}")
-            if args.wandb:
+            if args.wandb and ddp_utils.is_main():
                 wandb.log({"train/ctc_loss_step": loss_value, "step": epoch * len(train_loader) + batch_count})
-        train_loss = total_loss / max(len(train_loader), 1)
-        dev_loss = evaluate(model, dev_loader, device, loss_fn)
+        train_loss = ddp_utils.all_reduce_mean(total_loss / max(len(train_loader), 1))
+        dev_loss = ddp_utils.all_reduce_mean(evaluate(model, dev_loader, device, loss_fn))
         seconds = time.perf_counter() - epoch_start
-        with metrics_path.open("a", newline="") as metrics_file:
-            csv.DictWriter(metrics_file, fieldnames=["epoch", "train_ctc_loss", "dev_ctc_loss", "learning_rate", "seconds"]).writerow({
-                "epoch": epoch, "train_ctc_loss": f"{train_loss:.6f}", "dev_ctc_loss": f"{dev_loss:.6f}",
-                "learning_rate": f"{args.lr:.8g}", "seconds": f"{seconds:.2f}",
-            })
+        if ddp_utils.is_main():
+            with metrics_path.open("a", newline="") as metrics_file:
+                csv.DictWriter(metrics_file, fieldnames=["epoch", "train_ctc_loss", "dev_ctc_loss", "learning_rate", "seconds"]).writerow({
+                    "epoch": epoch, "train_ctc_loss": f"{train_loss:.6f}", "dev_ctc_loss": f"{dev_loss:.6f}",
+                    "learning_rate": f"{args.lr:.8g}", "seconds": f"{seconds:.2f}",
+                })
+            if args.wandb:
+                wandb.log({
+                    "train/ctc_loss": train_loss,
+                    "dev/ctc_loss": dev_loss,
+                    "train/learning_rate": args.lr,
+                    "epoch": epoch,
+                    "epoch_seconds": seconds,
+                })
+            checkpoint = args.output / f"checkpoint_epoch_{epoch:03d}.pt"
+            torch.save({"model": base.state_dict(), "vocab": vocab, "epoch": epoch, "train_ctc_loss": train_loss, "dev_ctc_loss": dev_loss}, checkpoint)
+            print(f"epoch={epoch:02d} train_ctc_loss={train_loss:.4f} dev_ctc_loss={dev_loss:.4f} seconds={seconds:.1f}")
+    if ddp_utils.is_main():
+        final_checkpoint = args.output / "tiny_streaming_conformer_ctc.pt"
+        torch.save({"model": ddp_utils.unwrap(model).state_dict(), "vocab": vocab, "epoch": args.epochs}, final_checkpoint)
+        metrics = list(csv.DictReader(metrics_path.open(encoding="utf-8")))
+        epochs = [int(row["epoch"]) for row in metrics]
+        train_losses = [float(row["train_ctc_loss"]) for row in metrics]
+        dev_losses = [float(row["dev_ctc_loss"]) for row in metrics]
+        figure, axis = plt.subplots(figsize=(8, 5), dpi=160)
+        axis.plot(epochs, train_losses, marker="o", markersize=4, linewidth=2, label="train")
+        axis.plot(epochs, dev_losses, marker="o", markersize=4, linewidth=2, label="dev")
+        axis.set_xlabel("Epoch")
+        axis.set_ylabel("CTC loss")
+        axis.set_title("Tiny Streaming Conformer CTC loss")
+        axis.set_xticks(epochs)
+        axis.yaxis.set_major_locator(MaxNLocator(nbins=8))
+        axis.grid(axis="y", alpha=0.25)
+        axis.legend(frameon=False)
+        figure.tight_layout()
+        figure.savefig(args.output / "loss_curve.png")
+        plt.close(figure)
+        print(f"metrics_saved: {metrics_path}")
+        print(f"loss_curve_saved: {args.output / 'loss_curve.png'}")
+        print(f"checkpoint_saved: {final_checkpoint}")
         if args.wandb:
-            wandb.log({
-                "train/ctc_loss": train_loss,
-                "dev/ctc_loss": dev_loss,
-                "train/learning_rate": args.lr,
-                "epoch": epoch,
-                "epoch_seconds": seconds,
-            })
-        checkpoint = args.output / f"checkpoint_epoch_{epoch:03d}.pt"
-        torch.save({"model": model.state_dict(), "vocab": vocab, "epoch": epoch, "train_ctc_loss": train_loss, "dev_ctc_loss": dev_loss}, checkpoint)
-        print(f"epoch={epoch:02d} train_ctc_loss={train_loss:.4f} dev_ctc_loss={dev_loss:.4f} seconds={seconds:.1f}")
-    final_checkpoint = args.output / "tiny_streaming_conformer_ctc.pt"
-    torch.save({"model": model.state_dict(), "vocab": vocab, "epoch": args.epochs}, final_checkpoint)
-    metrics = list(csv.DictReader(metrics_path.open(encoding="utf-8")))
-    epochs = [int(row["epoch"]) for row in metrics]
-    train_losses = [float(row["train_ctc_loss"]) for row in metrics]
-    dev_losses = [float(row["dev_ctc_loss"]) for row in metrics]
-    figure, axis = plt.subplots(figsize=(8, 5), dpi=160)
-    axis.plot(epochs, train_losses, marker="o", markersize=4, linewidth=2, label="train")
-    axis.plot(epochs, dev_losses, marker="o", markersize=4, linewidth=2, label="dev")
-    axis.set_xlabel("Epoch")
-    axis.set_ylabel("CTC loss")
-    axis.set_title("Tiny Streaming Conformer CTC loss")
-    axis.set_xticks(epochs)
-    axis.yaxis.set_major_locator(MaxNLocator(nbins=8))
-    axis.grid(axis="y", alpha=0.25)
-    axis.legend(frameon=False)
-    figure.tight_layout()
-    figure.savefig(args.output / "loss_curve.png")
-    plt.close(figure)
-    print(f"metrics_saved: {metrics_path}")
-    print(f"loss_curve_saved: {args.output / 'loss_curve.png'}")
-    print(f"checkpoint_saved: {final_checkpoint}")
-    if args.wandb:
-        wandb.finish()
+            wandb.finish()
+    ddp_utils.cleanup()
 
 
 if __name__ == "__main__":

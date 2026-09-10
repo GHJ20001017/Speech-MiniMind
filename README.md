@@ -57,6 +57,19 @@ conda activate speech-llm
 python -m pip install -r requirements.txt
 ```
 
+### 多卡训练（DDP）
+
+第 3 / 5 / 8 节的四个训练脚本（`train_conformer_ctc.py`、`train_conformer_streaming_ctc.py`、`train_speech_projector.py`、`train_speech_minimind.py`）都已支持多卡分布式训练。把 `python scripts/<脚本>.py ...` 换成 `torchrun` 即可，其余参数不变：
+
+```bash
+torchrun --nproc_per_node=4 scripts/train_conformer_ctc.py \
+  --data data/aishell1/processed --epochs 20 --batch-size 32 --lr 2e-4
+```
+
+- `--nproc_per_node=<N>` 开 N 张卡；脚本按 rank 自动分配设备、用 `DistributedSampler` 切分数据、跨卡求平均 loss。
+- 训练/验证 loss、checkpoint、`metrics.csv`、`loss_curve.png`、wandb 记录全部只在 rank 0 执行，各卡模型权重经梯度同步保持一致。
+- 不通过 `torchrun` 启动（无 `RANK`/`WORLD_SIZE`/`LOCAL_RANK` 环境变量）时自动退化为单卡行为，原有单卡命令完全不变。
+
 ### 1. 语音分析（00/01）
 
 对示例音频生成波形、频谱、STFT 动画：

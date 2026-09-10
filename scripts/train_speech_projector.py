@@ -34,6 +34,7 @@ except ImportError:  # pragma: no cover - wandb optional
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 from model.frozen_encoder import FrozenSpeechEncoder, build_frozen_encoder  # noqa: E402
+from model import ddp_utils  # noqa: E402
 from model.minimind_adapter import forward_inputs_embeds, load_minimind, token_embeddings  # noqa: E402
 from model.speech_projector import SpeechProjector  # noqa: E402
 from scripts.analyze_audio import read_wav  # noqa: E402
@@ -181,11 +182,13 @@ def load_or_encode_batch(encoder, waveforms, lengths, paths, cache_dir, device):
     return batch_hidden, batch_lengths
 
 
-def run_epoch(args, encoder, projector, lm, tokenizer, loader, device, optimizer=None, cache_dir=None):
+def run_epoch(args, encoder, projector, lm, tokenizer, loader, device, optimizer=None, cache_dir=None, sampler=None, epoch=0):
     training = optimizer is not None
+    if sampler is not None:
+        ddp_utils.set_epoch(sampler, epoch)
     projector.train(training)
     total_loss = 0.0
-    for waveforms, lengths, prompts, texts, paths in tqdm(loader, desc="train" if training else "dev", unit="batch"):
+    for waveforms, lengths, prompts, texts, paths in tqdm(loader, desc="train" if training else "dev", unit="batch", disable=not ddp_utils.is_main()):
         if cache_dir is not None:
             acoustic, acoustic_lengths = load_or_encode_batch(encoder, waveforms, lengths, paths, cache_dir, device)
         else:
@@ -215,10 +218,10 @@ def run_epoch(args, encoder, projector, lm, tokenizer, loader, device, optimizer
             loss.backward()
             torch.nn.utils.clip_grad_norm_(projector.parameters(), 1.0)
             optimizer.step()
-            if args.wandb:
+            if args.wandb and ddp_utils.is_main():
                 wandb.log({"train/loss_step": loss.detach().item()})
         total_loss += loss.detach().item()
-    return total_loss / max(len(loader), 1)
+    return ddp_utils.all_reduce_mean(total_loss / max(len(loader), 1))
 
 
 def resolve_dataset(
@@ -289,8 +292,9 @@ def main() -> None:
     parser.add_argument("--wandb-name", default=None)
     args = parser.parse_args()
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    if args.wandb:
+    ddp_utils.setup()
+    device = ddp_utils.device()
+    if args.wandb and ddp_utils.is_main():
         if wandb is None:
             raise SystemExit("wandb not installed. Run: python -m pip install -r requirements.txt")
         wandb.init(project=args.wandb_project, name=args.wandb_name, config=vars(args))
@@ -307,7 +311,7 @@ def main() -> None:
         parameter.requires_grad_(False)
 
     llm_dim = int(lm.config.hidden_size)
-    projector = SpeechProjector(acoustic_dim, llm_dim).to(device)
+    projector = ddp_utils.wrap(SpeechProjector(acoustic_dim, llm_dim).to(device))
     optimizer = torch.optim.AdamW(projector.parameters(), lr=args.lr)
 
     train_set, train_format = resolve_dataset(args.data, "train", args.data_format, args.prompt)
@@ -319,42 +323,47 @@ def main() -> None:
         train_set.rows = train_set.rows[: args.limit]
         dev_set.rows = dev_set.rows[: min(args.limit, len(dev_set))]
 
-    train_loader = DataLoader(train_set, batch_size=args.batch_size, shuffle=True, collate_fn=collate)
-    dev_loader = DataLoader(dev_set, batch_size=args.batch_size, shuffle=False, collate_fn=collate)
+    train_sampler = ddp_utils.make_sampler(train_set, shuffle=True)
+    dev_sampler = ddp_utils.make_sampler(dev_set, shuffle=False)
+    train_loader = DataLoader(train_set, batch_size=args.batch_size, shuffle=(train_sampler is None), sampler=train_sampler, collate_fn=collate)
+    dev_loader = DataLoader(dev_set, batch_size=args.batch_size, shuffle=False, sampler=dev_sampler, collate_fn=collate)
 
-    args.output.mkdir(parents=True, exist_ok=True)
-    (args.output / "config.json").write_text(
-        json.dumps(vars(args) | {"device": str(device), "llm_hidden_size": llm_dim}, default=str, ensure_ascii=False, indent=2)
-        + "\n",
-        encoding="utf-8",
-    )
+    if ddp_utils.is_main():
+        args.output.mkdir(parents=True, exist_ok=True)
+        (args.output / "config.json").write_text(
+            json.dumps(vars(args) | {"device": str(device), "llm_hidden_size": llm_dim}, default=str, ensure_ascii=False, indent=2)
+            + "\n",
+            encoding="utf-8",
+        )
+        with (args.output / "metrics.csv").open("w", newline="", encoding="utf-8") as handle:
+            csv.DictWriter(handle, fieldnames=["epoch", "train_loss", "dev_loss"]).writeheader()
 
-    with (args.output / "metrics.csv").open("w", newline="", encoding="utf-8") as handle:
-        csv.DictWriter(handle, fieldnames=["epoch", "train_loss", "dev_loss"]).writeheader()
-
-    print(f"device: {device}")
-    print(f"acoustic_dim: {acoustic_dim} (frame_shift_ms={encoder.output_frame_shift_ms})")
-    print(f"projector_parameters: {sum(p.numel() for p in projector.parameters()):,}")
-    print(f"data_format: {train_format}")
-    print(f"train_set_rows: {len(train_set)}")
-    print(f"dev_set_rows: {len(dev_set)}")
+    if ddp_utils.is_main():
+        print(f"device: {device}")
+        print(f"acoustic_dim: {acoustic_dim} (frame_shift_ms={encoder.output_frame_shift_ms})")
+        print(f"projector_parameters: {sum(p.numel() for p in projector.parameters()):,}")
+        print(f"data_format: {train_format}")
+        print(f"train_set_rows: {len(train_set)}")
+        print(f"dev_set_rows: {len(dev_set)}")
 
     for epoch in range(1, args.epochs + 1):
         train_loss = run_epoch(args, encoder, projector, lm, tokenizer, train_loader, device, optimizer,
-                               cache_dir=args.hidden_cache)
+                               cache_dir=args.hidden_cache, sampler=train_sampler, epoch=epoch)
         with torch.no_grad():
             dev_loss = run_epoch(args, encoder, projector, lm, tokenizer, dev_loader, device,
                                  cache_dir=args.hidden_cache)
-        torch.save({"projector": projector.state_dict(), "epoch": epoch, "llm_hidden_size": llm_dim}, args.output / f"projector_epoch_{epoch:03d}.pt")
-        with (args.output / "metrics.csv").open("a", newline="", encoding="utf-8") as handle:
-            csv.DictWriter(handle, fieldnames=["epoch", "train_loss", "dev_loss"]).writerow(
-                {"epoch": epoch, "train_loss": f"{train_loss:.6f}", "dev_loss": f"{dev_loss:.6f}"}
-            )
-        print(f"epoch={epoch:03d} train_loss={train_loss:.4f} dev_loss={dev_loss:.4f}")
-        if args.wandb:
+        if ddp_utils.is_main():
+            torch.save({"projector": ddp_utils.unwrap(projector).state_dict(), "epoch": epoch, "llm_hidden_size": llm_dim}, args.output / f"projector_epoch_{epoch:03d}.pt")
+            with (args.output / "metrics.csv").open("a", newline="", encoding="utf-8") as handle:
+                csv.DictWriter(handle, fieldnames=["epoch", "train_loss", "dev_loss"]).writerow(
+                    {"epoch": epoch, "train_loss": f"{train_loss:.6f}", "dev_loss": f"{dev_loss:.6f}"}
+                )
+            print(f"epoch={epoch:03d} train_loss={train_loss:.4f} dev_loss={dev_loss:.4f}")
+        if args.wandb and ddp_utils.is_main():
             wandb.log({"train/loss": train_loss, "dev/loss": dev_loss, "epoch": epoch})
-    if args.wandb:
+    if args.wandb and ddp_utils.is_main():
         wandb.finish()
+    ddp_utils.cleanup()
 
 
 if __name__ == "__main__":
