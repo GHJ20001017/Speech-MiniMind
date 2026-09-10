@@ -70,6 +70,14 @@ python scripts/train_conformer_streaming_ctc.py \
 ```
 
 
+训练过程（AISHELL-1，约 37k step）的 CTC loss 曲线：
+
+| train/ctc_loss_step | dev/ctc_loss |
+|---|---|
+| ![流式编码器训练 CTC loss](assets/02_streaming_train_loss.jpg) | ![流式编码器 dev CTC loss](assets/02_streaming_dev_loss.jpg) |
+
+train loss 从约 7 收敛到约 0.5；dev loss 从约 3.0 稳定下降到约 0.9。
+
 ### 4. 评估声学编码器（02）
 
 ```bash
@@ -176,6 +184,7 @@ Tiny Conformer 的详细架构与参数规格见 [`docs/02_acoustic_encoder.md`]
 ```text
 Speech-MiniMind/
 ├── docs/        # 分章教学文档
+├── assets/      # README 插图（训练曲线等）
 ├── examples/    # 示例音频
 ├── model/       # Conformer、CTC、流式版、Projector、MiniMind 适配
 ├── scripts/     # 分析 / 准备 / 训练 / 评估 / 合成脚本
