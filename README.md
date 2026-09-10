@@ -102,7 +102,7 @@ python -m pip install gradio   # 首次需要
 
 python scripts/visualize_asr_webui.py \
   --checkpoint outputs/02_acoustic_encoder/tiny_conformer_ctc.pt \
-  --stream-checkpoint outputs/04_streaming_acoustic_encoder/checkpoint_epoch_001.pt \
+  --stream-checkpoint outputs/02_streaming_acoustic_encoder/tiny_streaming_conformer_ctc.pt \
   --audio path/to/long.wav
 ```
 
