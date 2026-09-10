@@ -59,11 +59,18 @@ python -m pip install -r requirements.txt
 
 ### 多卡训练（DDP）
 
-第 3 / 5 / 8 节的四个训练脚本（`train_conformer_ctc.py`、`train_conformer_streaming_ctc.py`、`train_speech_projector.py`、`train_speech_minimind.py`）都已支持多卡分布式训练，下面的所有训练命令都用 `torchrun --nproc_per_node=<N>` 启动（`<N>` 为使用的 GPU 卡数，如 `4`）。
+第 3 / 5 / 8 节的四个训练脚本（`train_conformer_ctc.py`、`train_conformer_streaming_ctc.py`、`train_speech_projector.py`、`train_speech_minimind.py`）都已支持多卡分布式训练，下面的所有训练命令都用 `torchrun --nproc_per_node=<N>` 启动，并用 `CUDA_VISIBLE_DEVICES` **显式指定使用哪几张卡**（共享服务器上其他任务会占显存，必须挑空闲卡）。
 
+启动前先确认哪些卡空闲（`memory.free` 大的才是可用卡）：
+
+```bash
+nvidia-smi --query-gpu=index,memory.used,memory.free --format=csv
+```
+
+- `CUDA_VISIBLE_DEVICES=0,1,2,3` 指定本次使用的 GPU 卡号（可任意挑选，按需调整）；`--nproc_per_node=<N>` 必须等于你指定的卡数，否则会报错或撞上被占用的卡。
 - `--nproc_per_node=<N>` 开 N 张卡；脚本按 rank 自动分配设备、用 `DistributedSampler` 切分数据、跨卡求平均 loss。
 - 训练/验证 loss、checkpoint、`metrics.csv`、`loss_curve.png`、wandb 记录全部只在 rank 0 执行，各卡模型权重经梯度同步保持一致。
-- 需要单卡训练时，把命令开头的 `torchrun --nproc_per_node=<N>` 换成 `python` 直接运行即可（无 `RANK`/`WORLD_SIZE`/`LOCAL_RANK` 环境变量时脚本自动退化为单卡行为）。
+- 需要单卡训练时，把开头的 `torchrun --nproc_per_node=<N>` 换成 `python`，并用 `CUDA_VISIBLE_DEVICES=<一张空闲卡>` 指定该卡即可（无 `RANK`/`WORLD_SIZE`/`LOCAL_RANK` 环境变量时脚本自动退化为单卡行为）。
 
 ### 1. 语音分析（00/01）
 
@@ -89,7 +96,7 @@ python scripts/prepare_aishell1.py
 #### 非流式（离线整句识别）
 
 ```bash
-torchrun --nproc_per_node=4 scripts/train_conformer_ctc.py \
+CUDA_VISIBLE_DEVICES=0,1,2,3 torchrun --nproc_per_node=4 scripts/train_conformer_ctc.py \
   --data data/aishell1/processed --epochs 20 --batch-size 32 --lr 2e-4
 ```
 
@@ -103,7 +110,7 @@ torchrun --nproc_per_node=4 scripts/train_conformer_ctc.py \
 + **训练**：
 
 ```bash
-torchrun --nproc_per_node=4 scripts/train_conformer_streaming_ctc.py \
+CUDA_VISIBLE_DEVICES=0,1,2,3 torchrun --nproc_per_node=4 scripts/train_conformer_streaming_ctc.py \
   --data data/aishell1/processed --epochs 20 --batch-size 32 --lr 2e-4 \
   --chunk-size 32 --left-context 16
 ```
@@ -186,7 +193,7 @@ model.eval()
 先用 **Paraformer-zh-streaming 作为冻结编码器**（推荐，工业级中文流式 ASR 前端）。先下载 [MiniMind Transformers 权重](https://github.com/jingyaogong/minimind)（如 `minimind-3`）到本地目录，并按第 4 节下载 Paraformer 权重，然后：
 
 ```bash
-torchrun --nproc_per_node=4 scripts/train_speech_projector.py \
+CUDA_VISIBLE_DEVICES=0,1,2,3 torchrun --nproc_per_node=4 scripts/train_speech_projector.py \
   --data data/aishell1/processed \
   --encoder-type paraformer \
   --paraformer-model outputs/paraformer-streaming \
@@ -198,7 +205,7 @@ torchrun --nproc_per_node=4 scripts/train_speech_projector.py \
 **换用 Tiny Conformer + CTC 作为冻结编码器**（教学主线，替代上面的 Paraformer）：先按第 2 节训练得到 `outputs/02_acoustic_encoder/tiny_conformer_ctc.pt`，保持默认 `--encoder-type conformer`（或用 `--encoder-checkpoint` 显式指定），其余参数与上面一致：
 
 ```bash
-torchrun --nproc_per_node=4 scripts/train_speech_projector.py \
+CUDA_VISIBLE_DEVICES=0,1,2,3 torchrun --nproc_per_node=4 scripts/train_speech_projector.py \
   --data data/aishell1/processed \
   --encoder-checkpoint outputs/02_acoustic_encoder/tiny_conformer_ctc.pt \
   --minimind-model /path/to/minimind-3 \
@@ -280,7 +287,7 @@ python scripts/resample_stage2_mixed.py --data data/stage2_mixed --sr 16000
 在第 5 节的 Projector 桥接基础上，用第 6/7 节的指令数据**微调 MiniMind 本身**（LoRA），让它变成能听语音、理解指令、生成回答的完整 Speech LLM：
 
 ```bash
-torchrun --nproc_per_node=4 scripts/train_speech_minimind.py \
+CUDA_VISIBLE_DEVICES=0,1,2,3 torchrun --nproc_per_node=4 scripts/train_speech_minimind.py \
   --data data/stage2_mixed \
   --encoder-type paraformer \
   --paraformer-model outputs/paraformer-streaming \
