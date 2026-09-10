@@ -244,9 +244,36 @@ class ParaformerFrozenEncoder(FrozenSpeechEncoder):
                 "Resample before calling encode."
             )
         waveforms = waveforms.to(self._device)
-        feats, feats_lengths = self._frontend(waveforms, lengths.to(self._device))
-        encoder_out, encoder_out_lens, _ = self._encoder(feats, feats_lengths)
-        return encoder_out, encoder_out_lens
+        lengths = lengths.to(self._device)
+
+        # FunASR's streaming frontend (WavFrontendOnline) hard-asserts
+        # batch_size == 1 and keeps per-utterance fbank/LFR state internally on
+        # fixed device. To support arbitrary batch and any requested device we
+        # run the frontend on CPU (it is a small numeric frontend; negligible
+        # cost) and only move the spliced fbank to the encoder device.
+        self._frontend = self._frontend.to("cpu")
+        hidden_parts: list[torch.Tensor] = []
+        length_parts: list[torch.Tensor] = []
+        for i in range(waveforms.size(0)):
+            wav = waveforms[i : i + 1].cpu()
+            wav_len = lengths[i : i + 1].cpu()
+            feats, feats_lengths = self._frontend(wav, wav_len)
+            encoder_out, encoder_out_lens, _ = self._encoder(
+                feats.to(self._device), feats_lengths.to(self._device)
+            )
+            # Per-utterance encoder out is (1, T, D) (singleton batch dim) - or
+            # (1, 1, T, D) on some builds. Normalise to (T, D) before packing
+            # the padded batch, so pad_sequence aligns on the time axis.
+            if encoder_out.dim() == 4 and encoder_out.size(1) == 1:
+                encoder_out = encoder_out.squeeze(1)
+            encoder_out = encoder_out[0]  # drop singleton batch dim -> (T, D)
+            hidden_parts.append(encoder_out)
+            length_parts.append(encoder_out_lens.reshape(-1))
+
+        # hidden_parts all share the same trailing dim (output_dim); pad time.
+        hidden = torch.nn.utils.rnn.pad_sequence(hidden_parts, batch_first=True)
+        hidden_lengths = torch.cat(length_parts, dim=0)
+        return hidden, hidden_lengths
 
 
 def build_frozen_encoder(
