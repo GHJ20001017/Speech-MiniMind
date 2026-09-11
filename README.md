@@ -316,7 +316,7 @@ train loss 从约 8 收敛到约 0.85；dev loss 稳定下降到约 0.58。
 
 ### 9. 测试指令微调模型（推理 / WebUI 互动平台）
 
-第 8 节只生成 checkpoint，仓库补了两个**测试入口**来实际"用"模型：一个 CLI 推理脚本（`infer_speech_minimind.py`）和一个 Gradio 网页互动平台（`visualize_speech_minimind_webui.py`）。两者复用同一套推理管线：
+第 8 节只生成 checkpoint，仓库补了两个**测试入口**来实际"用"模型：一个 CLI 推理脚本（`infer_speech_minimind.py`）和一个网页互动平台（`visualize_speech_minimind_webui.py`，FastAPI + WebSocket）。两者复用同一套推理管线：
 
 ```text
 WAV ──▶ frozen 声学编码器(conformer/paraformer) ──▶ SpeechProjector(冻结)
@@ -350,10 +350,10 @@ python scripts/infer_speech_minimind.py \
 - 输入 WAV 非 16kHz 时自动重采样到 16kHz（paraformer 前端强制要求 16kHz）。
 - 可选 `--temperature`（>0 采样）、`--max-new-tokens`、`--verbose`。
 
-#### WebUI 互动平台（Gradio）
+#### WebUI 互动平台（FastAPI + WebSocket，双模式）
 
 ```bash
-python -m pip install gradio   # 首次需要
+python -m pip install fastapi uvicorn   # 首次需要
 
 python scripts/visualize_speech_minimind_webui.py \
   --encoder-type paraformer \
@@ -363,7 +363,26 @@ python scripts/visualize_speech_minimind_webui.py \
   --host 0.0.0.0 --port 7861
 ```
 
-启动后浏览器访问 `http://<host>:7861`：上传 WAV → 选择/输入指令（内置转写、概括、话题、翻译等预设）→ 点"运行"，右侧显示输入波形与模型回答文本。参数（`--tune`、`--max-new-tokens`、`--temperature` 等）与 CLI 一致。
+启动后浏览器访问 `http://<host>:7861`，页面提供两个模式页签：
+
+- **① 音频上传**：选择本地音频文件（WAV / MP3 / M4A 等）→ 选择/输入指令（内置转写、概括、话题、翻译等预设）→ 点"运行"。服务端用 `ffmpeg` 把音频解码成 16kHz 单声道（无 ffmpeg 时回退到标准库 `wave`，仅支持 16-bit PCM WAV），显示输入波形并流式输出回答。也有一次性 HTTP 接口：`POST /api/infer?instruction=...`，请求体直接是音频字节，返回 JSON。
+- **② 麦克风实时**：点击"开始监听"后浏览器采集 16kHz 单声道 PCM，通过**一条常连的 WebSocket**（`/ws`）持续推送到服务端。服务端内置的**能量 VAD**（自适应噪声底，无需 `webrtcvad`）实时断句：检测到说话结束后自动跑模型，并把回答**逐 token 流式**回传，停顿即出字、无需每次点按。页面可实时调整 VAD 灵敏度与断句静音时长，并显示麦克风电平。
+
+> 麦克风需要**安全上下文**：仅在 `http://localhost` 或 `https://` 下浏览器才允许 `getUserMedia`。推荐用 SSH 端口转发把远端 7861 映射到本机（例如 `ssh -N -L 7861:127.0.0.1:7861 <user>@<host>`），再访问 `http://localhost:7861` 即可。
+
+VAD 相关参数（默认值适合安静的近距离说话）：
+
+| 参数 | 默认 | 说明 |
+| --- | --- | --- |
+| `--vad-frame-ms` | `30` | 每帧时长（毫秒） |
+| `--vad-start-mult` | `2.5` | 帧能量 > 噪声底 × 该值视为起句 |
+| `--vad-stop-mult` | `1.5` | 帧能量 < 噪声底 × 该值计入静音 |
+| `--vad-min-speech-ms` | `250` | 最短语音时长，低于此不算一句话 |
+| `--vad-silence-ms` | `700` | 断句所需尾部静音时长 |
+| `--vad-max-utterance-s` | `30` | 单句硬上限，超过强制切分 |
+| `--no-vad-adaptive` | 关 | 关闭后冻结噪声底，不做自适应 |
+
+其余参数（`--tune`、`--max-new-tokens`、`--max-speech-tokens`、`--temperature` 等）与 CLI 一致。
 
 实际运行效果（上传一段语音，模型转写为中文文本）：
 
