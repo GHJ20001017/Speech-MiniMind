@@ -306,6 +306,14 @@ CUDA_VISIBLE_DEVICES=0,1,2,3 torchrun --nproc_per_node=4 scripts/train_speech_mi
 - `--tune lora` 依赖 `peft`：`python -m pip install peft`。
 - 输出 `outputs/04_speech_minimind_sft/`：`config.json`、`metrics.csv`、`lora_epoch_XXX/adapter_model.safetensors`（lora 模式）或 `model_epoch_XXX/model.safetensors`（full 模式，完整可加载模型）。
 
+训练过程（stage2 混合指令集，约 145k step / 3 epoch）的 loss 曲线：
+
+| train/loss_step | dev/loss |
+|---|---|
+| ![指令微调语音 LLM 训练 loss](assets/04_speech_minimind_train_loss.png) | ![指令微调语音 LLM dev loss](assets/04_speech_minimind_dev_loss.png) |
+
+train loss 从约 8 收敛到约 0.85；dev loss 稳定下降到约 0.58。
+
 ## 路线 B：音频专属 LLM（离散 codebook 端到端）— 待补充
 
 > 路线 B 的实现（语音 → 量化编码器/codebook → 音频专属 LLM → 解码器 → 语音输出）将在此之后补充。本仓库当前教学主线为**路线 A**（见上文）。
