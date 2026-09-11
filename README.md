@@ -314,6 +314,63 @@ CUDA_VISIBLE_DEVICES=0,1,2,3 torchrun --nproc_per_node=4 scripts/train_speech_mi
 
 train loss 从约 8 收敛到约 0.85；dev loss 稳定下降到约 0.58。
 
+### 9. 测试指令微调模型（推理 / WebUI 互动平台）
+
+第 8 节只生成 checkpoint，仓库补了两个**测试入口**来实际"用"模型：一个 CLI 推理脚本（`infer_speech_minimind.py`）和一个 Gradio 网页互动平台（`visualize_speech_minimind_webui.py`）。两者复用同一套推理管线：
+
+```text
+WAV ──▶ frozen 声学编码器(conformer/paraformer) ──▶ SpeechProjector(冻结)
+        ──▶ 语音前缀 embeddings ⊕ 指令文本 tokens ──▶ MiniMind(微调后) ──▶ 回答文本
+```
+
+因为 MiniMind 的输入前缀是**连续语音向量**（不是 token id），`generate_from_speech`（`model/minimind_adapter.py`）会先把语音前缀与指令文本拼成 `inputs_embeds`，优先走 `model.generate(inputs_embeds=...)`，若不支持则回退到逐 token 的自回归贪婪解码。
+
+#### CLI 推理
+
+```bash
+# full 全参微调模型 + paraformer 前端（推荐）
+python scripts/infer_speech_minimind.py \
+  --audio path/to/utterance.wav \
+  --instruction "请将这段语音准确转写为中文文本。" \
+  --encoder-type paraformer \
+  --paraformer-model outputs/paraformer-streaming \
+  --projector-checkpoint outputs/03_speech_minimind_paraformer/projector_epoch_005.pt \
+  --minimind-model outputs/04_speech_minimind_sft/model_epoch_003
+
+# 同样可用 conformer 前端 + tiny-conformer 训练的 projector
+python scripts/infer_speech_minimind.py \
+  --audio path/to/utterance.wav \
+  --instruction "请将这段语音准确转写为中文文本。" \
+  --encoder-checkpoint outputs/02_acoustic_encoder/tiny_conformer_ctc.pt \
+  --projector-checkpoint outputs/03_speech_minimind/projector_epoch_005.pt \
+  --minimind-model outputs/04_speech_minimind_sft/model_epoch_003
+```
+
+- `--minimind-model`：第 8 节输出目录。`full` 传 `model_epoch_XXX/`；`lora` 传 `lora_epoch_XXX/`（需 `--tune lora`，脚本会用 peft 重新挂载 adapter）。
+- 输入 WAV 非 16kHz 时自动重采样到 16kHz（paraformer 前端强制要求 16kHz）。
+- 可选 `--temperature`（>0 采样）、`--max-new-tokens`、`--verbose`。
+
+#### WebUI 互动平台（Gradio）
+
+```bash
+python -m pip install gradio   # 首次需要
+
+python scripts/visualize_speech_minimind_webui.py \
+  --encoder-type paraformer \
+  --paraformer-model outputs/paraformer-streaming \
+  --projector-checkpoint outputs/03_speech_minimind_paraformer/projector_epoch_005.pt \
+  --minimind-model outputs/04_speech_minimind_sft/model_epoch_003 \
+  --host 0.0.0.0 --port 7861
+```
+
+启动后浏览器访问 `http://<host>:7861`：上传 WAV → 选择/输入指令（内置转写、概括、话题、翻译等预设）→ 点"运行"，右侧显示输入波形与模型回答文本。参数（`--tune`、`--max-new-tokens`、`--temperature` 等）与 CLI 一致。
+
+实际运行效果（上传一段语音，模型转写为中文文本）：
+
+![Speech-MiniMind WebUI 互动平台演示](assets/04_speech_minimind_demo.gif)
+
+> 本机（Mac/CPU）只会把 `outputs/` 留空、不做对待训练——测试平台需要真实 checkpoint 与 GPU。把上面命令在**训练过该模型的 GPU 机器**上执行即可，所有权重都从你传入的路径加载，仓库不额外下载任何东西。
+
 ## 路线 B：音频专属 LLM（离散 codebook 端到端）— 待补充
 
 > 路线 B 的实现（语音 → 量化编码器/codebook → 音频专属 LLM → 解码器 → 语音输出）将在此之后补充。本仓库当前教学主线为**路线 A**（见上文）。
