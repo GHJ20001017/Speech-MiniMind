@@ -18,24 +18,31 @@ Usage
 -----
 .. code-block:: bash
 
-    pip install fastapi uvicorn
+    pip install fastapi uvicorn soundfile qwen-tts
 
-    # full-mode tuned model, paraformer frontend (recommended)
+    # full-mode tuned model, paraformer frontend (recommended);
+    # --tts-model enables text-to-speech after every MiniMind answer.
     python scripts/visualize_speech_minimind_webui.py \\
       --encoder-type paraformer \\
       --paraformer-model outputs/paraformer-streaming \\
       --projector-checkpoint outputs/03_speech_minimind_paraformer/projector_epoch_005.pt \\
       --minimind-model outputs/04_speech_minimind_sft/model_epoch_003 \\
-      --host 0.0.0.0 --port 7861
+      --tts-model /gpu3/guhj/models/Qwen3-TTS-12Hz-1.7B-CustomVoice \\
+      --tts-speaker Serena \\
+      --host 0.0.0.0 --port 7861 --ssl-auto
 
 All weights come from the paths you pass; nothing is downloaded here.
-Open http://<host>:<port> in a browser to use it.
+Open http://<host>:<port> (or https:// with --ssl-auto) in a browser to use it.
+When ``--tts-model`` is supplied, each final MiniMind answer is normalized,
+synthesized by Qwen3-TTS, and returned as a WAV message for browser playback.
 """
 
 import argparse
 import asyncio
+import base64
 import io
 import json
+import re
 import shutil
 import subprocess
 import sys
@@ -233,14 +240,19 @@ def decode_bytes_to_mono16k(data: bytes) -> np.ndarray:
 class SpeechEngine:
     """Frozen encoder + projector + tuned MiniMind behind a single lock."""
 
-    def __init__(self, encoder, projector, lm, tokenizer, device, max_speech_tokens: int) -> None:
+    def __init__(self, encoder, projector, lm, tokenizer, device, max_speech_tokens: int,
+                 tts_model=None, tts_speaker: str = "Serena", tts_language: str = "Chinese") -> None:
         self.encoder = encoder
         self.projector = projector
         self.lm = lm
         self.tokenizer = tokenizer
         self.device = device
         self.max_speech_tokens = max_speech_tokens
+        self.tts_model = tts_model
+        self.tts_speaker = tts_speaker
+        self.tts_language = tts_language
         self._lock = threading.Lock()
+        self._tts_lock = threading.Lock()
 
     def stream(self, audio: np.ndarray, instruction: str,
                temperature: float, max_new_tokens: int):
@@ -262,6 +274,41 @@ class SpeechEngine:
                 max_speech_tokens=self.max_speech_tokens,
                 temperature=temperature,
             )
+
+    @property
+    def tts_enabled(self) -> bool:
+        return self.tts_model is not None
+
+    @staticmethod
+    def _tts_text(text: str) -> str:
+        """Convert a model answer into concise text suitable for speech synthesis."""
+        text = re.sub(r"```.*?```", "", text, flags=re.S)
+        text = re.sub(r"`([^`]*)`", r"\1", text)
+        text = re.sub(r"!\[[^\]]*\]\([^)]*\)", "", text)
+        text = re.sub(r"https?://\S+", "网址", text)
+        text = re.sub(r"[*_>#~-]+", " ", text)
+        text = re.sub(r"\[([^\]]+)\]\([^)]*\)", r"\1", text)
+        text = re.sub(r"\s+", " ", text).strip()
+        return text[:4000]
+
+    def synthesize(self, text: str) -> tuple[bytes, int]:
+        """Synthesize a WAV payload with Qwen3-TTS for browser playback."""
+        if not self.tts_model:
+            raise RuntimeError("TTS 未启用，请启动时提供 --tts-model")
+        clean_text = self._tts_text(text)
+        if not clean_text:
+            raise ValueError("模型回答为空，无法合成语音")
+        with self._tts_lock:
+            wavs, sample_rate = self.tts_model.generate_custom_voice(
+                text=clean_text,
+                language=self.tts_language,
+                speaker=self.tts_speaker,
+            )
+        audio = np.asarray(wavs[0], dtype=np.float32)
+        import soundfile as sf
+        output = io.BytesIO()
+        sf.write(output, audio, sample_rate, format="WAV", subtype="PCM_16")
+        return output.getvalue(), int(sample_rate)
 
 
 # --------------------------------------------------------------------------- #
@@ -363,10 +410,19 @@ class Session:
 
         def worker() -> None:
             try:
+                full_text = ""
                 for partial, complete in self.engine.stream(
                     audio, self.instruction, self.temperature, self.max_new_tokens
                 ):
+                    full_text = complete
                     loop.call_soon_threadsafe(queue.put_nowait, ("partial", complete))
+                if self.engine.tts_enabled and full_text:
+                    wav_bytes, sample_rate = self.engine.synthesize(full_text)
+                    payload = {
+                        "audio": base64.b64encode(wav_bytes).decode("ascii"),
+                        "sample_rate": sample_rate,
+                    }
+                    loop.call_soon_threadsafe(queue.put_nowait, ("speech_audio", payload))
                 loop.call_soon_threadsafe(queue.put_nowait, ("done", ""))
             except Exception as exc:  # noqa: BLE001
                 loop.call_soon_threadsafe(queue.put_nowait, ("error", str(exc)))
@@ -378,6 +434,8 @@ class Session:
             if kind == "partial":
                 full = payload
                 await ws.send_json({"type": "partial", "text": payload})
+            elif kind == "speech_audio":
+                await ws.send_json({"type": "speech_audio", **payload})
             elif kind == "error":
                 await ws.send_json({"type": "error", "message": payload})
                 break
@@ -526,9 +584,21 @@ function wsSend(obj) {
   const s = JSON.stringify(obj);
   if (wsReady) ws.send(s); else pending.push(s);
 }
+// Base path for the websocket when the app is mounted behind a reverse
+// proxy such as code-server's /proxy/<port>/ (e.g. http://host:9999/proxy/7861/).
+// Detect that prefix from the URL so both a root deployment (path === "") and
+// a proxied one work; without it the client would hit the proxy root and never
+// reach the app.
+function apiBase() {
+  const seg = location.pathname.split("/").filter(Boolean);
+  if (seg.length >= 2 && seg[seg.length - 2] === "proxy") {
+    return "/proxy/" + seg[seg.length - 1];
+  }
+  return "";
+}
 function connectWS() {
   const proto = location.protocol === "https:" ? "wss" : "ws";
-  ws = new WebSocket(proto + "://" + location.host + "/ws");
+  ws = new WebSocket(proto + "://" + location.host + apiBase() + "/ws");
   ws.binaryType = "arraybuffer";
   ws.onopen = () => { wsReady = true; $("ws-state").textContent = "已连接";
                       while (pending.length) ws.send(pending.shift()); };
@@ -679,7 +749,16 @@ function setStatus(dotId, cls, text) {
   const d = $(dotId); d.className = "dot " + cls;
   $(dotId === "up-dot" ? "up-status" : "mic-status").textContent = text;
 }
-function answerEl() { return $("mic-answer"); }   // mic is the streaming target
+function playSpeechAudio(base64Audio) {
+  const bytes = atob(base64Audio);
+  const buffer = new Uint8Array(bytes.length);
+  for (let i = 0; i < bytes.length; i++) buffer[i] = bytes.charCodeAt(i);
+  if (window.currentSpeechAudio) window.currentSpeechAudio.pause();
+  if (window.currentSpeechUrl) URL.revokeObjectURL(window.currentSpeechUrl);
+  window.currentSpeechUrl = URL.createObjectURL(new Blob([buffer], { type: "audio/wav" }));
+  window.currentSpeechAudio = new Audio(window.currentSpeechUrl);
+  window.currentSpeechAudio.play().catch((e) => console.warn("语音播放被浏览器阻止：", e));
+}
 
 ws.onmessage = (ev) => {
   const m = JSON.parse(ev.data);
@@ -707,6 +786,10 @@ ws.onmessage = (ev) => {
     } else {
       $("mic-answer").textContent = m.text || "（空回答）";
     }
+  } else if (m.type === "speech_audio") {
+    playSpeechAudio(m.audio);
+    const target = uploadTarget === "up" ? $("up-answer") : $("mic-answer");
+    if (target.textContent) target.textContent += "\n🔊 正在播放语音回答";
   } else if (m.type === "error") {
     if (uploadTarget === "up") { $("up-answer").innerHTML = '<span class="err">' + m.message + '</span>';
       setStatus("up-dot", "idle", "出错"); $("run-upload").disabled = false; uploadTarget = null; }
@@ -780,6 +863,103 @@ def build_app(engine: SpeechEngine, vad_kwargs: dict, defaults: dict, host: str,
     return app, uvicorn
 
 
+def _is_ip_literal(host: str) -> bool:
+    parts = host.split(".")
+    if len(parts) == 4 and all(p.isdigit() and p.isascii() for p in parts):
+        return all(0 <= int(p) <= 255 for p in parts)
+    return ":" in host
+
+
+def _local_ipv4s() -> list[str]:
+    """Best-effort list of this machine's IPv4 addresses (to widen the cert SAN).
+
+    The address a browser actually uses is not always the one that routes to the
+    internet, so collect every interface address instead of only the outbound one.
+    """
+    import socket
+
+    addrs = {"127.0.0.1"}
+    try:
+        for info in socket.getaddrinfo(socket.gethostname(), None, socket.AF_INET):
+            addrs.add(info[4][0])
+    except OSError:
+        pass
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+            sock.connect(("8.8.8.8", 80))
+            addrs.add(sock.getsockname()[0])
+    except OSError:
+        pass
+    return sorted(addrs)
+
+
+def _san_entries(host: str) -> list[str]:
+    """Collect the names the certificate should be valid for."""
+    names = ["localhost"]
+    names.extend(_local_ipv4s())
+    if host not in ("0.0.0.0", "::", ""):
+        names.append(host)
+    seen, entries = set(), []
+    for name in names:
+        if name not in seen:
+            seen.add(name)
+            entries.append(name)
+    return entries
+
+
+def ensure_self_signed_cert(keyfile: Path, certfile: Path, host: str) -> None:
+    """Create a self-signed cert/key pair with openssl if they do not exist.
+
+    The microphone API needs a secure context, i.e. ``https://`` or
+    ``localhost``; serving the LAN address over https is the only browser-safe
+    way to reach the microphone without relying on a Chrome flag. The cert is
+    self-signed, so the browser warns once — click
+    "Advanced -> Proceed to <host>", after which the origin counts as secure.
+    The host names go into the SAN via ``-addext`` (OpenSSL >= 1.1.1).
+    """
+    if keyfile.exists() and certfile.exists():
+        return
+    keyfile.parent.mkdir(parents=True, exist_ok=True)
+    names = _san_entries(host)
+    san = ",".join(f"IP:{n}" if _is_ip_literal(n) else f"DNS:{n}" for n in names)
+    base = [
+        "openssl", "req", "-x509", "-newkey", "rsa:2048",
+        "-keyout", str(keyfile), "-out", str(certfile),
+        "-days", "3650", "-nodes", "-batch", "-subj", f"/CN={names[0]}",
+    ]
+    try:
+        subprocess.run(base + ["-addext", f"subjectAltName={san}"], check=True,
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except subprocess.CalledProcessError:
+        # Older OpenSSL (< 1.1.1) has no -addext; the browser override still works.
+        subprocess.run(base, check=True,
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    print(f"generated self-signed certificate: {certfile}")
+
+
+def _resolve_ssl(args) -> dict:
+    """Return uvicorn ssl kwargs; generate a persistent self-signed cert for --ssl-auto.
+
+    Cert lives in ``scripts/.webui_ssl/`` so it is generated once and reused on
+    every restart. ``--host`` here is the listen address; pass an actual
+    reachable address (IP or DNS name) so it is covered by the cert SAN.
+    """
+    if args.ssl_auto:
+        if args.ssl_keyfile or args.ssl_certfile:
+            raise SystemExit("--ssl-auto cannot be combined with --ssl-keyfile/--ssl-certfile")
+        host = args.host if args.host not in ("", "0.0.0.0", "::") else "localhost"
+        certdir = Path(__file__).resolve().parent / ".webui_ssl"
+        ensure_self_signed_cert(certdir / "key.pem", certdir / "cert.pem", host)
+        return {"ssl_keyfile": str(certdir / "key.pem"),
+                "ssl_certfile": str(certdir / "cert.pem")}
+    if bool(args.ssl_keyfile) != bool(args.ssl_certfile):
+        raise SystemExit("--ssl-keyfile and --ssl-certfile must be provided together")
+    if args.ssl_keyfile:
+        return {"ssl_keyfile": str(args.ssl_keyfile),
+                "ssl_certfile": str(args.ssl_certfile)}
+    return {}
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--encoder-type", choices=("conformer", "paraformer"), default="paraformer",
@@ -796,6 +976,12 @@ def main() -> None:
     parser.add_argument("--temperature", type=float, default=0.0)
     parser.add_argument("--instruction", default=PRESET_INSTRUCTIONS[0],
                         help="default instruction for both modes")
+    parser.add_argument("--tts-model", type=Path, default=None,
+                        help="Qwen3-TTS model directory; enables speech output")
+    parser.add_argument("--tts-speaker", default="Serena",
+                        help="Qwen3-TTS CustomVoice speaker, e.g. Serena")
+    parser.add_argument("--tts-language", default="Chinese",
+                        help="Qwen3-TTS language label")
     # VAD knobs (energy-based)
     parser.add_argument("--vad-frame-ms", type=float, default=30.0)
     parser.add_argument("--vad-start-mult", type=float, default=2.5,
@@ -810,6 +996,12 @@ def main() -> None:
                         help="freeze the noise floor instead of tracking ambient level")
     parser.add_argument("--host", default="0.0.0.0")
     parser.add_argument("--port", type=int, default=7861)
+    parser.add_argument("--ssl-keyfile", type=Path, default=None,
+                        help="path to a TLS private key (enables https)")
+    parser.add_argument("--ssl-certfile", type=Path, default=None,
+                        help="path to the matching TLS certificate (enables https)")
+    parser.add_argument("--ssl-auto", action="store_true",
+                        help="auto-generate a persistent self-signed cert under scripts/.webui_ssl and serve https")
     args = parser.parse_args()
 
     try:
@@ -820,7 +1012,28 @@ def main() -> None:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"device: {device}")
     encoder, projector, lm, tokenizer, _ = load_pipeline(args, device)
-    engine = SpeechEngine(encoder, projector, lm, tokenizer, device, args.max_speech_tokens)
+    tts_model = None
+    if args.tts_model:
+        try:
+            from qwen_tts import Qwen3TTSModel
+        except ImportError as exc:
+            raise SystemExit(
+                "--tts-model requires qwen-tts and soundfile. "
+                "Install them in the active environment first."
+            ) from exc
+        print(f"loading Qwen3-TTS: {args.tts_model}")
+        tts_model = Qwen3TTSModel.from_pretrained(
+            str(args.tts_model),
+            device_map=str(device),
+            dtype=torch.bfloat16,
+            attn_implementation="sdpa",
+        )
+    engine = SpeechEngine(
+        encoder, projector, lm, tokenizer, device, args.max_speech_tokens,
+        tts_model=tts_model,
+        tts_speaker=args.tts_speaker,
+        tts_language=args.tts_language,
+    )
 
     vad_kwargs = dict(
         sample_rate=SAMPLE_RATE,
@@ -839,8 +1052,12 @@ def main() -> None:
     )
     print("pipeline ready — serving UI")
     app, uvicorn = build_app(engine, vad_kwargs, defaults, args.host, args.port)
-    print(f"serving at http://{args.host}:{args.port}  (open http://localhost:{args.port} for mic)")
-    uvicorn.run(app, host=args.host, port=args.port, log_level="info")
+    ssl_kwargs = _resolve_ssl(args)
+    scheme = "https" if ssl_kwargs else "http"
+    print(f"serving at {scheme}://{args.host}:{args.port}")
+    print("microphone needs a secure context -> "
+          f"{'use the https URL above (browser will warn about the self-signed cert)' if ssl_kwargs else 'open http://localhost:' + str(args.port)}")
+    uvicorn.run(app, host=args.host, port=args.port, log_level="info", **ssl_kwargs)
 
 
 if __name__ == "__main__":

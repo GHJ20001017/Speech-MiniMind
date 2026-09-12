@@ -8,3 +8,4 @@ data/
 *.tar.gz
 *.pt
 *.pth
+scripts/.webui_ssl/

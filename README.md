@@ -342,7 +342,7 @@ python scripts/infer_speech_minimind.py \
   --audio path/to/utterance.wav \
   --instruction "请将这段语音准确转写为中文文本。" \
   --encoder-checkpoint outputs/02_acoustic_encoder/tiny_conformer_ctc.pt \
-  --projector-checkpoint outputs/03_speech_minimind/projector_epoch_005.pt \
+  --projector-checkpoint outputs/03_speech_minimind_paraformer/projector_epoch_005.pt \
   --minimind-model outputs/04_speech_minimind_sft/model_epoch_003
 ```
 
@@ -353,22 +353,32 @@ python scripts/infer_speech_minimind.py \
 #### WebUI 互动平台（FastAPI + WebSocket，双模式）
 
 ```bash
-python -m pip install fastapi uvicorn   # 首次需要
+python -m pip install fastapi uvicorn soundfile qwen-tts   # 首次需要
 
+# 局域网访问 + 麦克风 + MiniMind 文本回答转语音
 python scripts/visualize_speech_minimind_webui.py \
   --encoder-type paraformer \
   --paraformer-model outputs/paraformer-streaming \
   --projector-checkpoint outputs/03_speech_minimind_paraformer/projector_epoch_005.pt \
   --minimind-model outputs/04_speech_minimind_sft/model_epoch_003 \
-  --host 0.0.0.0 --port 7861
+  --tts-model /gpu3/guhj/models/Qwen3-TTS-12Hz-1.7B-CustomVoice \\
+  --tts-speaker Serena \\
+  --host 0.0.0.0 --port 7861 --ssl-auto
 ```
 
-启动后浏览器访问 `http://<host>:7861`，页面提供两个模式页签：
+启动时传入 `--tts-model` 后，MiniMind 每次生成最终文本回答，服务端会调用 Qwen3-TTS 的 `generate_custom_voice` 合成为 WAV，并通过同一条 WebSocket 返回浏览器自动播放；不传该参数时保留原来的纯文本模式。可用 `--tts-speaker Serena` 和 `--tts-language Chinese` 选择 Qwen3-TTS 的预置音色与语言。
+
+启动后浏览器访问 `https://<host>:7861`（用 `--ssl-auto`）或 `http://localhost:7861`（端口转发），页面提供两个模式页签：
 
 - **① 音频上传**：选择本地音频文件（WAV / MP3 / M4A 等）→ 选择/输入指令（内置转写、概括、话题、翻译等预设）→ 点"运行"。服务端用 `ffmpeg` 把音频解码成 16kHz 单声道（无 ffmpeg 时回退到标准库 `wave`，仅支持 16-bit PCM WAV），显示输入波形并流式输出回答。也有一次性 HTTP 接口：`POST /api/infer?instruction=...`，请求体直接是音频字节，返回 JSON。
 - **② 麦克风实时**：点击"开始监听"后浏览器采集 16kHz 单声道 PCM，通过**一条常连的 WebSocket**（`/ws`）持续推送到服务端。服务端内置的**能量 VAD**（自适应噪声底，无需 `webrtcvad`）实时断句：检测到说话结束后自动跑模型，并把回答**逐 token 流式**回传，停顿即出字、无需每次点按。页面可实时调整 VAD 灵敏度与断句静音时长，并显示麦克风电平。
 
-> 麦克风需要**安全上下文**：仅在 `http://localhost` 或 `https://` 下浏览器才允许 `getUserMedia`。推荐用 SSH 端口转发把远端 7861 映射到本机（例如 `ssh -N -L 7861:127.0.0.1:7861 <user>@<host>`），再访问 `http://localhost:7861` 即可。
+> 麦克风需要**安全上下文**：仅在 `http://localhost` 或 `https://` 下浏览器才允许 `getUserMedia`。两种做法二选一：
+>
+> 1. **推荐：`--ssl-auto`**（上面命令已带）。脚本首次启动时用 `openssl` 生成自签证书（存在 `scripts/.webui_ssl/`，之后复用），用 `https://<host>:7861` 访问。浏览器会提示证书不受信任，点一次「高级 → 继续前往 \<host\>」即可，此后即为安全上下文，任何浏览器/设备都能用麦克风。也可自己指定证书：`--ssl-keyfile key.pem --ssl-certfile cert.pem`。
+> 2. **端口转发**：`ssh -N -L 7861:127.0.0.1:7861 <user>@<host>`，再访问 `http://localhost:7861`。
+>
+> （`http://192.168.x.x:7861` 这类明文局域网地址浏览器一律拒绝麦克风，与页面代码无关。）
 
 VAD 相关参数（默认值适合安静的近距离说话）：
 
@@ -381,6 +391,7 @@ VAD 相关参数（默认值适合安静的近距离说话）：
 | `--vad-silence-ms` | `700` | 断句所需尾部静音时长 |
 | `--vad-max-utterance-s` | `30` | 单句硬上限，超过强制切分 |
 | `--no-vad-adaptive` | 关 | 关闭后冻结噪声底，不做自适应 |
+| `--ssl-auto` | 关 | 生成/复用 `scripts/.webui_ssl/` 自签证书并以 https 提供服务（麦克风必需） |
 
 其余参数（`--tune`、`--max-new-tokens`、`--max-speech-tokens`、`--temperature` 等）与 CLI 一致。
 

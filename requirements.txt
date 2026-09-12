@@ -5,3 +5,5 @@ torch>=2.2
 tqdm>=4.66
 transformers>=4.57
 wandb>=0.16
+soundfile>=0.12
+qwen-tts
