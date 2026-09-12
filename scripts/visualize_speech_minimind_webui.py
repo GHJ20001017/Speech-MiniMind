@@ -472,6 +472,9 @@ PAGE_HTML = r"""<!DOCTYPE html>
   label { display:block; font-size:13px; color:var(--muted); margin:12px 0 6px; }
   input[type=text], select { width:100%; padding:9px 11px; border:1px solid var(--line);
          border-radius:8px; font:inherit; background:#fff; }
+  .custom-instruction { display:none; width:100%; margin-top:8px; padding:9px 11px;
+         border:1px solid var(--line); border-radius:8px; font:inherit; resize:vertical; }
+  .custom-instruction.visible { display:block; }
   button { font:inherit; padding:9px 18px; border-radius:8px; border:1px solid var(--accent);
            background:var(--accent); color:#fff; cursor:pointer; }
   button.ghost { background:#fff; color:var(--accent); }
@@ -510,6 +513,8 @@ PAGE_HTML = r"""<!DOCTYPE html>
     <input type="file" id="file" accept="audio/*"/>
     <label>指令</label>
     <select id="instruction-upload"></select>
+    <textarea id="custom-upload" class="custom-instruction" rows="3"
+      placeholder="请输入自定义指令，例如：请用一句话总结这段语音。"></textarea>
     <div class="row" style="margin-top:14px">
       <button id="run-upload">▶ 运行</button>
       <span class="status"><span class="dot" id="up-dot"></span><span id="up-status">就绪</span></span>
@@ -524,6 +529,8 @@ PAGE_HTML = r"""<!DOCTYPE html>
     <p class="hint">点击「开始监听」后保持 WebSocket 常连：对着麦克风说话，停顿约 0.7 秒后模型自动开始识别并流式输出文本。</p>
     <label>指令</label>
     <select id="instruction-mic"></select>
+    <textarea id="custom-mic" class="custom-instruction" rows="3"
+      placeholder="请输入自定义指令，例如：请用一句话总结这段语音。"></textarea>
     <div class="row" style="margin-top:14px">
       <button id="mic-toggle">🎙 开始监听</button>
       <span class="status"><span class="dot idle" id="mic-dot"></span><span id="mic-status">未连接</span></span>
@@ -557,8 +564,19 @@ function fillSelect(sel) {
   const custom = document.createElement("option");
   custom.value = "__custom__"; custom.textContent = "（手动输入…）"; sel.appendChild(custom);
 }
+function customInputFor(sel) {
+  return $(sel.id === "instruction-upload" ? "custom-upload" : "custom-mic");
+}
+function updateCustomInstruction(sel) {
+  const input = customInputFor(sel);
+  const visible = sel.value === "__custom__";
+  input.classList.toggle("visible", visible);
+  if (visible) input.focus();
+}
 fillSelect($("instruction-upload"));
 fillSelect($("instruction-mic"));
+$("instruction-upload").addEventListener("change", (e) => updateCustomInstruction(e.target));
+$("instruction-mic").addEventListener("change", (e) => updateCustomInstruction(e.target));
 
 document.querySelectorAll(".tab").forEach((t) => t.addEventListener("click", () => {
   document.querySelectorAll(".tab").forEach((x) => x.classList.remove("active"));
@@ -569,10 +587,13 @@ document.querySelectorAll(".tab").forEach((t) => t.addEventListener("click", () 
 
 function currentInstruction(sel) {
   if (sel.value === "__custom__") {
-    const v = prompt("请输入指令：", PRESETS[0]);
-    if (v) { const o = document.createElement("option"); o.value = v; o.textContent = v;
-             sel.insertBefore(o, sel.lastElementChild); sel.value = v; }
-    else sel.value = PRESETS[0];
+    const text = customInputFor(sel).value.trim();
+    if (!text) {
+      alert("请输入自定义指令");
+      customInputFor(sel).focus();
+      return PRESETS[0];
+    }
+    return text;
   }
   return sel.value;
 }

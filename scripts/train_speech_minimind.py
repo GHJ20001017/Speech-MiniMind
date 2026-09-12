@@ -1,15 +1,14 @@
-"""Instruction-tune (LoRA) a Speech→MiniMind LLM on speech instruction data.
+"""Instruction-tune a Speech→MiniMind LLM on speech instruction data.
 
-Pipeline (reuses the frozen projector bridge from chapter 03):
+Pipeline:
 
-    audio ──> TinyConformer.encoder (frozen) ──> SpeechProjector (frozen)
+    audio ──> TinyConformer.encoder (frozen) ──> SpeechProjector
                 ──> speech prefix embeddings
-                ──concat──> MiniMind (LoRA adapters trained) ──> answer text
+                ──concat──> MiniMind (LoRA or full fine-tuned) ──> answer text
 
-The acoustic encoder and the speech projector are both loaded frozen from
-their chapter-02 / chapter-03 checkpoints. Only MiniMind's LoRA adapters are
-updated, so a ~19.6k→196k-sample instruction corpus trains in reasonable time
-and memory on a single GPU.
+The acoustic encoder is always frozen. The SpeechProjector is frozen by default
+and can optionally be fine-tuned with ``--tune-projector`` when the target
+MiniMind and speech frontend need to adapt together.
 
 Data: any JSONL with ``audio, instruction, answer`` (e.g. the merged
 ``data/stage2_mixed/{train,dev}.jsonl`` produced by
@@ -154,16 +153,17 @@ def run_epoch(args, encoder, projector, lm, tokenizer, loader, device, optimizer
     training = optimizer is not None
     if sampler is not None:
         ddp_utils.set_epoch(sampler, epoch)
-    projector.train(False)  # frontend always frozen/eval
+    projector.train(training and args.tune_projector)
     encoder.train(False)
     lm.train(training)
+    projector_module = ddp_utils.unwrap(projector)
     total_loss = 0.0
     steps = 0
     for waveforms, lengths, instructions, answers in tqdm(loader, desc="train" if training else "dev", unit="batch", disable=not ddp_utils.is_main()):
         with torch.no_grad():
             acoustic, acoustic_lengths = encoder.encode(waveforms.to(device), lengths.to(device), SAMPLE_RATE)
-            projected = projector(acoustic)
-            projected_lengths = projector.output_lengths(acoustic_lengths).clamp_max(projected.size(1))
+        projected = projector(acoustic)
+        projected_lengths = projector_module.output_lengths(acoustic_lengths).clamp_max(projected.size(1))
 
         inputs_embeds, attention_mask, labels = make_sft_batch(
             lm, tokenizer, projected, projected_lengths, instructions, answers,
@@ -180,7 +180,8 @@ def run_epoch(args, encoder, projector, lm, tokenizer, loader, device, optimizer
             optimizer.zero_grad()
             loss.backward()
             torch.nn.utils.clip_grad_norm_(
-                [p for p in lm.parameters() if p.requires_grad], args.grad_clip
+                [p for p in list(lm.parameters()) + list(projector.parameters()) if p.requires_grad],
+                args.grad_clip,
             )
             optimizer.step()
             if args.wandb and ddp_utils.is_main():
@@ -237,6 +238,10 @@ def main() -> None:
                         help="FunASR model id/dir for --encoder-type paraformer")
     parser.add_argument("--projector-checkpoint", type=Path, required=True,
                         help="trained SpeechProjector ckpt (outputs/03_speech_minimind/projector_epoch_XXX.pt)")
+    parser.add_argument("--tune-projector", action=argparse.BooleanOptionalAction, default=False,
+                        help="also fine-tune SpeechProjector; default keeps the frontend frozen")
+    parser.add_argument("--projector-lr", type=float, default=None,
+                        help="Projector learning rate when --tune-projector (default: --lr)")
     parser.add_argument("--minimind-model", type=Path, required=True,
                         help="local Transformers-format MiniMind dir")
     parser.add_argument("--tune", choices=("lora", "full"), default="lora",
@@ -288,7 +293,8 @@ def main() -> None:
     projector.load_state_dict(proj_ckpt["projector"])
     projector.eval()
     for p in projector.parameters():
-        p.requires_grad_(False)
+        p.requires_grad_(args.tune_projector)
+    projector = ddp_utils.wrap(projector)
 
     # ---- load LLM + prepare fine-tuning (lora or full) ----
     lm, tokenizer = load_minimind(args.minimind_model, device)
@@ -310,8 +316,13 @@ def main() -> None:
 
     base_lm = ddp_utils.unwrap(lm)
     lm = ddp_utils.wrap(lm)
+    projector_module = ddp_utils.unwrap(projector)
     trainable_params = [p for p in base_lm.parameters() if p.requires_grad]
-    optimizer = torch.optim.AdamW(trainable_params, lr=args.lr)
+    optimizer_groups = [{"params": trainable_params, "lr": args.lr}]
+    projector_params = [p for p in projector_module.parameters() if p.requires_grad]
+    if projector_params:
+        optimizer_groups.append({"params": projector_params, "lr": args.projector_lr or args.lr})
+    optimizer = torch.optim.AdamW(optimizer_groups)
 
     # ---- data ----
     args.output.mkdir(parents=True, exist_ok=True)
@@ -356,9 +367,13 @@ def main() -> None:
         print(f"device: {device}")
         print(f"llm_hidden_size: {llm_dim}")
         print(f"tune_mode: {args.tune}")
+        print(f"tune_projector: {args.tune_projector}")
         print(f"train_set_rows: {len(train_set)}  dev_set_rows: {len(dev_set)}")
         print(f"trainable: {sum(p.numel() for p in trainable_params):,} "
               f"({sum(p.numel() for p in trainable_params) * 100.0 / max(sum(p.numel() for p in base_lm.parameters()), 1):.2f}% of LLM)")
+        if projector_params:
+            print(f"projector_trainable: {sum(p.numel() for p in projector_params):,} "
+                  f"(lr={args.projector_lr or args.lr:g})")
 
     for epoch in range(1, args.epochs + 1):
         train_loss = run_epoch(args, encoder, projector, lm, tokenizer,
@@ -375,6 +390,14 @@ def main() -> None:
             else:
                 base_lm.save_pretrained(args.output / f"lora_epoch_{epoch:03d}")
                 ckpt_tag = f"lora_epoch_{epoch:03d}"
+            if args.tune_projector:
+                projector_path = args.output / f"projector_epoch_{epoch:03d}.pt"
+                torch.save({
+                    "projector": projector_module.state_dict(),
+                    "acoustic_dim": acoustic_dim,
+                    "llm_hidden_size": llm_dim,
+                    "source_checkpoint": str(args.projector_checkpoint),
+                }, projector_path)
             with (args.output / "metrics.csv").open("a", newline="", encoding="utf-8") as handle:
                 import csv
                 csv.DictWriter(handle, fieldnames=["epoch", "train_loss", "dev_loss"]).writerow(

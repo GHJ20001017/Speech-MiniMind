@@ -298,12 +298,25 @@ CUDA_VISIBLE_DEVICES=0,1,2,3 torchrun --nproc_per_node=4 scripts/train_speech_mi
   --wandb --wandb-name speech_minimind_sft
 ```
 
-- 冻结语音编码器（`--encoder-type` 选 Paraformer 或 Conformer）和 Speech Projector（语音前端），只对 MiniMind 做指令微调，支持两种方式（`--tune`）：
-  - `--tune lora`（默认）：只对 MiniMind 注入并训练 **LoRA adapter**（约 0.5% 可训练参数），省显存、速度快。
-  - `--tune full`：**全参数微调**全部 MiniMind 权重（100% 参数可训练），效果更强但需要更大显存、更慢。
+默认冻结语音编码器和 Speech Projector，只对 MiniMind 做指令微调；如果希望在指令微调阶段同步适配 Projector，可显式打开可选参数：
+
+```bash
+# Projector 与 MiniMind 一起训练；--projector-lr 不传时复用 --lr
+CUDA_VISIBLE_DEVICES=0,1,2,3 torchrun --nproc_per_node=4 scripts/train_speech_minimind.py \
+  --data data/stage2_mixed \
+  --encoder-type paraformer --paraformer-model outputs/paraformer-streaming \
+  --projector-checkpoint outputs/03_speech_minimind_paraformer/projector_epoch_005.pt \
+  --minimind-model /path/to/minimind-3 \
+  --output outputs/04_speech_minimind_sft --epochs 3 --batch-size 2 \
+  --tune-projector --projector-lr 5e-5
+```
+
+- `--tune lora`（默认）：只对 MiniMind 注入并训练 **LoRA adapter**（约 0.5% 可训练参数）；`--tune full`：全参数微调 MiniMind。
+- 默认冻结语音编码器和 Speech Projector；传入 `--tune-projector` 后会把 Projector 加入优化器，与 MiniMind 一起训练。可用 `--projector-lr` 单独设置学习率（不传时复用 `--lr`）。编码器始终冻结。
 - 损失只在 `answer` 部分计算（prompt 与语音前缀用 -100 mask），标准 SFT。
-- 常见参数：`--tune lora|full`、`--lang-filter zh|en`（只练单一语言）、`--limit N`（先小规模试跑）、`--lora-r/--lora-alpha`（LoRA 秩）、`--epochs`、`--wandb`（上传指标，可选 `--wandb-project <name>`、`--wandb-name <run>`，project 默认 `Speech-MiniMind`）。
+- 常见参数：`--tune lora|full`、`--tune-projector`、`--projector-lr`、`--lang-filter zh|en`（只练单一语言）、`--limit N`（先小规模试跑）、`--lora-r/--lora-alpha`（LoRA 秩）、`--epochs`、`--wandb`（上传指标，可选 `--wandb-project <name>`、`--wandb-name <run>`，project 默认 `Speech-MiniMind`）。
 - `--tune lora` 依赖 `peft`：`python -m pip install peft`。
+- 开启 Projector 微调时，每个 epoch 额外保存 `projector_epoch_XXX.pt`，可直接作为后续推理或继续训练的 `--projector-checkpoint`。
 - 输出 `outputs/04_speech_minimind_sft/`：`config.json`、`metrics.csv`、`lora_epoch_XXX/adapter_model.safetensors`（lora 模式）或 `model_epoch_XXX/model.safetensors`（full 模式，完整可加载模型）。
 
 训练过程（stage2 混合指令集，约 145k step / 3 epoch）的 loss 曲线：
