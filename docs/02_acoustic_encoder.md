@@ -142,7 +142,7 @@ CTC 解码：我爱北京
 确认 `train.csv`、`vocab.txt` 已生成后运行：
 
 ```bash
-python scripts/train_conformer_ctc.py \
+python trainer/train_conformer_ctc.py \
   --data data/aishell1/processed \
   --epochs 20 \
   --batch-size 8 \

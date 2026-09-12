@@ -41,6 +41,8 @@ from abc import ABC, abstractmethod
 
 import torch
 
+from dataset.speech_dataset import augment_mel_features
+
 
 class FrozenSpeechEncoder(ABC):
     """Common interface shared by every frozen acoustic encoder backend.
@@ -124,8 +126,12 @@ class TinyConformerEncoder(FrozenSpeechEncoder):
         waveforms: torch.Tensor,
         lengths: torch.Tensor,
         sample_rate: int = 16000,
+        feature_augment: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        return self.encode_log_mel(self._waveform_to_log_mel(waveforms, lengths, sample_rate))
+        features = self._waveform_to_log_mel(waveforms, lengths, sample_rate)
+        if feature_augment:
+            features = augment_mel_features(features)
+        return self.encode_log_mel(features)
 
     @torch.no_grad()
     def encode_log_mel(
@@ -242,6 +248,7 @@ class ParaformerFrozenEncoder(FrozenSpeechEncoder):
         waveforms: torch.Tensor,
         lengths: torch.Tensor,
         sample_rate: int = 16000,
+        feature_augment: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         if sample_rate != 16000:
             raise ValueError(
@@ -267,6 +274,8 @@ class ParaformerFrozenEncoder(FrozenSpeechEncoder):
             feats_parts.append(feats[0])  # (1, T, frontend_dim) -> (T, dim)
             feats_lengths_parts.append(feats_lengths.reshape(-1))
         feats_pad = torch.nn.utils.rnn.pad_sequence(feats_parts, batch_first=True).to(self._device)
+        if feature_augment:
+            feats_pad = augment_mel_features(feats_pad)
         feats_lengths = torch.cat(feats_lengths_parts, dim=0).to(self._device)
 
         encoder_out, encoder_out_lens, _ = self._encoder(feats_pad, feats_lengths)

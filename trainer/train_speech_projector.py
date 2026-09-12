@@ -33,6 +33,7 @@ except ImportError:  # pragma: no cover - wandb optional
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
+from dataset.speech_dataset import SpeechAugmentConfig, SpeechWaveformAugmenter
 from model.frozen_encoder import FrozenSpeechEncoder, build_frozen_encoder  # noqa: E402
 from model import ddp_utils  # noqa: E402
 from model.minimind_adapter import forward_inputs_embeds, load_minimind, token_embeddings  # noqa: E402
@@ -43,11 +44,12 @@ SAMPLE_RATE = 16000
 
 
 class AishellCSVDataset(Dataset):
-    def __init__(self, manifest: Path, prompt: str) -> None:
+    def __init__(self, manifest: Path, prompt: str, augmenter=None) -> None:
         with manifest.open(encoding="utf-8") as handle:
             self.rows = list(csv.DictReader(handle))
         self.prompt = prompt
         self.manifest = manifest
+        self.augmenter = augmenter or SpeechWaveformAugmenter(SpeechAugmentConfig())
 
     def __len__(self) -> int:
         return len(self.rows)
@@ -58,12 +60,13 @@ class AishellCSVDataset(Dataset):
         audio_array, rate = read_wav(audio)
         if rate != SAMPLE_RATE:
             raise ValueError(f"expected {SAMPLE_RATE} Hz waveform, got {rate} (path={audio})")
+        waveform = self.augmenter(audio_array, rate)
         text = "".join(row["text"].split())
-        return torch.from_numpy(audio_array.astype(np.float32)), rate, self.prompt, text, row["path"]
+        return torch.from_numpy(waveform.astype(np.float32)), rate, self.prompt, text, row["path"]
 
 
 class InstructionJSONLDataset(Dataset):
-    def __init__(self, manifest: Path, prompt_fallback: str) -> None:
+    def __init__(self, manifest: Path, prompt_fallback: str, augmenter=None) -> None:
         rows: list[dict[str, str]] = []
         with manifest.open(encoding="utf-8") as handle:
             for line in handle:
@@ -85,6 +88,7 @@ class InstructionJSONLDataset(Dataset):
                 )
         self.rows = rows
         self.manifest = manifest
+        self.augmenter = augmenter or SpeechWaveformAugmenter(SpeechAugmentConfig())
 
     def __len__(self) -> int:
         return len(self.rows)
@@ -97,7 +101,8 @@ class InstructionJSONLDataset(Dataset):
         audio_array, rate = read_wav(audio_path)
         if rate != SAMPLE_RATE:
             raise ValueError(f"expected {SAMPLE_RATE} Hz waveform, got {rate} (path={audio_path})")
-        return torch.from_numpy(audio_array.astype(np.float32)), rate, row["prompt"], row["answer"], str(audio_path)
+        waveform = self.augmenter(audio_array, rate)
+        return torch.from_numpy(waveform.astype(np.float32)), rate, row["prompt"], row["answer"], str(audio_path)
 
 
 def collate(batch: list[tuple[torch.Tensor, int, str, str, str]]) -> tuple[torch.Tensor, torch.Tensor, list[str], list[str], list[str]]:
@@ -139,14 +144,17 @@ def make_batch_embeddings(
     return padded, attention_mask, padded_labels
 
 
-def encode_batch(encoder, waveforms, lengths, device):
+def encode_batch(encoder, waveforms, lengths, device, feature_augment=False):
     """Encode one batch through the unified FrozenSpeechEncoder interface."""
     with torch.no_grad():
-        acoustic, acoustic_lengths = encoder.encode(waveforms.to(device), lengths.to(device), SAMPLE_RATE)
+        acoustic, acoustic_lengths = encoder.encode(
+            waveforms.to(device), lengths.to(device), SAMPLE_RATE,
+            feature_augment=feature_augment,
+        )
     return acoustic, acoustic_lengths
 
 
-def load_or_encode_batch(encoder, waveforms, lengths, paths, cache_dir, device):
+def load_or_encode_batch(encoder, waveforms, lengths, paths, cache_dir, device, feature_augment=False):
     """Return cached (hidden, hidden_lengths) per sample, else encode and write.
 
     Cache files are ``{cache_dir}/<sha1(path)>.pt``. We always recompute in the
@@ -169,7 +177,7 @@ def load_or_encode_batch(encoder, waveforms, lengths, paths, cache_dir, device):
         idx = torch.tensor(to_encode, dtype=torch.long, device=waveforms.device)
         sub = torch.index_select(waveforms, 0, idx)
         sub_lens = torch.index_select(lengths, 0, idx)
-        hidden, hidden_lengths = encode_batch(encoder, sub, sub_lens, device)
+        hidden, hidden_lengths = encode_batch(encoder, sub, sub_lens, device, feature_augment)
         for pos, i in enumerate(to_encode):
             key = hashlib.sha1(paths[i].encode()).hexdigest()[:16]
             cache_file = cache_dir / f"{key}.pt"
@@ -190,9 +198,15 @@ def run_epoch(args, encoder, projector, lm, tokenizer, loader, device, optimizer
     total_loss = 0.0
     for waveforms, lengths, prompts, texts, paths in tqdm(loader, desc="train" if training else "dev", unit="batch", disable=not ddp_utils.is_main()):
         if cache_dir is not None:
-            acoustic, acoustic_lengths = load_or_encode_batch(encoder, waveforms, lengths, paths, cache_dir, device)
+            acoustic, acoustic_lengths = load_or_encode_batch(
+                encoder, waveforms, lengths, paths, cache_dir, device,
+                feature_augment=args.augment_mel and training,
+            )
         else:
-            acoustic, acoustic_lengths = encode_batch(encoder, waveforms, lengths, device)
+            acoustic, acoustic_lengths = encode_batch(
+                encoder, waveforms, lengths, device,
+                feature_augment=args.augment_mel and training,
+            )
         projected = projector(acoustic)
         projected_lengths = projector.output_lengths(acoustic_lengths).clamp_max(projected.size(1))
         inputs_embeds, attention_mask, labels = make_batch_embeddings(
@@ -229,6 +243,7 @@ def resolve_dataset(
     split: str,
     data_format: str,
     prompt_fallback: str,
+    augmenter=None,
 ) -> tuple[Dataset, str]:
     csv_path = data_root / f"{split}.csv"
     jsonl_path = data_root / f"{split}.jsonl"
@@ -239,9 +254,9 @@ def resolve_dataset(
                 f"--data 为单文件时需要文件名与 split 对齐（当前 split={split}，data={data_root}）"
             )
         if data_root.suffix.lower() == ".csv":
-            return AishellCSVDataset(data_root, prompt_fallback), "csv"
+            return AishellCSVDataset(data_root, prompt_fallback, augmenter), "csv"
         if data_root.suffix.lower() == ".jsonl":
-            return InstructionJSONLDataset(data_root, prompt_fallback), "jsonl"
+            return InstructionJSONLDataset(data_root, prompt_fallback, augmenter), "jsonl"
         raise ValueError(f"--data 单文件仅支持 .csv/.jsonl: {data_root}")
 
     if not data_root.exists() or not data_root.is_dir():
@@ -250,18 +265,18 @@ def resolve_dataset(
     if data_format == "csv":
         if not csv_path.exists():
             raise FileNotFoundError(f"csv split不存在: {csv_path}")
-        return AishellCSVDataset(csv_path, prompt_fallback), "csv"
+        return AishellCSVDataset(csv_path, prompt_fallback, augmenter), "csv"
 
     if data_format == "jsonl":
         if not jsonl_path.exists():
             raise FileNotFoundError(f"jsonl split不存在: {jsonl_path}")
-        return InstructionJSONLDataset(jsonl_path, prompt_fallback), "jsonl"
+        return InstructionJSONLDataset(jsonl_path, prompt_fallback, augmenter), "jsonl"
 
     # auto mode: prefer legacy csv for backward compatibility
     if csv_path.exists():
-        return AishellCSVDataset(csv_path, prompt_fallback), "csv"
+        return AishellCSVDataset(csv_path, prompt_fallback, augmenter), "csv"
     if jsonl_path.exists():
-        return InstructionJSONLDataset(jsonl_path, prompt_fallback), "jsonl"
+        return InstructionJSONLDataset(jsonl_path, prompt_fallback, augmenter), "jsonl"
     raise FileNotFoundError(
         f"未发现数据文件: {data_root / 'train.csv'}/{data_root / 'train.jsonl'} (split={split})"
     )
@@ -287,6 +302,10 @@ def main() -> None:
     parser.add_argument("--prompt", default="请将这段语音转写为文字：")
     parser.add_argument("--data-format", choices=("auto", "csv", "jsonl"), default="auto")
     parser.add_argument("--limit", type=int, default=0, help="limit examples for a quick smoke test")
+    parser.add_argument("--augment", action=argparse.BooleanOptionalAction, default=False,
+                        help="apply random waveform augmentation inside the training dataset")
+    parser.add_argument("--augment-mel", action=argparse.BooleanOptionalAction, default=False,
+                        help="apply SpecAugment masks after the encoder frontend")
     parser.add_argument("--wandb", action=argparse.BooleanOptionalAction, default=False, help="log metrics to Weights & Biases")
     parser.add_argument("--wandb-project", default="Speech-MiniMind")
     parser.add_argument("--wandb-name", default=None)
@@ -314,8 +333,10 @@ def main() -> None:
     projector = ddp_utils.wrap(SpeechProjector(acoustic_dim, llm_dim).to(device))
     optimizer = torch.optim.AdamW(projector.parameters(), lr=args.lr)
 
-    train_set, train_format = resolve_dataset(args.data, "train", args.data_format, args.prompt)
-    dev_set, dev_format = resolve_dataset(args.data, "dev", args.data_format, args.prompt)
+    train_augmenter = SpeechWaveformAugmenter(SpeechAugmentConfig(enabled=args.augment))
+    dev_augmenter = SpeechWaveformAugmenter(SpeechAugmentConfig(enabled=False))
+    train_set, train_format = resolve_dataset(args.data, "train", args.data_format, args.prompt, train_augmenter)
+    dev_set, dev_format = resolve_dataset(args.data, "dev", args.data_format, args.prompt, dev_augmenter)
     if train_format != dev_format:
         raise ValueError(f"train/dev 数据格式不一致: train={train_format}, dev={dev_format}")
 
@@ -346,9 +367,12 @@ def main() -> None:
         print(f"train_set_rows: {len(train_set)}")
         print(f"dev_set_rows: {len(dev_set)}")
 
+    effective_cache = None if args.augment or args.augment_mel else args.hidden_cache
+    if (args.augment or args.augment_mel) and args.hidden_cache and ddp_utils.is_main():
+        print("augmentation enabled: disabling hidden-cache so each epoch gets fresh augmentation")
     for epoch in range(1, args.epochs + 1):
         train_loss = run_epoch(args, encoder, projector, lm, tokenizer, train_loader, device, optimizer,
-                               cache_dir=args.hidden_cache, sampler=train_sampler, epoch=epoch)
+                               cache_dir=effective_cache, sampler=train_sampler, epoch=epoch)
         with torch.no_grad():
             dev_loss = run_epoch(args, encoder, projector, lm, tokenizer, dev_loader, device,
                                  cache_dir=args.hidden_cache)

@@ -31,17 +31,17 @@ from pathlib import Path
 import numpy as np
 import torch
 from torch.nn.utils.rnn import pad_sequence
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
+from dataset.speech_dataset import SpeechAugmentConfig, SpeechInstructionDataset  # noqa: E402
 from model.frozen_encoder import build_frozen_encoder  # noqa: E402
 from model import ddp_utils  # noqa: E402
 from model.minimind_adapter import forward_inputs_embeds, load_minimind  # noqa: E402
 from model.speech_projector import SpeechProjector  # noqa: E402
-from scripts.analyze_audio import read_wav  # noqa: E402
 
 SAMPLE_RATE = 16000
 
@@ -49,42 +49,6 @@ try:
     import wandb
 except ImportError:  # pragma: no cover - wandb optional
     wandb = None
-
-
-class SpeechInstructionDataset(Dataset):
-    """Read merged JSONL (``audio,instruction,answer``) into speech features."""
-
-    def __init__(self, manifest: Path, lang_filter: str | None = None) -> None:
-        rows: list[dict[str, str]] = []
-        with manifest.open(encoding="utf-8") as handle:
-            for line in handle:
-                line = line.strip()
-                if not line:
-                    continue
-                record = json.loads(line)
-                if lang_filter and record.get("lang") != lang_filter:
-                    continue
-                audio = str(record.get("audio", "")).strip()
-                instruction = str(record.get("instruction", "")).strip()
-                answer = str(record.get("answer", "")).strip()
-                if not audio or not answer:
-                    continue
-                rows.append({"audio": audio, "instruction": instruction, "answer": answer})
-        self.rows = rows
-        self.manifest = manifest
-
-    def __len__(self) -> int:
-        return len(self.rows)
-
-    def __getitem__(self, index: int) -> tuple[torch.Tensor, int, str, str]:
-        row = self.rows[index]
-        audio_path = Path(row["audio"])
-        if not audio_path.is_absolute():
-            audio_path = self.manifest.parent / audio_path
-        audio_array, rate = read_wav(audio_path)
-        if rate != SAMPLE_RATE:
-            raise ValueError(f"expected {SAMPLE_RATE} Hz waveform, got {rate} (path={audio_path})")
-        return torch.from_numpy(audio_array.astype(np.float32)), rate, row["instruction"], row["answer"]
 
 
 def collate(batch: list[tuple[torch.Tensor, int, str, str]]) -> tuple[torch.Tensor, torch.Tensor, list[str], list[str]]:
@@ -161,7 +125,10 @@ def run_epoch(args, encoder, projector, lm, tokenizer, loader, device, optimizer
     steps = 0
     for waveforms, lengths, instructions, answers in tqdm(loader, desc="train" if training else "dev", unit="batch", disable=not ddp_utils.is_main()):
         with torch.no_grad():
-            acoustic, acoustic_lengths = encoder.encode(waveforms.to(device), lengths.to(device), SAMPLE_RATE)
+            acoustic, acoustic_lengths = encoder.encode(
+                waveforms.to(device), lengths.to(device), SAMPLE_RATE,
+                feature_augment=args.augment_mel and training,
+            )
         projected = projector(acoustic)
         projected_lengths = projector_module.output_lengths(acoustic_lengths).clamp_max(projected.size(1))
 
@@ -262,6 +229,10 @@ def main() -> None:
     parser.add_argument("--lang-filter", default=None,
                         help="only train on this lang (zh/en); None = all")
     parser.add_argument("--limit", type=int, default=0, help="limit examples (smoke test)")
+    parser.add_argument("--augment", action=argparse.BooleanOptionalAction, default=False,
+                        help="apply random waveform augmentation inside the training dataset")
+    parser.add_argument("--augment-mel", action=argparse.BooleanOptionalAction, default=False,
+                        help="apply SpecAugment masks after the encoder frontend")
     parser.add_argument("--dev-file", type=Path, default=None,
                         help="dev JSONL when --data is a single train JSONL")
     parser.add_argument("--seed", type=int, default=7)
@@ -327,8 +298,9 @@ def main() -> None:
     # ---- data ----
     args.output.mkdir(parents=True, exist_ok=True)
 
-    def resolve(manifest):
-        return SpeechInstructionDataset(manifest, args.lang_filter)
+    def resolve(manifest, training: bool):
+        config = SpeechAugmentConfig(enabled=args.augment and training)
+        return SpeechInstructionDataset(manifest, augment=config, lang_filter=args.lang_filter, limit=args.limit)
 
     if args.data.is_dir():
         train_manifest, dev_manifest = args.data / "train.jsonl", args.data / "dev.jsonl"
@@ -339,11 +311,8 @@ def main() -> None:
             raise SystemExit("For single-file data, pass --dev-file <path>")
         train_manifest, dev_manifest = args.data, args.dev_file
 
-    train_set = resolve(train_manifest)
-    dev_set = resolve(dev_manifest)
-    if args.limit:
-        train_set.rows = train_set.rows[: args.limit]
-        dev_set.rows = dev_set.rows[: min(args.limit, len(dev_set))]
+    train_set = resolve(train_manifest, training=True)
+    dev_set = resolve(dev_manifest, training=False)
 
     train_sampler = ddp_utils.make_sampler(train_set, shuffle=True)
     dev_sampler = ddp_utils.make_sampler(dev_set, shuffle=False)

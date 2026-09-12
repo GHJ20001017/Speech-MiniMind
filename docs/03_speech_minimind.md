@@ -57,7 +57,7 @@ labels = [-100, ..., -100,  # 语音前缀和 prompt
 MiniMind 的源码和权重由官方仓库维护，本项目不复制其大模型文件。请先下载一个 Transformers 格式的 MiniMind 模型目录，再运行：
 
 ```bash
-python scripts/train_speech_projector.py \
+python trainer/train_speech_projector.py \
   --data data/aishell1/processed \
   --encoder-checkpoint outputs/02_acoustic_encoder/tiny_conformer_ctc.pt \
   --minimind-model /path/to/minimind-3 \

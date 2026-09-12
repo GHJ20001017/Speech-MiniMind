@@ -96,7 +96,7 @@ python scripts/prepare_aishell1.py
 #### 非流式（离线整句识别）
 
 ```bash
-CUDA_VISIBLE_DEVICES=0,1,2,3 torchrun --nproc_per_node=4 scripts/train_conformer_ctc.py \
+CUDA_VISIBLE_DEVICES=0,1,2,3 torchrun --nproc_per_node=4 trainer/train_conformer_ctc.py \
   --data data/aishell1/processed --epochs 20 --batch-size 32 --lr 2e-4
 ```
 
@@ -110,7 +110,7 @@ CUDA_VISIBLE_DEVICES=0,1,2,3 torchrun --nproc_per_node=4 scripts/train_conformer
 + **训练**：
 
 ```bash
-CUDA_VISIBLE_DEVICES=0,1,2,3 torchrun --nproc_per_node=4 scripts/train_conformer_streaming_ctc.py \
+CUDA_VISIBLE_DEVICES=0,1,2,3 torchrun --nproc_per_node=4 trainer/train_conformer_streaming_ctc.py \
   --data data/aishell1/processed --epochs 20 --batch-size 32 --lr 2e-4 \
   --chunk-size 32 --left-context 16
 ```
@@ -193,19 +193,20 @@ model.eval()
 先用 **Paraformer-zh-streaming 作为冻结编码器**（推荐，工业级中文流式 ASR 前端）。先下载 [MiniMind Transformers 权重](https://github.com/jingyaogong/minimind)（如 `minimind-3`）到本地目录，并按第 4 节下载 Paraformer 权重，然后：
 
 ```bash
-CUDA_VISIBLE_DEVICES=0,1,2,3 torchrun --nproc_per_node=4 scripts/train_speech_projector.py \
+CUDA_VISIBLE_DEVICES=0,1,2,3 torchrun --nproc_per_node=4 trainer/train_speech_projector.py \
   --data data/aishell1/processed \
   --encoder-type paraformer \
   --paraformer-model outputs/paraformer-streaming \
   --minimind-model /path/to/minimind-3 \
   --output outputs/03_speech_minimind_paraformer --epochs 5 --batch-size 2 \
+  --augment --augment-mel \
   --wandb --wandb-name projector_paraformer
 ```
 
 **换用 Tiny Conformer + CTC 作为冻结编码器**（教学主线，替代上面的 Paraformer）：先按第 2 节训练得到 `outputs/02_acoustic_encoder/tiny_conformer_ctc.pt`，保持默认 `--encoder-type conformer`（或用 `--encoder-checkpoint` 显式指定），其余参数与上面一致：
 
 ```bash
-CUDA_VISIBLE_DEVICES=0,1,2,3 torchrun --nproc_per_node=4 scripts/train_speech_projector.py \
+CUDA_VISIBLE_DEVICES=0,1,2,3 torchrun --nproc_per_node=4 trainer/train_speech_projector.py \
   --data data/aishell1/processed \
   --encoder-checkpoint outputs/02_acoustic_encoder/tiny_conformer_ctc.pt \
   --minimind-model /path/to/minimind-3 \
@@ -287,7 +288,7 @@ python scripts/resample_stage2_mixed.py --data data/stage2_mixed --sr 16000
 在第 5 节的 Projector 桥接基础上，用第 6/7 节的指令数据**微调 MiniMind 本身**（LoRA），让它变成能听语音、理解指令、生成回答的完整 Speech LLM：
 
 ```bash
-CUDA_VISIBLE_DEVICES=0,1,2,3 torchrun --nproc_per_node=4 scripts/train_speech_minimind.py \
+CUDA_VISIBLE_DEVICES=0,1,2,3 torchrun --nproc_per_node=4 trainer/train_speech_minimind.py \
   --data data/stage2_mixed \
   --encoder-type paraformer \
   --paraformer-model outputs/paraformer-streaming \
@@ -295,6 +296,7 @@ CUDA_VISIBLE_DEVICES=0,1,2,3 torchrun --nproc_per_node=4 scripts/train_speech_mi
   --minimind-model /path/to/minimind-3 \
   --output outputs/04_speech_minimind_sft --epochs 3 --batch-size 2 \
   --lora-r 8 --lora-alpha 16 \
+  --augment --augment-mel \
   --wandb --wandb-name speech_minimind_sft
 ```
 
@@ -302,7 +304,7 @@ CUDA_VISIBLE_DEVICES=0,1,2,3 torchrun --nproc_per_node=4 scripts/train_speech_mi
 
 ```bash
 # Projector 与 MiniMind 一起训练；--projector-lr 不传时复用 --lr
-CUDA_VISIBLE_DEVICES=0,1,2,3 torchrun --nproc_per_node=4 scripts/train_speech_minimind.py \
+CUDA_VISIBLE_DEVICES=0,1,2,3 torchrun --nproc_per_node=4 trainer/train_speech_minimind.py \
   --data data/stage2_mixed \
   --encoder-type paraformer --paraformer-model outputs/paraformer-streaming \
   --projector-checkpoint outputs/03_speech_minimind_paraformer/projector_epoch_005.pt \
@@ -314,7 +316,9 @@ CUDA_VISIBLE_DEVICES=0,1,2,3 torchrun --nproc_per_node=4 scripts/train_speech_mi
 - `--tune lora`（默认）：只对 MiniMind 注入并训练 **LoRA adapter**（约 0.5% 可训练参数）；`--tune full`：全参数微调 MiniMind。
 - 默认冻结语音编码器和 Speech Projector；传入 `--tune-projector` 后会把 Projector 加入优化器，与 MiniMind 一起训练。可用 `--projector-lr` 单独设置学习率（不传时复用 `--lr`）。编码器始终冻结。
 - 损失只在 `answer` 部分计算（prompt 与语音前缀用 -100 mask），标准 SFT。
-- 常见参数：`--tune lora|full`、`--tune-projector`、`--projector-lr`、`--lang-filter zh|en`（只练单一语言）、`--limit N`（先小规模试跑）、`--lora-r/--lora-alpha`（LoRA 秩）、`--epochs`、`--wandb`（上传指标，可选 `--wandb-project <name>`、`--wandb-name <run>`，project 默认 `Speech-MiniMind`）。
+- `--augment`：在 Dataset 的 `__getitem__` 阶段按样本随机增强训练音频，原始音频文件不会被修改；验证集始终不增强。当前包括随机变速、加噪、音量、时间遮挡、低通和简易混响。Projector 训练开启增强时会自动关闭 `--hidden-cache`，避免缓存阻止每个 epoch 重新随机增强。
+- `--augment-mel`：在声学前端生成 Mel/Fbank 后，按 batch 随机做 SpecAugment 的频率遮挡和时间遮挡；同样只作用于训练集，验证集关闭。
+- 常见参数：`--tune lora|full`、`--tune-projector`、`--projector-lr`、`--augment`、`--lang-filter zh|en`（只练单一语言）、`--limit N`（先小规模试跑）、`--lora-r/--lora-alpha`（LoRA 秩）、`--epochs`、`--wandb`（上传指标，可选 `--wandb-project <name>`、`--wandb-name <run>`，project 默认 `Speech-MiniMind`）。
 - `--tune lora` 依赖 `peft`：`python -m pip install peft`。
 - 开启 Projector 微调时，每个 epoch 额外保存 `projector_epoch_XXX.pt`，可直接作为后续推理或继续训练的 `--projector-checkpoint`。
 - 输出 `outputs/04_speech_minimind_sft/`：`config.json`、`metrics.csv`、`lora_epoch_XXX/adapter_model.safetensors`（lora 模式）或 `model_epoch_XXX/model.safetensors`（full 模式，完整可加载模型）。
@@ -426,7 +430,9 @@ Speech-MiniMind/
 ├── assets/      # README 插图（训练曲线等）
 ├── examples/    # 示例音频
 ├── model/       # Conformer、CTC、流式版、Projector、MiniMind 适配
-├── scripts/     # 分析 / 准备 / 训练 / 评估 / 合成脚本
+├── dataset/     # Dataset 与训练时随机音频增强
+├── trainer/     # 各阶段训练脚本
+├── scripts/     # 数据准备 / 下载 / 评估 / 推理 / WebUI
 ├── data/        # 本地数据，不提交
 ├── outputs/     # 图表、日志、checkpoint，不提交
 ├── requirements.txt
