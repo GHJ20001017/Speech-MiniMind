@@ -302,9 +302,9 @@ def main() -> None:
     parser.add_argument("--prompt", default="请将这段语音转写为文字：")
     parser.add_argument("--data-format", choices=("auto", "csv", "jsonl"), default="auto")
     parser.add_argument("--limit", type=int, default=0, help="limit examples for a quick smoke test")
-    parser.add_argument("--augment", action=argparse.BooleanOptionalAction, default=False,
+    parser.add_argument("--augment", action=argparse.BooleanOptionalAction, default=True,
                         help="apply random waveform augmentation inside the training dataset")
-    parser.add_argument("--augment-mel", action=argparse.BooleanOptionalAction, default=False,
+    parser.add_argument("--augment-mel", action=argparse.BooleanOptionalAction, default=True,
                         help="apply SpecAugment masks after the encoder frontend")
     parser.add_argument("--wandb", action=argparse.BooleanOptionalAction, default=False, help="log metrics to Weights & Biases")
     parser.add_argument("--wandb-project", default="Speech-MiniMind")
