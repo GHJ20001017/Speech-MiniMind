@@ -91,7 +91,17 @@ class SpeechWaveformAugmenter:
             ir = np.random.randn(ir_len).astype(np.float32) * np.exp(-np.linspace(0.0, 10.0, ir_len))
             ir[0] = 1.0
             ir /= np.sqrt(np.sum(ir ** 2) + 1e-6)
-            wav = np.convolve(wav, ir, mode="same").astype(np.float32)
+            # Direct convolution is O(len(wav) * len(ir)) and can stall a
+            # DDP rank for minutes on long utterances. FFT convolution keeps
+            # the augmentation bounded near O(n log n).
+            output_size = len(wav) + len(ir) - 1
+            fft_size = 1 << (output_size - 1).bit_length()
+            reverb = np.fft.irfft(
+                np.fft.rfft(wav, fft_size) * np.fft.rfft(ir, fft_size),
+                fft_size,
+            )[:output_size]
+            start = (len(ir) - 1) // 2
+            wav = reverb[start:start + len(wav)].astype(np.float32)
         return np.clip(wav, -1.0, 1.0).astype(np.float32)
 
 

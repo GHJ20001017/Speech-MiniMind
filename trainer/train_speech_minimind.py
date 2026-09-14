@@ -219,6 +219,8 @@ def main() -> None:
     parser.add_argument("--output", type=Path, default=Path("outputs/04_speech_minimind_sft"))
     parser.add_argument("--epochs", type=int, default=2)
     parser.add_argument("--batch-size", type=int, default=2)
+    parser.add_argument("--num-workers", type=int, default=0,
+                        help="DataLoader workers for parallel audio loading/augmentation")
     parser.add_argument("--lr", type=float, default=2e-4)
     parser.add_argument("--max-length", type=int, default=2048)
     parser.add_argument("--max-speech-tokens", type=int, default=512)
@@ -318,8 +320,26 @@ def main() -> None:
 
     train_sampler = ddp_utils.make_sampler(train_set, shuffle=True)
     dev_sampler = ddp_utils.make_sampler(dev_set, shuffle=False)
-    train_loader = DataLoader(train_set, batch_size=args.batch_size, shuffle=(train_sampler is None), sampler=train_sampler, collate_fn=collate)
-    dev_loader = DataLoader(dev_set, batch_size=args.batch_size, shuffle=False, sampler=dev_sampler, collate_fn=collate)
+    train_loader = DataLoader(
+        train_set,
+        batch_size=args.batch_size,
+        shuffle=(train_sampler is None),
+        sampler=train_sampler,
+        collate_fn=collate,
+        num_workers=args.num_workers,
+        pin_memory=device.type == "cuda",
+        persistent_workers=args.num_workers > 0,
+    )
+    dev_loader = DataLoader(
+        dev_set,
+        batch_size=args.batch_size,
+        shuffle=False,
+        sampler=dev_sampler,
+        collate_fn=collate,
+        num_workers=args.num_workers,
+        pin_memory=device.type == "cuda",
+        persistent_workers=args.num_workers > 0,
+    )
 
     # save config + initial model/adapter reference (rank 0 only)
     if ddp_utils.is_main():
