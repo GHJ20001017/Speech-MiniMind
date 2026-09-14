@@ -67,7 +67,7 @@ def wrap(model: torch.nn.Module) -> torch.nn.Module:
         model,
         device_ids=[local_rank()],
         output_device=local_rank(),
-        find_unused_parameters=True,
+        find_unused_parameters=False,
     )
 
 

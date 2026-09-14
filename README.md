@@ -160,51 +160,47 @@ python scripts/visualize_asr_webui.py \
 
 我们训练好的 02 章「Tiny Conformer + CTC」编码器权重（**流式**与**非流式**）会发布在 ModelScope 仓库：<https://www.modelscope.cn/models/ghjghj1017/Tiny_Conformer>。你可以直接下载使用，省去本地重新训练。
 
-### 换用成熟开源编码器（推荐 FunASR / Paraformer-zh-streaming）
+### 换用成熟开源编码器（推荐 FunASR / SenseVoice-Small）
 
-如果后续要换成开源的成熟声学编码器，**推荐用 FunASR 的 Paraformer-zh-streaming**（阿里达摩院开源，Apache-2.0，中文实时流式识别的工业级模型，约 220M 参数），把前面的 Tiny Conformer + CTC 替换掉。先用脚本下载权重：
+如果后续要换成开源的成熟声学编码器，**推荐用 FunASR 的 SenseVoice-Small**。它是离线非自回归模型，适合批量提取帧级 encoder hidden states。首次使用时安装依赖并下载模型：
 
 ```bash
-# 首次需要 funasr 与 modelscope（均为可选依赖，手动安装即可）
 python -m pip install funasr modelscope
 
-# 默认走 ModelScope 镜像（iic/speech_paraformer-large_asr_nat-zh-cn-16k-common-vocab8404-online，国内更快）
-python scripts/download_paraformer_streaming.py --output outputs/paraformer-streaming
-
-# 也可改走 Hugging Face 上游（funasr/paraformer-zh-streaming）
-python scripts/download_paraformer_streaming.py --source huggingface --output outputs/paraformer-streaming
+# 默认可由 FunASR 自动下载；也可提前下载到本地目录
+python -c "from modelscope.hub.snapshot_download import snapshot_download; snapshot_download('iic/SenseVoiceSmall', local_dir='outputs/sensevoice-small')"
 ```
 
-脚本会把权重、配置、tokens 一起下载到 `outputs/paraformer-streaming`。它**不是** `transformers` 模型，要用 FunASR 的 `AutoModel` 加载：
+SenseVoice 不需要流式 encoder。仓库的 `SenseVoiceFrozenEncoder` 会使用 SenseVoice 的离线 `WavFrontend`，将一个 batch 的 fbank/LFR 特征一次性送入 `SenseVoiceEncoderSmall`，输出批量帧级声学表示，再交给 `SpeechProjector`。编码器参数全程冻结，训练时仍可使用 waveform 和 Mel/Fbank augmentation。
 
 ```python
 from funasr import AutoModel
 
-model = AutoModel(model="outputs/paraformer-streaming", device="cuda")  # 支持 device="cpu"/"cuda"
+model = AutoModel(model="iic/SenseVoiceSmall", device="cuda", disable_update=True)
 for p in model.parameters():
     p.requires_grad_(False)
 model.eval()
 ```
 
-> **注意**：Paraformer-zh-streaming 是**完整的流式 ASR 模型**（输入 16kHz 波形 → 输出文本/时间戳），不像 `WhisperModel.from_pretrained(...).encoder` 那样直接暴露帧级 encoder hidden state。仓库已提供统一封装 `model/frozen_encoder.py`（`FrozenSpeechEncoder` 基类 + `TinyConformerEncoder` / `ParaformerFrozenEncoder` 两个后端），它在 FunASR 内部取出流式 encoder（`SANMEncoderChunkOpt`）的帧级输出作为 `acoustic_dim=512` 的声学表示，并自动完成 waveform→fbank→LFR 前端，因此可以像 Tiny Conformer 一样直接喂给 `SpeechProjector`（具体的使用步骤、命令与维度对齐请见下文第 5 节）。
+> **注意**：SenseVoice 的 encoder hidden state 不是 ASR 文本输出，而是 Projector 使用的连续帧级声学表示。其 encoder 支持 batch forward，输出维度由模型自动读取；当前默认 frontend 为 16kHz、80-bin fbank、LFR `m=7/n=6`。
 
 ### 5. 训练语音投影器连接 MiniMind（03，Speech Projector）
 
-先用 **Paraformer-zh-streaming 作为冻结编码器**（推荐，工业级中文流式 ASR 前端）。先下载 [MiniMind Transformers 权重](https://github.com/jingyaogong/minimind)（如 `minimind-3`）到本地目录，并按第 4 节下载 Paraformer 权重，然后：
+使用 **SenseVoice-Small 作为冻结编码器**。先下载 [MiniMind Transformers 权重](https://github.com/jingyaogong/minimind)（如 `minimind-3`）到本地目录，然后：
 
 ```bash
 CUDA_VISIBLE_DEVICES=0,1,2,3 torchrun --nproc_per_node=4 trainer/train_speech_projector.py \
   --data data/aishell1/processed \
-  --encoder-type paraformer \
-  --paraformer-model outputs/paraformer-streaming \
+  --encoder-type sensevoice \
+  --sensevoice-model outputs/sensevoice-small \
   --minimind-model /path/to/minimind-3 \
   --output outputs/03_speech_minimind_projector --epochs 5 --batch-size 2 \
-  --wandb --wandb-name projector_paraformer
+  --wandb --wandb-name projector_sensevoice
 ```
 
 无论用哪个后端，都冻结编码器和 MiniMind，只训练约 0.8M 参数的 `SpeechProjector`。这一步得到的是**语音条件的转写桥接模型**，还不是完整的 Speech LLM。
 
-脚本会按所选后端自动设置 `SpeechProjector.acoustic_dim`（Conformer=256，Paraformer=512），并把输入统一为 16kHz 波形（Paraformer 前端要求 16kHz，非 16kHz 会被校验拦截）。对较长训练集可用 `--hidden-cache <dir>` 把每段音频的 encoder hidden state 缓存到本地（按 sha1(path) 命名），避免每个 epoch 重复跑前端（Paraformer 前端较耗时）。后续第 8 节的 `train_speech_minimind.py` 也支持同样的 `--encoder-type` / `--paraformer-model`，保证前后两阶段用同一编码器。
+脚本会按所选后端自动设置 `SpeechProjector.acoustic_dim`（SenseVoice 通常为 512，Conformer=256，Paraformer=512），并把输入统一为 16kHz 波形。SenseVoice 的 encoder 会对一个 batch 的 frontend 特征执行批量 forward；对较长训练集可用 `--hidden-cache <dir>` 缓存每段音频的 encoder hidden state，避免每个 epoch 重复跑前端。后续第 8 节的 `train_speech_minimind.py` 也支持同样的 `--encoder-type` / `--sensevoice-model`，保证前后两阶段使用同一编码器。
 
 训练过程（AISHELL-1，约 9.5k step）的 loss 曲线：
 
@@ -278,13 +274,12 @@ python scripts/resample_stage2_mixed.py --data data/stage2_mixed --sr 16000
 ```bash
 CUDA_VISIBLE_DEVICES=0,1,2,3 torchrun --nproc_per_node=4 trainer/train_speech_minimind.py \
   --data data/stage2_mixed \
-  --encoder-type paraformer \
-  --paraformer-model outputs/paraformer-streaming \
+  --encoder-type sensevoice \
+  --sensevoice-model outputs/sensevoice-small \
   --projector-checkpoint outputs/03_speech_minimind_projector/projector_epoch_005.pt \
   --minimind-model /path/to/minimind-3 \
   --output outputs/04_speech_minimind_sft --epochs 3 --batch-size 2 \
   --lora-r 8 --lora-alpha 16 \
-  --augment --augment-mel \
   --wandb --wandb-name speech_minimind_sft
 ```
 
@@ -294,18 +289,19 @@ CUDA_VISIBLE_DEVICES=0,1,2,3 torchrun --nproc_per_node=4 trainer/train_speech_mi
 # Projector 与 MiniMind 一起训练；--projector-lr 不传时复用 --lr
 CUDA_VISIBLE_DEVICES=0,1,2,3 torchrun --nproc_per_node=4 trainer/train_speech_minimind.py \
   --data data/stage2_mixed \
-  --encoder-type paraformer --paraformer-model outputs/paraformer-streaming \
+  --encoder-type sensevoice --sensevoice-model outputs/sensevoice-small \
   --projector-checkpoint outputs/03_speech_minimind_projector/projector_epoch_005.pt \
   --minimind-model /path/to/minimind-3 \
   --output outputs/04_speech_minimind_sft --epochs 3 --batch-size 2 \
-  --tune-projector --projector-lr 5e-5
+  --tune full --tune-projector --projector-lr 5e-5 \
+  --wandb --wandb-name speech_minimind_sft
 ```
 
 - `--tune lora`（默认）：只对 MiniMind 注入并训练 **LoRA adapter**（约 0.5% 可训练参数）；`--tune full`：全参数微调 MiniMind。
 - 默认冻结语音编码器和 Speech Projector；传入 `--tune-projector` 后会把 Projector 加入优化器，与 MiniMind 一起训练。可用 `--projector-lr` 单独设置学习率（不传时复用 `--lr`）。编码器始终冻结。
 - 损失只在 `answer` 部分计算（prompt 与语音前缀用 -100 mask），标准 SFT。
-- `--augment`：在 Dataset 的 `__getitem__` 阶段按样本随机增强训练音频，原始音频文件不会被修改；验证集始终不增强。当前包括随机变速、加噪、音量、时间遮挡、低通和简易混响。Projector 训练开启增强时会自动关闭 `--hidden-cache`，避免缓存阻止每个 epoch 重新随机增强。
-- `--augment-mel`：在声学前端生成 Mel/Fbank 后，按 batch 随机做 SpecAugment 的频率遮挡和时间遮挡；同样只作用于训练集，验证集关闭。
+- `--augment`（默认开启）：在 Dataset 的 `__getitem__` 阶段按样本随机增强训练音频，原始音频文件不会被修改；验证集始终不增强。使用 `--no-augment` 可关闭。当前包括随机变速、加噪、音量、时间遮挡、低通和简易混响。
+- `--augment-mel`（默认开启）：在声学前端生成 Mel/Fbank 后，按 batch 随机做 SpecAugment 的频率遮挡和时间遮挡；同样只作用于训练集，验证集关闭。使用 `--no-augment-mel` 可关闭。
 - 常见参数：`--tune lora|full`、`--tune-projector`、`--projector-lr`、`--augment`、`--lang-filter zh|en`（只练单一语言）、`--limit N`（先小规模试跑）、`--lora-r/--lora-alpha`（LoRA 秩）、`--epochs`、`--wandb`（上传指标，可选 `--wandb-project <name>`、`--wandb-name <run>`，project 默认 `Speech-MiniMind`）。
 - `--tune lora` 依赖 `peft`：`python -m pip install peft`。
 - 开启 Projector 微调时，每个 epoch 额外保存 `projector_epoch_XXX.pt`，可直接作为后续推理或继续训练的 `--projector-checkpoint`。
@@ -324,7 +320,7 @@ train loss 从约 8 收敛到约 0.85；dev loss 稳定下降到约 0.58。
 第 8 节只生成 checkpoint，仓库补了两个**测试入口**来实际"用"模型：一个 CLI 推理脚本（`infer_speech_minimind.py`）和一个网页互动平台（`visualize_speech_minimind_webui.py`，FastAPI + WebSocket）。两者复用同一套推理管线：
 
 ```text
-WAV ──▶ frozen 声学编码器(conformer/paraformer) ──▶ SpeechProjector(冻结)
+WAV ──▶ frozen 声学编码器(sensevoice/conformer/paraformer) ──▶ SpeechProjector(冻结)
         ──▶ 语音前缀 embeddings ⊕ 指令文本 tokens ──▶ MiniMind(微调后) ──▶ 回答文本
 ```
 
@@ -337,8 +333,8 @@ WAV ──▶ frozen 声学编码器(conformer/paraformer) ──▶ SpeechProje
 python scripts/infer_speech_minimind.py \
   --audio path/to/utterance.wav \
   --instruction "请将这段语音准确转写为中文文本。" \
-  --encoder-type paraformer \
-  --paraformer-model outputs/paraformer-streaming \
+  --encoder-type sensevoice \
+  --sensevoice-model outputs/sensevoice-small \
   --projector-checkpoint outputs/03_speech_minimind_projector/projector_epoch_005.pt \
   --minimind-model outputs/04_speech_minimind_sft/model_epoch_003
 
@@ -362,8 +358,8 @@ python -m pip install fastapi uvicorn soundfile qwen-tts   # 首次需要
 
 # 局域网访问 + 麦克风 + MiniMind 文本回答转语音
 python scripts/visualize_speech_minimind_webui.py \
-  --encoder-type paraformer \
-  --paraformer-model outputs/paraformer-streaming \
+  --encoder-type sensevoice \
+  --sensevoice-model outputs/sensevoice-small \
   --projector-checkpoint outputs/03_speech_minimind_projector/projector_epoch_005.pt \
   --minimind-model outputs/04_speech_minimind_sft/model_epoch_003 \
   --tts-model /gpu3/guhj/models/Qwen3-TTS-12Hz-1.7B-CustomVoice \\

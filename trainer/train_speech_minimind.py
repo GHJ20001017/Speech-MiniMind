@@ -199,8 +199,10 @@ def main() -> None:
                         help="dir or single JSONL with {train,dev}.jsonl (audio/instruction/answer)")
     parser.add_argument("--encoder-checkpoint", type=Path,
                         default=Path("outputs/02_acoustic_encoder/tiny_conformer_ctc.pt"))
-    parser.add_argument("--encoder-type", choices=("conformer", "paraformer"), default="conformer",
-                        help="frozen acoustic encoder backend")
+    parser.add_argument("--encoder-type", choices=("sensevoice", "conformer", "paraformer"), default="sensevoice",
+                        help="frozen acoustic encoder backend (sensevoice=batched offline default)")
+    parser.add_argument("--sensevoice-model", default="iic/SenseVoiceSmall",
+                        help="SenseVoice-Small model id or local directory")
     parser.add_argument("--paraformer-model", default=None,
                         help="FunASR model id/dir for --encoder-type paraformer")
     parser.add_argument("--projector-checkpoint", type=Path, required=True,
@@ -229,9 +231,9 @@ def main() -> None:
     parser.add_argument("--lang-filter", default=None,
                         help="only train on this lang (zh/en); None = all")
     parser.add_argument("--limit", type=int, default=0, help="limit examples (smoke test)")
-    parser.add_argument("--augment", action=argparse.BooleanOptionalAction, default=False,
+    parser.add_argument("--augment", action=argparse.BooleanOptionalAction, default=True,
                         help="apply random waveform augmentation inside the training dataset")
-    parser.add_argument("--augment-mel", action=argparse.BooleanOptionalAction, default=False,
+    parser.add_argument("--augment-mel", action=argparse.BooleanOptionalAction, default=True,
                         help="apply SpecAugment masks after the encoder frontend")
     parser.add_argument("--dev-file", type=Path, default=None,
                         help="dev JSONL when --data is a single train JSONL")
@@ -253,7 +255,7 @@ def main() -> None:
     encoder = build_frozen_encoder(
         args.encoder_type,
         checkpoint=str(args.encoder_checkpoint) if args.encoder_type == "conformer" else None,
-        model_id=args.paraformer_model,
+        model_id=(args.sensevoice_model if args.encoder_type == "sensevoice" else args.paraformer_model),
         device=device,
     )
     acoustic_dim = encoder.output_dim

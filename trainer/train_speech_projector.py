@@ -208,7 +208,7 @@ def run_epoch(args, encoder, projector, lm, tokenizer, loader, device, optimizer
                 feature_augment=args.augment_mel and training,
             )
         projected = projector(acoustic)
-        projected_lengths = projector.output_lengths(acoustic_lengths).clamp_max(projected.size(1))
+        projected_lengths = ddp_utils.unwrap(projector).output_lengths(acoustic_lengths).clamp_max(projected.size(1))
         inputs_embeds, attention_mask, labels = make_batch_embeddings(
             lm,
             tokenizer,
@@ -285,9 +285,11 @@ def resolve_dataset(
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--data", type=Path, default=Path("data/aishell1/processed"))
-    parser.add_argument("--encoder-type", choices=("conformer", "paraformer"), default="conformer",
-                        help="frozen acoustic encoder backend (conformer=offline default, paraformer=FunASR streaming)")
+    parser.add_argument("--encoder-type", choices=("sensevoice", "conformer", "paraformer"), default="sensevoice",
+                        help="frozen acoustic encoder backend (sensevoice=batched offline default, conformer=offline, paraformer=FunASR streaming)")
     parser.add_argument("--encoder-checkpoint", type=Path, default=Path("outputs/02_acoustic_encoder/tiny_conformer_ctc.pt"))
+    parser.add_argument("--sensevoice-model", default="iic/SenseVoiceSmall",
+                        help="SenseVoice-Small model id or local directory")
     parser.add_argument("--paraformer-model", default=None,
                         help="FunASR model id/dir for --encoder-type paraformer (default ModelScope iic/...-online)")
     parser.add_argument("--hidden-cache", type=Path, default=None,
@@ -320,7 +322,9 @@ def main() -> None:
     encoder = build_frozen_encoder(
         encoder_type=args.encoder_type,
         checkpoint=str(args.encoder_checkpoint) if args.encoder_type == "conformer" else None,
-        model_id=args.paraformer_model,
+        model_id=(
+            args.sensevoice_model if args.encoder_type == "sensevoice" else args.paraformer_model
+        ),
         device=device,
     )
     acoustic_dim = encoder.output_dim

@@ -2,7 +2,7 @@
 
 Loads the same pipeline as ``train_speech_minimind.py`` but in eval mode:
 
-    audio ──▶ frozen acoustic encoder (conformer / paraformer)
+    audio ──▶ frozen acoustic encoder (sensevoice / conformer / paraformer)
               ──▶ SpeechProjector (frozen) ──▶ speech prefix embeddings
               ──concat──▶ MiniMind (tuned) ──▶ answer text
 
@@ -16,13 +16,13 @@ Usage
 -----
 .. code-block:: bash
 
-    # full-mode tuned model, paraformer frontend (recommended)
+    # full-mode tuned model, SenseVoice-Small frontend (recommended)
     python scripts/infer_speech_minimind.py \\
       --audio path/to/utterance.wav \\
       --instruction "请将这段语音准确转写为中文文本。" \\
-      --encoder-type paraformer \\
-      --paraformer-model outputs/paraformer-streaming \\
-      --projector-checkpoint outputs/03_speech_minimind_paraformer/projector_epoch_005.pt \\
+      --encoder-type sensevoice \\
+      --sensevoice-model outputs/sensevoice-small \\
+      --projector-checkpoint outputs/03_speech_minimind_projector/projector_epoch_005.pt \\
       --minimind-model outputs/04_speech_minimind_sft/model_epoch_003
 
     # conformer frontend
@@ -79,7 +79,7 @@ def load_pipeline(args, device: torch.device):
     encoder = build_frozen_encoder(
         args.encoder_type,
         checkpoint=str(args.encoder_checkpoint) if args.encoder_type == "conformer" else None,
-        model_id=args.paraformer_model,
+        model_id=(args.sensevoice_model if args.encoder_type == "sensevoice" else args.paraformer_model),
         device=device,
     )
     acoustic_dim = encoder.output_dim
@@ -139,11 +139,13 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--audio", type=str, required=True, help="16-bit PCM WAV (16 kHz preferred; auto-resampled)")
     parser.add_argument("--instruction", default="请将这段语音准确转写为中文文本。", help="text instruction for the model")
-    parser.add_argument("--encoder-type", choices=("conformer", "paraformer"), default="paraformer",
+    parser.add_argument("--encoder-type", choices=("sensevoice", "conformer", "paraformer"), default="sensevoice",
                         help="frozen acoustic encoder backend")
     parser.add_argument("--encoder-checkpoint", type=Path,
                         default=Path("outputs/02_acoustic_encoder/tiny_conformer_ctc.pt"),
-                        help="conformer checkpoint (ignored for --encoder-type paraformer)")
+                        help="conformer checkpoint (ignored for SenseVoice/Paraformer)")
+    parser.add_argument("--sensevoice-model", default="iic/SenseVoiceSmall",
+                        help="SenseVoice-Small model id or local directory")
     parser.add_argument("--paraformer-model", default=None, help="FunASR model id/dir (paraformer backend)")
     parser.add_argument("--projector-checkpoint", type=Path, required=True,
                         help="trained SpeechProjector ckpt (outputs/03_*/projector_epoch_XXX.pt)")

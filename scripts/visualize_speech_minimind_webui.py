@@ -20,12 +20,12 @@ Usage
 
     pip install fastapi uvicorn soundfile qwen-tts
 
-    # full-mode tuned model, paraformer frontend (recommended);
+    # full-mode tuned model, SenseVoice-Small frontend (recommended);
     # --tts-model enables text-to-speech after every MiniMind answer.
     python scripts/visualize_speech_minimind_webui.py \\
-      --encoder-type paraformer \\
-      --paraformer-model outputs/paraformer-streaming \\
-      --projector-checkpoint outputs/03_speech_minimind_paraformer/projector_epoch_005.pt \\
+      --encoder-type sensevoice \\
+      --sensevoice-model outputs/sensevoice-small \\
+      --projector-checkpoint outputs/03_speech_minimind_projector/projector_epoch_005.pt \\
       --minimind-model outputs/04_speech_minimind_sft/model_epoch_003 \\
       --tts-model /gpu3/guhj/models/Qwen3-TTS-12Hz-1.7B-CustomVoice \\
       --tts-speaker Serena \\
@@ -983,10 +983,12 @@ def _resolve_ssl(args) -> dict:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--encoder-type", choices=("conformer", "paraformer"), default="paraformer",
+    parser.add_argument("--encoder-type", choices=("sensevoice", "conformer", "paraformer"), default="sensevoice",
                         help="frozen acoustic encoder backend")
     parser.add_argument("--encoder-checkpoint", type=Path,
                         default=Path("outputs/02_acoustic_encoder/tiny_conformer_ctc.pt"))
+    parser.add_argument("--sensevoice-model", default="iic/SenseVoiceSmall",
+                        help="SenseVoice-Small model id or local directory")
     parser.add_argument("--paraformer-model", default=None)
     parser.add_argument("--projector-checkpoint", type=Path, required=True)
     parser.add_argument("--minimind-model", type=Path, required=True,

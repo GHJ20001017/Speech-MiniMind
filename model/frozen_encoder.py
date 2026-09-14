@@ -6,15 +6,15 @@ backends expose very different contracts:
 
 * :class:`TinyConformerEncoder` - the in-repo Conformer. It ingests log-mel
   frames ``(B, T, n_mels)`` and returns ``(B, T//4, 256)`` after two stride-2
-  convolutions. It is cheap and fully offline, so it is the default backend
-  and the only one that can run without funasr installed.
+  convolutions. It is cheap and fully offline, so it is retained as the
+  lightweight in-repo fallback.
+* :class:`SenseVoiceFrozenEncoder` - the FunASR ``SenseVoiceSmall`` offline
+  encoder. Its frontend extracts a padded batch of fbank/LFR features and the
+  ``SenseVoiceEncoderSmall`` processes the batch in one forward pass, returning
+  frame-level states (normally 512 dimensions).
 * :class:`ParaformerFrozenEncoder` - the FunASR ``paraformer-zh-streaming``
-  encoder (:class:`SANMEncoderChunkOpt`). Unlike the Conformer this is the
-  front half of a *complete* streaming ASR model; it ingests raw waveforms
-  and returns frame-level encoder states ``(B, T', 512)`` at ~60 ms/frame
-  (fbank 10 ms hop with LFR m=7/n=6 left-context splicing). It has **no**
-  internal temporal subsampling, so the hidden-frame rate is fixed by the
-  frontend, not by the encoder weights.
+  encoder (:class:`SANMEncoderChunkOpt`). This legacy adapter is retained for
+  compatibility, but it is not the default training path.
 
 This module normalises both backends behind one interface so the projector
 trainer does not care which encoder was used::
@@ -167,6 +167,85 @@ class TinyConformerEncoder(FrozenSpeechEncoder):
         return torch.nn.utils.rnn.pad_sequence(batch, batch_first=True)
 
 
+class SenseVoiceFrozenEncoder(FrozenSpeechEncoder):
+    """Batch encoder adapter for FunASR ``SenseVoiceSmall``.
+
+    SenseVoice is used only as a frozen acoustic encoder here.  Its offline
+    ``WavFrontend`` still extracts each utterance's fbank internally, but the
+    resulting padded feature batch is passed through ``SenseVoiceEncoderSmall``
+    in one batched forward, avoiding the per-utterance encoder calls used by
+    the old streaming Paraformer path.
+    """
+
+    def __init__(
+        self,
+        model_id: str = "iic/SenseVoiceSmall",
+        device: str | torch.device = "cpu",
+        disable_dither: bool = True,
+    ) -> None:
+        try:
+            from funasr import AutoModel
+            from funasr.frontends.wav_frontend import WavFrontend
+        except ImportError as error:  # pragma: no cover - environment dependent
+            raise ImportError(
+                "SenseVoiceFrozenEncoder requires 'funasr'. "
+                "Install it with: python -m pip install funasr modelscope"
+            ) from error
+
+        self._device = torch.device(device)
+        self._auto = AutoModel(
+            model=model_id,
+            device=str(self._device),
+            disable_update=True,
+        )
+        self._encoder = self._auto.model.encoder
+        self._encoder.to(self._device).eval()
+        for parameter in self._encoder.parameters():
+            parameter.requires_grad_(False)
+        self._engine = self._encoder
+        self.output_dim = int(self._encoder.output_size())
+        self.output_frame_shift_ms = 60.0
+
+        self._frontend = WavFrontend(
+            fs=16000,
+            window="hamming",
+            n_mels=80,
+            frame_length=25,
+            frame_shift=10,
+            lfr_m=7,
+            lfr_n=6,
+            dither=0.0 if disable_dither else 1.0,
+        )
+
+    @torch.no_grad()
+    def encode(
+        self,
+        waveforms: torch.Tensor,
+        lengths: torch.Tensor,
+        sample_rate: int = 16000,
+        feature_augment: bool = False,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if sample_rate != 16000:
+            raise ValueError(
+                f"SenseVoice frontend expects 16 kHz waveforms, got {sample_rate} Hz. "
+                "Resample before calling encode."
+            )
+        waveforms = waveforms.to(self._device)
+        lengths = lengths.to(self._device)
+        # WavFrontend handles the per-utterance fbank extraction internally,
+        # then pads the result so SenseVoice's encoder sees one real batch.
+        self._frontend = self._frontend.to("cpu")
+        features, feature_lengths = self._frontend(
+            waveforms.cpu(), lengths.cpu()
+        )
+        features = features.to(self._device)
+        feature_lengths = feature_lengths.to(self._device)
+        if feature_augment:
+            features = augment_mel_features(features)
+        hidden, hidden_lengths = self._encoder(features, feature_lengths)
+        return hidden, hidden_lengths
+
+
 class ParaformerFrozenEncoder(FrozenSpeechEncoder):
     """FunASR ``paraformer-zh-streaming`` frozen encoder adapter.
 
@@ -295,14 +374,18 @@ def build_frozen_encoder(
 ) -> FrozenSpeechEncoder:
     """Return the encoder adapter selected by ``--encoder-type``.
 
-    Supported values: ``conformer`` (default, offline, no extra deps) and
-    ``paraformer`` (FunASR, ModelScope-first).
+    Supported values: ``sensevoice`` (FunASR, batched offline default),
+    ``conformer`` (offline, no extra deps), and ``paraformer`` (FunASR).
     """
     key = (encoder_type or "conformer").lower().replace("-", "_")
     if key in ("conformer", "tiny_conformer", "tinyconformer"):
         return TinyConformerEncoder(checkpoint=checkpoint, hidden_dim=hidden_dim, device=device)
+    if key in ("sensevoice", "sense_voice", "sensevoicesmall"):
+        return SenseVoiceFrozenEncoder(
+            model_id=model_id or "iic/SenseVoiceSmall", device=device
+        )
     if key in ("paraformer", "paraformer_streaming", "funasr"):
         return ParaformerFrozenEncoder(checkpoint=checkpoint, model_id=model_id, device=device)
     raise ValueError(
-        f"unknown --encoder-type '{encoder_type}'. Supported: conformer, paraformer"
+        f"unknown --encoder-type '{encoder_type}'. Supported: sensevoice, conformer, paraformer"
     )
