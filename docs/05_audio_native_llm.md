@@ -80,9 +80,17 @@ python scripts/prepare_speech_to_speech.py --download \
 
 脚本做的事情：
 
-1. 读 `conversations` / `answer_audios`，把展平 token 还原成 `(8, T)`，遇到 stop token（`>= codebook_size`）即截断；
+1. 读 `conversations` / `answer_audios`，把展平 token 还原成 `(Q, T)`，遇到 stop token（`>= codebook_size`）即截断；
 2. 用同源 Mimi 编码 `question_audios`，写入 `codes/*_p.npy`；
 3. 落盘 `codes/*_a.npy` 与 `data/route_b/s2s/{train,dev}.jsonl`。
+
+**实测事实（95 上跑通的 414024 行 `sft_a2a.parquet`，5.7 GB）**：
+
+- 展平 token 是 **frame-major**：`(t*Q+q)`，即 `arr.reshape(T, 8).T`。按这个顺序解码后送 SenseVoice 往返，转写与原文一致；
+  误按 codebook-major（`arr.reshape(8, T)`）解码则完全听不懂。这一点已用 ASR 对照验证，不要把顺序改回去。
+- 中文占比约 **34.65%**（`cjk_ratio >= 0.15`），且**分布在文件后段**，所以 `--limit` 做小样本时很容易一条中文都抽不到（表现为 `{"lang": 400}`、`kept: 0`）。要凑中文子集请调大 `--limit` 或跑全量。
+- 单个回答的 token 长度是 `Q` 的整数倍（`len % 8 == 0`，stop token 已在数据里被剔除），实测长度 120–23336，token 值域 `[0, 2047]`。
+- 读取必须**按 row group 流式**（`ParquetFile.iter_batches`）：`pq.read_table` 会因嵌套列报 `Nested data conversions not implemented for chunked array outputs`，而且会把整份 5.7 GB 读进内存。
 
 先下载 mini 版（`sft_a2a_mini.parquet`）做冒烟测试更省时间。
 
@@ -158,6 +166,8 @@ python scripts/infer_speech_to_speech.py \
 ```
 
 脚本把输入 WAV 编码成 token、自回归生成回答 token、再用同一 codec 解码为 WAV；`--print-hypothesis` 会把生成音频送 ASR 做一次可懂性检查。
+
+**生成必须锁码本**：frame-major 布局下，回答的第 `n` 个 slot 固定属于第 `n % Q` 个码本。`generate_audio_tokens` 会在每一步把 logits 掩蔽到该码本块（外加 `<|audio_end|>`），否则半训好的模型会飘到别的码本块，`from_lm_tokens` 还原出 `>= codebook_size` 的 code 值，Mimi 解码器会直接 `CUDA error: device-side assert triggered`。
 
 ## 7. 评测
 
