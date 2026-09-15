@@ -448,6 +448,9 @@ python scripts/eval_codec_reconstruction.py \
 python scripts/prepare_speech_to_speech.py --download \
   --file-name sft_a2a.parquet --lang zh \
   --output data/route_b/s2s --device cuda:0
+# 说明：完整 sft_a2a.parquet 有 414024 行 / 5.7 GB，中文占约 34.65% 且偏向文件后段，
+# 用 --limit 抽小样本时可能一条中文都取不到（统计里会显示 kept: 0）；冒烟请用
+# --file-name sft_a2a_mini.parquet，或把 --limit 调大。读取按 row group 流式进行。
 
 # 2) 可选 B0 预训练：先学 codec token 的分布
 python scripts/prepare_audio_lm_corpus.py --data-root data --output data/route_b/audio_lm
