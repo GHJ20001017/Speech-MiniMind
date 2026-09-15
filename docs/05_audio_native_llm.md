@@ -64,6 +64,24 @@ python scripts/eval_codec_reconstruction.py \
 
 **门槛**：中文可懂、无明显金属音。不达标就换 `--codec-type encodec`，或换更大的码本。
 
+### 实测结果（2026-09-15，Mimi 8×2048）
+
+在 95 上实测（`--num 20~30`）：
+
+| 语料 / 域 | 行类型 | 指标 | 值 |
+|---|---|---|---|
+| AISHELL-1 dev（zh 朗读） | 波形 | `mel_mae` / CER | **2.5697 / 0.3415** |
+| VoiceAssistant-400K dev（en 对话） | 波形 | `mel_mae` / WER | **1.8940 / 0.2251** |
+| `sft_a2a` 回答音频（en，B1 目标域） | 只有 code | WER | **0.1465** |
+
+读法：**英文明显优于中文**（WER 0.225 < CER 0.342；mel 失真 1.89 < 2.57），且 B1 真正的目标域（`sft_a2a` 英文回答音频）WER 最低，说明「Mimi + 8 码本」对英文是可用的，重建不是瓶颈。中文偏高的主因是 **12.5 Hz 对声调语言的采样率偏稀疏**，不是实现问题。错误集中在：
+
+- **短音频**（<0.3s，如 `y`、`oakfords`）——帧太少、上下文不足，WER 直接到 1.0，属预期；
+- **专有名词/罕见词**（`Britney Spears` → `birdss spears`、`Texas` 类）——量化损失对未见词的音素细节更敏感；
+- 长句整体语义仍可辨（如 `why do helium balloons float in the air`、`so it is because of the lower density when compared to the air` 完全正确）。
+
+> 结论：**M0 对英文通过**，无需为英文切换 codec。上述数值是 `--num 20~30` 的小样本，用于选型判断，不是最终评测指标。
+
 ## 3. 词表布局与训练目标
 
 `model/audio_lm.py` 定义音频 token 的排布。音频块紧跟在文本词表之后：
