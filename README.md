@@ -492,13 +492,6 @@ python scripts/prepare_audio_lm_corpus.py --data-root data --output data/route_b
 | moss_speech_qa | `data/moss_speech_qa/{train,dev}.jsonl` 的 `audio`（问题是 Qwen3-TTS 合成音） | zh | 24 kHz |
 | voiceassistant400k_50k | 同上的 `audio`，**默认不引入**，需加 `--include-english` | en | 22.05 kHz |
 
-每行只有 `{"audio": "<绝对路径>", "source": "...", "lang": "..."}` 三个字段，同时写出 `metadata.json` 记录各来源行数。两个容易踩的点：
-
-- **路径基准不统一**：AISHELL 的 CSV 存的是仓库根相对路径，moss/va 的 JSONL 存的是相对自己目录的路径。脚本会依次尝试「仓库根 / 清单所在目录」，并把结果**统一转成绝对路径**——因为下游 `cache_audio_tokens.py` 是相对它自己的清单目录解析的，这里留相对路径会静默全部失效。
-- **采样率不统一**：清单不做重采样，交给 codec 内部处理（codec 是 24 kHz，16 kHz 的 AISHELL 在 `encode` 里会自动上采样）。
-
-无论 AISHELL 还是 moss，这里都只是**列出**音频，真正的量化在下一步。
-
 #### 3.2 编码成离散 token 缓存（`cache_audio_tokens.py`）
 
 ```bash
