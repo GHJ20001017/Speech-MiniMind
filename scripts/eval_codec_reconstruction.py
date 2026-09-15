@@ -58,7 +58,11 @@ def parse_args() -> argparse.Namespace:
 
 
 def load_aishell_rows(data: Path, split: str, num: int) -> list[tuple[str, str]]:
-    """Return ``[(audio_path, transcript), ...]`` from an AISHELL CSV manifest."""
+    """Return ``[(audio_path, transcript), ...]`` from an AISHELL CSV manifest.
+
+    AISHELL manifests store repo-root-relative paths (``data/aishell1/...``), so
+    resolve against the repo root first and fall back to the manifest directory.
+    """
     manifest = data / f"{split}.csv"
     if not manifest.exists():
         raise SystemExit(f"manifest not found: {manifest}")
@@ -67,7 +71,8 @@ def load_aishell_rows(data: Path, split: str, num: int) -> list[tuple[str, str]]
         for row in csv.DictReader(handle):
             path = Path(row["path"])
             if not path.is_absolute():
-                path = data / path
+                candidate = ROOT / path
+                path = candidate if candidate.exists() else data / path
             rows.append((str(path), row.get("text", "")))
     return rows[:num] if num else rows
 

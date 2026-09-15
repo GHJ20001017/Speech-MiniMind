@@ -4,7 +4,7 @@ This is the Route-B first stage: before any speech-to-speech pairing exists, the
 LM learns the *distribution* of the codec's tokens, exactly as a text LM learns
 a language.  Every sample is one utterance's code sequence wrapped as
 
-    [BOS] <|audio_bos|> codes... <|audio_eos|> [EOS]
+    [BOS] <|audio_start|> codes... <|audio_end|> [EOS]
 
 and the whole code span is supervised.
 

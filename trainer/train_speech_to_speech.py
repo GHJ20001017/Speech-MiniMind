@@ -4,8 +4,8 @@ Continues from the B0 audio-LM checkpoint.  Each sample pairs a *prompt*
 utterance with an *answer* utterance; the model reads the prompt codes and
 generates the answer codes, and the loss covers only the answer span::
 
-    [BOS] <|audio_bos|> prompt codes <|audio_eos|>
-          <|audio_bos|> answer codes <|audio_eos|> [EOS]
+    [BOS] <|audio_start|> prompt codes <|audio_end|>
+          <|audio_start|> answer codes <|audio_end|> [EOS]
 
 Use ``--init-from`` to start from the B0 output directory (or any directory that
 already contains the audio-extended vocabulary).  When starting from a plain

@@ -11,7 +11,7 @@ tokenised answer audio, so we only need to:
 
 Tokens in ``answer_audios`` are stored flat as 8 codes per frame, with a
 per-layer stop token (``>= codebook_size``) terminating each layer; those are
-truncated here because the trainer appends ``<|audio_eos|>`` itself.
+truncated here because the trainer appends ``<|audio_end|>`` itself.
 
 Usage::
 
@@ -75,13 +75,35 @@ def parse_args() -> argparse.Namespace:
 
 
 def download_dataset(args: argparse.Namespace) -> Path:
+    """Fetch the parquet from ModelScope.
+
+    ``gongjy/minimind-o_dataset`` is a *dataset* repo, so the default
+    ``snapshot_download(..., repo_type='model')`` 404s; ask for the dataset
+    endpoint explicitly (with a fallback for older ``modelscope`` versions that
+    lack ``dataset_snapshot_download``).
+    """
     try:
         from modelscope.hub.snapshot_download import snapshot_download
+
+        try:
+            from modelscope.hub.snapshot_download import dataset_snapshot_download
+        except ImportError:
+            dataset_snapshot_download = None
     except ImportError as error:  # pragma: no cover - environment dependent
         raise SystemExit(
             "modelscope is required for --download. Run: python -m pip install modelscope"
         ) from error
-    local_dir = snapshot_download(args.dataset_id, local_dir=str(args.download_dir))
+
+    if dataset_snapshot_download is not None:
+        local_dir = dataset_snapshot_download(
+            args.dataset_id, local_dir=str(args.download_dir),
+            allow_patterns=[args.file_name],
+        )
+    else:
+        local_dir = snapshot_download(
+            args.dataset_id, local_dir=str(args.download_dir),
+            repo_type="dataset", allow_patterns=[args.file_name],
+        )
     candidate = Path(local_dir) / args.file_name
     if not candidate.exists():
         available = sorted(p.name for p in Path(local_dir).glob("*.parquet"))

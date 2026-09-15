@@ -37,6 +37,11 @@ from math import gcd
 import numpy as np
 import torch
 
+# MiniMind-O (and its public ``sft_a2a`` dataset) use the first 8 Mimi
+# quantizers, while the released checkpoint exposes 32.  Keep the default here
+# so every Route-B component agrees on the code layout.
+DEFAULT_MIMI_CODEBOOKS = 8
+
 
 def _resample_1d(y: np.ndarray, source_rate: int, target_rate: int) -> np.ndarray:
     """Resample one channel from ``source_rate`` to ``target_rate``.
@@ -160,16 +165,20 @@ class FrozenAudioCodec(ABC):
 
 
 class MimiCodec(FrozenAudioCodec):
-    """Kyutai ``Mimi`` codec adapter (8 codebooks, 12.5 Hz, 24 kHz).
+    """Kyutai ``Mimi`` codec adapter (12.5 Hz, 24 kHz).
 
-    ``Mimi`` is the codec used by MiniMind-O, so tokenising our own audio with
-    it keeps us bit-compatible with the public ``sft_a2a`` dataset.
+    The released checkpoints carry **32** quantizers (1 semantic + 31 acoustic),
+    but MiniMind-O - and therefore the public ``sft_a2a`` dataset - only use the
+    **first 8**.  ``num_codebooks`` defaults to 8 so our prompt codes and the
+    dataset's answer codes come from the same sub-codebook set; it is passed
+    straight to ``encode(num_quantizers=...)``.
     """
 
     def __init__(
         self,
         model_id: str = "kyutai/mimi",
         device: str | torch.device = "cpu",
+        num_codebooks: int | None = None,
     ) -> None:
         try:
             from transformers import AutoFeatureExtractor, MimiModel
@@ -186,7 +195,14 @@ class MimiCodec(FrozenAudioCodec):
         self._engine = self._model
 
         config = self._model.config
-        self.num_codebooks = int(getattr(config, "num_quantizers", 8) or 8)
+        # Checkpoints expose 32 quantizers; Route B mirrors MiniMind-O's 8.
+        available = int(getattr(config, "num_quantizers", 8) or 8)
+        requested = int(num_codebooks) if num_codebooks else DEFAULT_MIMI_CODEBOOKS
+        if requested > available:
+            raise ValueError(
+                f"requested num_codebooks={requested} but {model_id} only has {available}"
+            )
+        self.num_codebooks = requested
         self.codebook_size = int(getattr(config, "codebook_size", 2048) or 2048)
 
         feature_extractor = None
@@ -216,10 +232,15 @@ class MimiCodec(FrozenAudioCodec):
             torch.arange(input_values.size(-1), device=self._device)[None, :]
             < lengths.to(self._device)[:, None]
         )
-        output = self._model.encode(input_values, padding_mask=padding_mask)
+        output = self._model.encode(
+            input_values,
+            padding_mask=padding_mask,
+            num_quantizers=self.num_codebooks,
+        )
         codes = output.audio_codes  # (B, Q, T_c)
         if codes.dtype != torch.long:
             codes = codes.long()
+        codes = codes[:, : self.num_codebooks, :]
         frame_lengths = self._frame_lengths(codes.size(2), lengths)
         codes = codes.masked_fill(
             torch.arange(codes.size(2), device=codes.device)[None, None, :]
@@ -240,14 +261,19 @@ class MimiCodec(FrozenAudioCodec):
                 (codes.size(0),), codes.size(2), dtype=torch.long
             )
         code_lengths = code_lengths.to(self._device)
-        padding_mask = (
-            torch.arange(codes.size(-1), device=self._device)[None, :]
-            < code_lengths[:, None]
-        ).unsqueeze(1)  # (B, 1, T_c)
+        # Mimi only uses `padding_mask.shape[-1]` to trim the decoded waveform,
+        # so the mask must be *sample* length, not frame length.  Trimming also
+        # removes the decoder's padding tail (its output overshoots the input).
+        sample_lengths = (code_lengths.cpu() * self.samples_per_frame).clamp_min(1)
+        padding_mask = torch.zeros(
+            (codes.size(0), 1, int(sample_lengths.max())),
+            dtype=torch.bool, device=self._device,
+        )
+        for index, count in enumerate(sample_lengths.tolist()):
+            padding_mask[index, :, :count] = True
         output = self._model.decode(codes, padding_mask=padding_mask)
         audio_values = output.audio_values.squeeze(1)  # (B, N)
-        lengths = self.frames_to_samples(code_lengths.cpu())
-        return audio_values.cpu().clamp(-1.0, 1.0), lengths
+        return audio_values.cpu().clamp(-1.0, 1.0), sample_lengths
 
     def _frame_lengths(self, frames: int, lengths: torch.Tensor) -> torch.Tensor:
         """Map waveform sample counts to Mimi frame counts (80 ms per frame)."""
@@ -368,7 +394,11 @@ def build_frozen_audio_codec(
     """
     key = (codec_type or "mimi").lower().replace("-", "_")
     if key in ("mimi", "kyutai_mimi"):
-        return MimiCodec(model_id=model_id or "kyutai/mimi", device=device)
+        return MimiCodec(
+            model_id=model_id or "kyutai/mimi",
+            device=device,
+            num_codebooks=num_codebooks,
+        )
     if key in ("encodec", "encodec_24khz"):
         return EncodecCodec(
             model_id=model_id or "facebook/encodec_24khz",

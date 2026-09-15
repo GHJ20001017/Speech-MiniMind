@@ -416,7 +416,7 @@ WAV ──► 冻结 codec 编码器 ──► 离散 audio tokens ──► 音
 与路线 A 的三点关键差异：
 
 - **必须扩词表**：把 `codebook_size × num_codebooks` 个音频 token 追加到文本词表之后，再训练 `embed_tokens` / `lm_head` 的新增行（LoRA 覆盖不到，因此路线 B 默认 `--tune full`）。
-- **输入输出同为离散 token**：序列是 `[BOS] <|audio_bos|> 输入语音 <|audio_eos|> <|audio_bos|> 输出语音 <|audio_eos|> [EOS]`，损失只算输出语音段。
+- **输入输出同为离散 token**：序列是 `[BOS] <|audio_start|> 输入语音 <|audio_end|> <|audio_start|> 输出语音 <|audio_end|> [EOS]`，损失只算输出语音段。
 - **不复用路线 A 的连续前缀**：两条路线共享数据与训练骨架，但序列布局独立。
 
 ### 代码与脚本

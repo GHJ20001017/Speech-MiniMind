@@ -27,6 +27,8 @@ WAV ──► 冻结 codec 编码器 ──► 离散 audio tokens ──► 音
 | `mimi`（默认） | 8 × 2048 | 12.5 Hz | 24 kHz | Kyutai Mimi，与 MiniMind-O 的 `sft_a2a` 数据**同源**，可直接复用其已 token 化的音频 |
 | `encodec` | 8 × 1024 | 75 Hz | 24 kHz | Meta EnCodec 24kHz，作为对照 |
 
+> **注意**：公开的 Mimi 权重（`kyutai/mimi`、ModelScope `gongjy/mimi`）实际带 **32** 个 quantizer（1 语义 + 31 声学），而 MiniMind-O 和 `sft_a2a` 只用**前 8** 个。`MimiCodec` 默认 `num_codebooks=8`，并把它传给 `encode(num_quantizers=...)`，让输入语音和数据集里的回答 code 来自同一组子码本。若改成其他数量，两侧必须一致。
+
 进入训练前必须先量化「量化损失」，否则模型再强也救不回差 codec：
 
 ```bash
@@ -49,19 +51,20 @@ python scripts/eval_codec_reconstruction.py \
 `model/audio_lm.py` 定义音频 token 的排布。音频块紧跟在文本词表之后：
 
 ```text
-[0, text_vocab)                       文本 token（保持预训练权重）
+[0, audio_offset)                     文本 token（保持预训练权重）
 [audio_offset + q*C, +C)              codebook q 的 C 个码（q = 0..Q-1）
-最后 3 个 id                            <|audio_bos|> <|audio_eos|> <|audio_pad|>
 ```
+
+三个特殊 token 复用 MiniMind-3 tokenizer 自带的 `<|audio_start|>`(14) / `<|audio_end|>`(15) / `<|audio_pad|>`(16)（`register_audio_special_tokens` 会发现已存在而跳过；换成普通文本 tokenizer 时才追加为 `additional_special_tokens`）。因此它们位于 `audio_offset` **之下**，`total_vocab_size` 取「音频块末尾」与「特殊 token 最大 id + 1」两者的较大值。
 
 一帧 `t` 的 `Q` 个 code 被**展平**成 `t*Q + q` 的连续 token（与 MiniMind-O 的 `answer_audios` 一致）。训练序列：
 
 ```text
-[BOS] <|audio_bos|> 输入语音 token <|audio_eos|>
-      <|audio_bos|> 输出语音 token <|audio_eos|> [EOS]
+[BOS] <|audio_start|> 输入语音 token <|audio_end|>
+      <|audio_start|> 输出语音 token <|audio_end|> [EOS]
 ```
 
-损失**只算输出语音那段**（含它的 `<|audio_eos|>`）：`build_audio_batch` 把其余位置全部标成 `-100`。这与路线 A 只算 `answer` 文本完全同构。
+损失**只算输出语音那段**（含它的 `<|audio_end|>`）：`build_audio_batch` 把其余位置全部标成 `-100`。这与路线 A 只算 `answer` 文本完全同构。
 
 ## 4. 数据
 

@@ -84,20 +84,28 @@ def main() -> None:
     codebook_size = codec.codebook_size
     num_codebooks = codec.num_codebooks
 
-    from model.audio_lm import AudioVocabSpec
+    from model.audio_lm import (
+        AUDIO_BOS,
+        AUDIO_EOS,
+        AUDIO_PAD,
+        AudioVocabSpec,
+        register_audio_special_tokens,
+    )
 
+    register_audio_special_tokens(tokenizer)
     offset = audio_offset_for(args.model)
     if offset < 0:
-        # Special tokens were appended last, so the block starts here.
-        offset = len(tokenizer.get_vocab()) - 3 - codebook_size * num_codebooks
+        # No offset recorded on the checkpoint: our convention is
+        # `audio_offset = len(tokenizer)` measured *after* the specials exist.
+        offset = len(tokenizer)
     spec = AudioVocabSpec(
         text_vocab_size=offset,
         codebook_size=codebook_size,
         num_codebooks=num_codebooks,
         audio_offset=offset,
-        audio_bos_id=tokenizer.convert_tokens_to_ids("<|audio_bos|>"),
-        audio_eos_id=tokenizer.convert_tokens_to_ids("<|audio_eos|>"),
-        audio_pad_id=tokenizer.convert_tokens_to_ids("<|audio_pad|>"),
+        audio_bos_id=tokenizer.convert_tokens_to_ids(AUDIO_BOS),
+        audio_eos_id=tokenizer.convert_tokens_to_ids(AUDIO_EOS),
+        audio_pad_id=tokenizer.convert_tokens_to_ids(AUDIO_PAD),
     )
     print(f"vocab: text={spec.text_vocab_size} audio={spec.audio_vocab_size} "
           f"total={spec.total_vocab_size}")

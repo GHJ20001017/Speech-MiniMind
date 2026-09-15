@@ -12,9 +12,10 @@ the same MiniMind decoder as Route A, so the LM needs three additions:
 Layout for one Speech-to-Speech sample (``Q`` codebooks, ``M`` prompt frames,
 ``K`` answer frames)::
 
-    [BOS] <|audio_bos|>  prompt frames (M*Q tokens)  <|audio_eos|>
-          <|audio_bos|>  answer frames (K*Q tokens)  <|audio_eos|>  [EOS]
-    labels = -100 everywhere except the answer frame tokens and <|audio_eos|>
+    [BOS] <|audio_start|>  prompt frames (M*Q tokens)  <|audio_end|>
+          <|audio_start|>  answer frames (K*Q tokens)  <|audio_end|>  [EOS]
+    labels = -100 everywhere except the answer frame tokens, their <|audio_end|>,
+             and the closing [EOS]
 
 Frames are **flattened codebook-major-then-frame** (``t*Q + q``), matching the
 public MiniMind-O ``sft_a2a`` tokenisation.  ``Q == 1`` degenerates to a plain
@@ -28,11 +29,15 @@ from dataclasses import dataclass, field
 
 import torch
 
-AUDIO_BOS = "<|audio_bos|>"
-AUDIO_EOS = "<|audio_eos|>"
+# MiniMind-3 ships an omni-aware tokenizer that already defines these three
+# (ids 14/15/16 in the released checkpoint).  Reusing its names keeps our token
+# ids identical to MiniMind-O's, so codes read from its public ``sft_a2a`` set
+# mean the same thing on both sides.  A plain text tokenizer gets them appended
+# by :func:`register_audio_special_tokens` instead.
+AUDIO_BOS = "<|audio_start|>"
+AUDIO_EOS = "<|audio_end|>"
 AUDIO_PAD = "<|audio_pad|>"
 AUDIO_SPECIAL_TOKENS = (AUDIO_BOS, AUDIO_EOS, AUDIO_PAD)
-
 
 @dataclass
 class AudioVocabSpec:
@@ -40,7 +45,8 @@ class AudioVocabSpec:
 
     ``audio_offset`` is the first audio-token id; codebook ``q`` owns the slice
     ``[audio_offset + q*codebook_size, audio_offset + (q+1)*codebook_size)``.
-    The three special tokens sit right after the last codebook.
+    The three special tokens may sit below ``audio_offset`` (MiniMind-3 ships
+    them at ids 14/15/16) rather than after the last codebook.
     """
 
     text_vocab_size: int
@@ -57,7 +63,14 @@ class AudioVocabSpec:
 
     @property
     def total_vocab_size(self) -> int:
-        return self.audio_offset + self.audio_vocab_size + len(AUDIO_SPECIAL_TOKENS)
+        """Embedding rows needed.
+
+        The special tokens may live *below* ``audio_offset`` (MiniMind-3 already
+        ships them) or be appended above the codebooks (plain text tokenizer), so
+        take the max of both layouts.
+        """
+        special_span = max(self.audio_bos_id, self.audio_eos_id, self.audio_pad_id) + 1
+        return max(self.audio_offset + self.audio_vocab_size, special_span)
 
     def token_id(self, codebook: int, code: int) -> int:
         """Map ``(codebook, code)`` to a single LM token id."""
@@ -82,35 +95,49 @@ def build_vocab_spec(
     codebook_size: int,
     num_codebooks: int,
 ) -> AudioVocabSpec:
-    """Reserve the audio block directly above the tokenizer's text vocabulary."""
+    """Reserve the audio block directly above the tokenizer's text vocabulary.
+
+    ``register_audio_special_tokens`` must run first: it either reuses the three
+    tokens the tokenizer already ships (MiniMind-3: ids 14/15/16) or appends them,
+    so ``len(tokenizer)`` is the final text size and the audio block starts right
+    after it.
+    """
     text_vocab_size = len(tokenizer)
     audio_offset = text_vocab_size
-    audio_bos_id = audio_offset + codebook_size * num_codebooks
+    audio_bos_id = tokenizer.convert_tokens_to_ids(AUDIO_BOS)
+    audio_eos_id = tokenizer.convert_tokens_to_ids(AUDIO_EOS)
+    audio_pad_id = tokenizer.convert_tokens_to_ids(AUDIO_PAD)
+    for name, token_id in ((AUDIO_BOS, audio_bos_id), (AUDIO_EOS, audio_eos_id),
+                           (AUDIO_PAD, audio_pad_id)):
+        if token_id is None or token_id < 0:
+            raise RuntimeError(
+                f"audio special token {name} is not registered; "
+                "call register_audio_special_tokens(tokenizer) first"
+            )
     return AudioVocabSpec(
         text_vocab_size=text_vocab_size,
         codebook_size=codebook_size,
         num_codebooks=num_codebooks,
         audio_offset=audio_offset,
-        audio_bos_id=audio_bos_id,
-        audio_eos_id=audio_bos_id + 1,
-        audio_pad_id=audio_bos_id + 2,
+        audio_bos_id=int(audio_bos_id),
+        audio_eos_id=int(audio_eos_id),
+        audio_pad_id=int(audio_pad_id),
     )
 
 
 def register_audio_special_tokens(tokenizer) -> None:
-    """Add the three audio special tokens as *additional* special tokens.
+    """Make sure the three audio special tokens exist in the tokenizer.
 
-    They are appended after the existing vocabulary so their ids line up with
-    :func:`build_vocab_spec`'s ``text_vocab_size``.
+    MiniMind-3's tokenizer already defines them (``<|audio_start|>`` = 14,
+    ``<|audio_end|>`` = 15, ``<|audio_pad|>`` = 16), in which case this is a
+    no-op.  A plain text tokenizer gets them appended as additional special
+    tokens, which is why this must run *before* :func:`build_vocab_spec`.
     """
-    added = tokenizer.add_special_tokens(
-        {"additional_special_tokens": list(AUDIO_SPECIAL_TOKENS)}
-    )
-    if added != len(AUDIO_SPECIAL_TOKENS):
-        # Idempotent re-runs: the tokens were already present.
-        for token in AUDIO_SPECIAL_TOKENS:
-            if token not in tokenizer.get_vocab():
-                raise RuntimeError(f"failed to register audio special token {token}")
+    vocab = tokenizer.get_vocab()
+    missing = [token for token in AUDIO_SPECIAL_TOKENS if token not in vocab]
+    if not missing:
+        return
+    tokenizer.add_special_tokens({"additional_special_tokens": missing})
 
 
 def extend_model_vocab(
@@ -213,7 +240,8 @@ def build_audio_batch(
     """Assemble a padded training batch.
 
     Returns ``(input_ids, labels, attention_mask)`` with shape ``(B, L)``.
-    Only answer-audio tokens (plus their ``<|audio_eos|>``) are supervised.
+    Only answer-audio tokens (plus their ``<|audio_end|>`` and the closing
+    ``[EOS]``, so the model also learns to stop) are supervised.
     """
     bos_id = tokenizer.bos_token_id
     eos_id = tokenizer.eos_token_id
@@ -283,7 +311,7 @@ def generate_audio_tokens(
 ) -> list[int]:
     """Autoregressively sample audio tokens after ``prompt_ids``.
 
-    ``prompt_ids`` must already contain the ``<|audio_bos|>`` that opens the
+    ``prompt_ids`` must already contain the ``<|audio_start|>`` that opens the
     answer. Returns the generated *audio* token ids (special tokens excluded).
     """
     device = next(model.parameters()).device
