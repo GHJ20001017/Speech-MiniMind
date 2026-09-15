@@ -44,6 +44,7 @@
 | 02 声学编码器 | Tiny Conformer、AISHELL-1、CTC；流式 Conformer（因果分块版） | [docs/02_acoustic_encoder.md](docs/02_acoustic_encoder.md) |
 | 03 接入 MiniMind | Speech Projector、语音前缀 | [docs/03_speech_minimind.md](docs/03_speech_minimind.md) |
 | 04 指令微调语音 LLM | 合并指令数据、LoRA 微调 MiniMind | 见下方第 7/8 节 |
+| 05 音频专属 LLM | 离散 codebook、冻结 codec、音频 LM 预训练与语音到语音微调（路线 B） | [docs/05_audio_native_llm.md](docs/05_audio_native_llm.md) |
 
 ## 路线 A：级联式 Speech LLM 端到端实现（教学主线）
 
@@ -402,9 +403,81 @@ VAD 相关参数（默认值适合安静的近距离说话）：
 
 > 本机（Mac/CPU）只会把 `outputs/` 留空、不做对待训练——测试平台需要真实 checkpoint 与 GPU。把上面命令在**训练过该模型的 GPU 机器**上执行即可，所有权重都从你传入的路径加载，仓库不额外下载任何东西。
 
-## 路线 B：音频专属 LLM（离散 codebook 端到端）— 待补充
+## 路线 B：音频专属 LLM（离散 codebook 端到端）
 
-> 路线 B 的实现（语音 → 量化编码器/codebook → 音频专属 LLM → 解码器 → 语音输出）将在此之后补充。本仓库当前教学主线为**路线 A**（见上文）。
+路线 A 把语音变成**连续**向量再交给通用 LLM，输出**文本**；路线 B 则把语音量化成**离散 codebook token**，让 LLM 直接在 token 序列上建模并生成，再由解码器还原波形：
+
+```text
+WAV ──► 冻结 codec 编码器 ──► 离散 audio tokens ──► 音频专属 LLM
+                                                    │
+                              WAV ◄── 冻结 codec 解码器 ◄── 生成的 audio tokens
+```
+
+与路线 A 的三点关键差异：
+
+- **必须扩词表**：把 `codebook_size × num_codebooks` 个音频 token 追加到文本词表之后，再训练 `embed_tokens` / `lm_head` 的新增行（LoRA 覆盖不到，因此路线 B 默认 `--tune full`）。
+- **输入输出同为离散 token**：序列是 `[BOS] <|audio_bos|> 输入语音 <|audio_eos|> <|audio_bos|> 输出语音 <|audio_eos|> [EOS]`，损失只算输出语音段。
+- **不复用路线 A 的连续前缀**：两条路线共享数据与训练骨架，但序列布局独立。
+
+### 代码与脚本
+
+| 文件 | 作用 |
+|---|---|
+| `model/audio_codec.py` | 冻结 codec 封装（`mimi` 默认 / `encodec` 对照），`encode` 波形→code、`decode` code→波形 |
+| `model/audio_lm.py` | 词表扩展、`<|audio_bos/eos/pad|>`、序列拼装与 label mask、自回归采样 |
+| `dataset/audio_token_dataset.py` | 读离线 code 缓存（`.npy`）产出训练样本 |
+| `scripts/prepare_speech_to_speech.py` | 把 MiniMind-O `sft_a2a.parquet` 转成本仓库的 s2s 清单 |
+| `scripts/prepare_audio_lm_corpus.py` | 汇总 AISHELL-1 / moss 音频成 B0 纯音频语料 |
+| `scripts/cache_audio_tokens.py` | 用冻结 codec 把音频一次性编码为离散 token 缓存 |
+| `trainer/train_audio_lm_pretrain.py` | B0 音频 LM 预训练 |
+| `trainer/train_speech_to_speech.py` | B1/B2 语音到语音指令微调 |
+| `scripts/eval_codec_reconstruction.py` | M0 门槛：重建失真 / STOI / PESQ / 往返 CER |
+| `scripts/infer_speech_to_speech.py` | 端到端推理：WAV → token → LLM → WAV |
+
+完整教学文档见 [docs/05_audio_native_llm.md](docs/05_audio_native_llm.md)。
+
+### 快速跑通
+
+```bash
+# 0) M0：先确认所选 codec 的重建质量（中文能听懂才继续）
+python scripts/eval_codec_reconstruction.py \
+  --data data/aishell1/processed --split dev --num 20 \
+  --codec-type mimi --device cuda:0 --output outputs/05_route_b_codec_check
+
+# 1) 数据：优先用 MiniMind-O 已 token 化的 sft_a2a（Click 一下即可下载）
+python scripts/prepare_speech_to_speech.py --download \
+  --file-name sft_a2a.parquet --lang zh \
+  --output data/route_b/s2s --device cuda:0
+
+# 2) 可选 B0 预训练：先学 codec token 的分布
+python scripts/prepare_audio_lm_corpus.py --data-root data --output data/route_b/audio_lm
+python scripts/cache_audio_tokens.py \
+  --data data/route_b/audio_lm --output data/route_b/audio_lm_codes \
+  --codec-type mimi --device cuda:0 --batch-size 16
+CUDA_VISIBLE_DEVICES=6,7 torchrun --nproc_per_node=2 \
+  trainer/train_audio_lm_pretrain.py \
+  --data data/route_b/audio_lm_codes \
+  --minimind-model /gpu3/guhj/models/minimind-3 \
+  --output outputs/05_route_b_audio_lm --epochs 3 --batch-size 8 \
+  --tune full --num-workers 4 --wandb --wandb-name route_b_b0
+
+# 3) B1/B2：语音到语音指令微调（只监督回答语音）
+CUDA_VISIBLE_DEVICES=6,7 torchrun --nproc_per_node=2 \
+  trainer/train_speech_to_speech.py \
+  --data data/route_b/s2s \
+  --init-from outputs/05_route_b_audio_lm/model_epoch_003 \
+  --output outputs/06_route_b_s2s --epochs 3 --batch-size 4 \
+  --tune full --num-workers 4 --wandb --wandb-name route_b_s2s
+
+# 4) 推理
+python scripts/infer_speech_to_speech.py \
+  --audio examples/disgusted_to_happy.wav \
+  --model outputs/06_route_b_s2s/model_epoch_003 \
+  --codec-type mimi --device cuda:0 --output outputs/route_b_answer.wav
+```
+
+> codec 为冻结的预训练模型（Mimi 8×2048、12.5 Hz、24 kHz；EnCodec 24 kHz 作对照），仓库不训练 codec。第一阶段的 s2s 数据主要来自 MiniMind-O `sft_a2a` 与自建 TTS 合成配对，**音色单一、无真实噪声**，属于教学闭环的已知局限，不能当作真实场景泛化结论。
+
 
 ## 目录结构
 
@@ -413,8 +486,8 @@ Speech-MiniMind/
 ├── docs/        # 分章教学文档
 ├── assets/      # README 插图（训练曲线等）
 ├── examples/    # 示例音频
-├── model/       # Conformer、CTC、流式版、Projector、MiniMind 适配
-├── dataset/     # Dataset 与训练时随机音频增强
+├── model/       # Conformer、CTC、流式版、Projector、MiniMind 适配、音频 codec / 音频 LM（路线 B）
+├── dataset/     # Dataset 与训练时随机音频增强（含路线 B 的 token 数据集）
 ├── trainer/     # 各阶段训练脚本
 ├── scripts/     # 数据准备 / 下载 / 评估 / 推理 / WebUI
 ├── data/        # 本地数据，不提交

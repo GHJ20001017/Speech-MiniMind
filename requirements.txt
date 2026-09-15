@@ -7,3 +7,5 @@ transformers>=4.57
 wandb>=0.16
 soundfile>=0.12
 qwen-tts
+pyarrow>=14
+modelscope
