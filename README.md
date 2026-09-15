@@ -518,16 +518,6 @@ data/route_b/audio_lm_codes/
 └── metadata.json                # codec 类型 / num_codebooks / codebook_size / sr / frame_rate
 ```
 
-要点：
-
-- **shard 形状 `(Q, T)`**：`Q=8` 个码本 × `T` 帧，12.5 Hz 即每帧 80 ms，用 `int16` 存（codebook 值 `< 2048`）。训练时 `dataset/audio_token_dataset.py` 会把 `(Q, T)` 展平成 `(T*Q,)` 的 frame-major 序列。
-- **可复用 / 可续跑**：默认遇到已存在的 shard 直接跳过（`reused`），加 `--overwrite` 强制重编；`--limit N` 只处理前 N 条（冒烟用）。日志里 `encoded / reused / failed / skipped_long` 四个计数器可直接判断是否正常。
-- **过滤规则**：读不出来的音频、编码后长度为 0 的、超过 `--max-seconds`（默认 40 s）的都会被丢弃，并**从清单里删掉对应行**，保证清单不会指向不存在的 `.npy`。这一点是踩过坑的：编码是攒批延迟写入的，所以脚本不能在缓冲期间去探盘判断文件是否存在，只能等最终 flush 后按实际写出的 key 复核一遍。
-- **缓存带元信息**：`metadata.json` 记录 codec 类型与码本参数，换 codec 必须换 `--output` 目录，避免旧 token 被静默复用。
-- **清单只在最后一次性写出**：所以缓存运行到一半时 `train.jsonl` 还不存在，训练脚本此刻读会报 `FileNotFoundError`，属预期行为。
-
-> 如果第 2 节（`sft_a2a`）已经把回答侧 token 一起产出了，那部分音频就**不需要再走本步**：`prepare_speech_to_speech.py` 直接从 parquet 里取回答 token、只把问题音频过一遍 Mimi，`.npy` 落在同一套 `codes/` 布局下（回答侧 `*_a.npy`、问题侧 `*_p.npy`）。本节只针对 B0 的纯音频语料。
-
 ### 4. B0 音频 LM 预训练（05，可选）
 
 在纯音频语料上先学 codec token 的分布，再用它初始化第 5 节：
