@@ -177,8 +177,8 @@ def main() -> None:
     if not args.skip_prompt_encode:
         codec = build_frozen_audio_codec(args.codec_type, args.codec_model, args.device)
 
-    table = pq.read_table(parquet_path)
-    columns = set(table.column_names)
+    parquet_file = pq.ParquetFile(str(parquet_path))
+    columns = set(parquet_file.schema_arrow.names)
     for required in ("conversations", "answer_audios"):
         if required not in columns:
             raise SystemExit(f"parquet is missing required column '{required}' (has {sorted(columns)})")
@@ -196,43 +196,58 @@ def main() -> None:
              "too_long": 0, "no_question": 0, "question_failed": 0}
 
     # Collect candidates first so the codec can encode question audio in batches.
+    # The parquet is ~5.7 GB with nested list columns, so iterate row-group
+    # batches instead of materialising the whole table (which both blows up RAM
+    # and trips "Nested data conversions not implemented for chunked arrays").
     pending: list[dict] = []
-    total = table.num_rows if not args.limit else min(args.limit, table.num_rows)
-    for index in range(total):
-        stats["rows"] += 1
-        conversations = json.loads(table["conversations"][index].as_py())
-        assistant_turns = [t for t in conversations if t.get("role") == "assistant"]
-        if not assistant_turns:
-            stats["no_answer"] += 1
-            continue
-        if not keep_language(str(assistant_turns[-1].get("content", "")), args.lang):
-            stats["lang"] += 1
-            continue
+    total_rows = parquet_file.metadata.num_rows
+    stop_at = total_rows if not args.limit else min(args.limit, total_rows)
+    wanted = [c for c in ("conversations", "answer_audios", "question_audios") if c in columns]
+    index = -1
+    for batch in parquet_file.iter_batches(batch_size=256, columns=wanted):
+        if index + 1 >= stop_at:
+            break
+        data = batch.to_pydict()
+        for offset in range(batch.num_rows):
+            index += 1
+            if index >= stop_at:
+                break
+            stats["rows"] += 1
+            conversations = json.loads(data["conversations"][offset])
+            assistant_turns = [t for t in conversations if t.get("role") == "assistant"]
+            if not assistant_turns:
+                stats["no_answer"] += 1
+                continue
+            if not keep_language(str(assistant_turns[-1].get("content", "")), args.lang):
+                stats["lang"] += 1
+                continue
 
-        answer_audios = table["answer_audios"][index].as_py() or []
-        if not answer_audios:
-            stats["no_answer"] += 1
-            continue
-        codes = split_answer_tokens(
-            [int(t) for t in answer_audios[-1]], num_codebooks, codebook_size
-        )
-        if codes is None:
-            stats["bad_answer"] += 1
-            continue
-        if codes.shape[1] > args.max_answer_frames:
-            stats["too_long"] += 1
-            continue
+            answer_audios = data["answer_audios"][offset] or []
+            if not answer_audios:
+                stats["no_answer"] += 1
+                continue
+            codes = split_answer_tokens(
+                [int(t) for t in answer_audios[-1]], num_codebooks, codebook_size
+            )
+            if codes is None:
+                stats["bad_answer"] += 1
+                continue
+            if codes.shape[1] > args.max_answer_frames:
+                stats["too_long"] += 1
+                continue
 
-        question_audio = None
-        if codec is not None and has_questions:
-            audios = table["question_audios"][index].as_py() or []
-            if audios and audios[-1]:
-                question_audio = audios[-1]
-            else:
-                stats["no_question"] += 1
-        pending.append(
-            {"index": index, "codes": codes, "audio": question_audio}
-        )
+            question_audio = None
+            if codec is not None and has_questions:
+                audios = data["question_audios"][offset] or []
+                if audios and audios[-1]:
+                    question_audio = audios[-1]
+                else:
+                    stats["no_question"] += 1
+            pending.append(
+                {"index": index, "codes": codes, "audio": question_audio}
+            )
+        if index + 1 >= stop_at:
+            break
 
     # Batch-encode question audio.
     if codec is not None:

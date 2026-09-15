@@ -22,6 +22,8 @@ import csv
 import json
 from pathlib import Path
 
+ROOT = Path(__file__).resolve().parents[1]
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
@@ -38,8 +40,21 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def resolve(path: Path, base: Path) -> Path:
-    return path if path.is_absolute() else (base / path).resolve()
+def resolve_audio(value: str, manifest: Path) -> Path | None:
+    """Resolve a manifest audio path, tolerating two different conventions.
+
+    AISHELL CSVs store *repo-root-relative* paths (``data/aishell1/...``) while
+    the moss/voiceassistant JSONLs store *manifest-relative* ones
+    (``audio/000000.wav``).  Try the repo root first, then the manifest dir, and
+    return ``None`` when neither exists so callers can skip quietly.
+    """
+    path = Path(value)
+    if path.is_absolute():
+        return path if path.exists() else None
+    for candidate in (ROOT / path, manifest.parent / path):
+        if candidate.exists():
+            return candidate
+    return None
 
 
 def collect_aishell(data_root: Path) -> dict[str, list[dict]]:
@@ -51,8 +66,8 @@ def collect_aishell(data_root: Path) -> dict[str, list[dict]]:
             continue
         with manifest.open(encoding="utf-8") as handle:
             for row in csv.DictReader(handle):
-                audio = resolve(Path(row["path"]), processed)
-                if audio.exists():
+                audio = resolve_audio(row["path"], manifest)
+                if audio is not None:
                     splits[split].append(
                         {"audio": str(audio), "source": "aishell1", "lang": "zh"}
                     )
@@ -72,8 +87,8 @@ def collect_jsonl(manifest: Path, source: str, lang: str) -> list[dict]:
             audio = record.get("audio")
             if not audio:
                 continue
-            path = resolve(Path(audio), manifest.parent)
-            if path.exists():
+            path = resolve_audio(audio, manifest)
+            if path is not None:
                 rows.append({"audio": str(path), "source": source, "lang": lang})
     return rows
 

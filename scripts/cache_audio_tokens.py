@@ -89,23 +89,30 @@ def resolve(manifest: Path, value: str) -> Path:
     return path if path.is_absolute() else (manifest.parent / path)
 
 
-def flush_batch(codec, batch: list[dict], code_dir: Path, counters: dict) -> None:
-    """Encode one batch of ``{"key", "waveform", "rate"}`` items and save shards."""
+def flush_batch(codec, batch: list[dict], code_dir: Path, counters: dict) -> set[str]:
+    """Encode one batch of ``{"key", "waveform", "rate"}`` items and save shards.
+
+    Returns the set of keys that actually produced a shard, so the caller can
+    drop manifest rows whose encode failed instead of pointing at a missing file.
+    """
     if not batch:
-        return
+        return set()
     waveforms = [torch.from_numpy(item["waveform"]) for item in batch]
     lengths = torch.tensor([w.numel() for w in waveforms], dtype=torch.long)
     padded = torch.nn.utils.rnn.pad_sequence(waveforms, batch_first=True)
     rates = {item["rate"] for item in batch}
     rate = rates.pop() if len(rates) == 1 else 16000
     codes, code_lengths = codec.encode(padded, lengths, rate)
+    written: set[str] = set()
     for item, code, length in zip(batch, codes, code_lengths.tolist()):
         if length <= 0:
             counters["failed"] += 1
             continue
         np.save(code_dir / f"{item['key']}.npy", code[:, :length].numpy().astype(np.int16))
         counters["encoded"] += 1
+        written.add(item["key"])
     batch.clear()
+    return written
 
 
 def process_split(
@@ -131,6 +138,10 @@ def process_split(
 
     for index, row in enumerate(rows):
         is_s2s = "answer_audio" in row or "prompt_audio" in row
+        # ``pieces`` maps a source field to either the shard it will live in, or
+        # ``None`` when the audio could not be read/skipped.  Encoding itself is
+        # deferred (batching), so we must NOT probe the filesystem here: the
+        # shard is only written when the batch flushes.
         pieces: dict[str, str | None] = {}
 
         for field, suffix in (("prompt_audio", "p"), ("answer_audio", "a"), ("audio", "")):
@@ -152,6 +163,8 @@ def process_split(
                 counters["skipped_long"] += 1
                 pieces[field] = None
                 continue
+            # Queue for encoding and record where it will land; the shard is
+            # written on the next flush, so do not look for it on disk yet.
             batch.append({"key": key, "waveform": waveform, "rate": rate})
             pieces[field] = rel_path(key)
 
@@ -162,24 +175,38 @@ def process_split(
 
         mapped: dict = {"task": row.get("task", "audio_lm"),
                         "source": row.get("source", "unknown"),
-                        "lang": row.get("lang", "zh")}
+                        "lang": row.get("lang", "zh"),
+                        "index": index}
         if is_s2s:
-            answer_rel = pieces.get("answer_audio")
-            if not answer_rel or not (output / answer_rel).exists():
+            if not pieces.get("answer_audio"):
                 counters["failed"] += 1
                 continue
-            mapped["answer_codes"] = answer_rel
-            prompt_rel = pieces.get("prompt_audio")
-            mapped["prompt_codes"] = prompt_rel if prompt_rel and (output / prompt_rel).exists() else None
+            mapped["answer_codes"] = pieces["answer_audio"]
+            mapped["prompt_codes"] = pieces.get("prompt_audio")
         else:
-            audio_rel = pieces.get("audio")
-            if not audio_rel or not (output / audio_rel).exists():
+            if not pieces.get("audio"):
                 counters["failed"] += 1
                 continue
-            mapped["codes"] = audio_rel
+            mapped["codes"] = pieces["audio"]
         out_rows.append(mapped)
 
     flush_batch(codec, batch, code_dir, counters)
+
+    # Drop rows whose referenced shard never got written (encode returned a zero
+    # length); otherwise the manifest would point at a missing .npy.
+    def shard_ok(rel: str | None) -> bool:
+        return bool(rel) and (output / rel).exists()
+
+    kept: list[dict] = []
+    for row in out_rows:
+        index = row.pop("index")
+        if not shard_ok(row.get("answer_codes") or row.get("codes")):
+            counters["failed"] += 1
+            continue
+        if "prompt_codes" in row and row["prompt_codes"] and not shard_ok(row["prompt_codes"]):
+            row["prompt_codes"] = None
+        kept.append(row)
+    out_rows = kept
 
     manifest_out = output / f"{split}.jsonl"
     with manifest_out.open("w", encoding="utf-8") as handle:
