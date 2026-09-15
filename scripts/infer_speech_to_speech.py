@@ -52,6 +52,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-prompt-frames", type=int, default=512)
     parser.add_argument("--output", type=Path, default=Path("outputs/route_b_answer.wav"))
     parser.add_argument("--print-hypothesis", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--asr-language", default="zh", choices=("zh", "en", "yue", "ja", "ko", "auto"),
+                        help="language hint for the round-trip SenseVoice check")
     parser.add_argument("--sensevoice-model", default="iic/SenseVoiceSmall")
     parser.add_argument("--seed", type=int, default=7)
     return parser.parse_args()
@@ -157,7 +159,7 @@ def main() -> None:
 
             asr = AutoModel(model=args.sensevoice_model, device=args.device, disable_update=True)
             result = asr.generate(input=recon[0, : int(recon_lengths[0])].numpy(), cache={},
-                                  language="zh", use_itn=False, batch_size_s=60)
+                                  language=args.asr_language, use_itn=False, batch_size_s=60)
             text = result[0]["text"] if result else ""
             print("ASR:", re.sub(r"<\|[^|]*\|>", "", text).strip())
         except Exception as error:  # noqa: BLE001 - optional dependency

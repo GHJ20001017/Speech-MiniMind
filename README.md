@@ -363,8 +363,8 @@ python scripts/visualize_speech_minimind_webui.py \
   --sensevoice-model outputs/sensevoice-small \
   --projector-checkpoint outputs/03_speech_minimind_projector/projector_epoch_005.pt \
   --minimind-model outputs/04_speech_minimind_sft/model_epoch_003 \
-  --tts-model /gpu3/guhj/models/Qwen3-TTS-12Hz-1.7B-CustomVoice \\
-  --tts-speaker Serena \\
+  --tts-model /gpu3/guhj/models/Qwen3-TTS-12Hz-1.7B-CustomVoice \
+  --tts-speaker Serena \
   --host 0.0.0.0 --port 7861 --ssl-auto
 ```
 
@@ -419,60 +419,141 @@ WAV ──► 冻结 codec 编码器 ──► 离散 audio tokens ──► 音
 - **输入输出同为离散 token**：序列是 `[BOS] <|audio_start|> 输入语音 <|audio_end|> <|audio_start|> 输出语音 <|audio_end|> [EOS]`，损失只算输出语音段。
 - **不复用路线 A 的连续前缀**：两条路线共享数据与训练骨架，但序列布局独立。
 
-### 代码与脚本
-
-| 文件 | 作用 |
-|---|---|
-| `model/audio_codec.py` | 冻结 codec 封装（`mimi` 默认 / `encodec` 对照），`encode` 波形→code、`decode` code→波形 |
-| `model/audio_lm.py` | 词表扩展、`<|audio_bos/eos/pad|>`、序列拼装与 label mask、自回归采样 |
-| `dataset/audio_token_dataset.py` | 读离线 code 缓存（`.npy`）产出训练样本 |
-| `scripts/prepare_speech_to_speech.py` | 把 MiniMind-O `sft_a2a.parquet` 转成本仓库的 s2s 清单 |
-| `scripts/prepare_audio_lm_corpus.py` | 汇总 AISHELL-1 / moss 音频成 B0 纯音频语料 |
-| `scripts/cache_audio_tokens.py` | 用冻结 codec 把音频一次性编码为离散 token 缓存 |
-| `trainer/train_audio_lm_pretrain.py` | B0 音频 LM 预训练 |
-| `trainer/train_speech_to_speech.py` | B1/B2 语音到语音指令微调 |
-| `scripts/eval_codec_reconstruction.py` | M0 门槛：重建失真 / STOI / PESQ / 往返 CER |
-| `scripts/infer_speech_to_speech.py` | 端到端推理：WAV → token → LLM → WAV |
-
 完整教学文档见 [docs/05_audio_native_llm.md](docs/05_audio_native_llm.md)。
 
-### 快速跑通
+### 1. 确认 codec 重建质量（05，M0 闸门）
+
+路线 B 的第一道闸门：冻结 codec 必须能把中文语音编成离散 token 再还原回「人能听懂」的波形，否则后面的音频 LM 训练没有意义。
+
+**为什么它必须排在第 3 节的 token 缓存之前**：本步只吃原始 WAV + AISHELL 转写，**不依赖任何 token 缓存**——它自己在内存里跑一遍 `encode → decode`，并用转写算往返 CER（`.npy` 里只剩 code，没有 ground truth，无法事后补验）。反过来，缓存**是由 codec 产出的**：换 codec 就得把所有 `.npy` 重新编一遍（`metadata.json` 按 codec 记录，必须换 `--output`）。所以顺序一定是「先定 codec，再批量编码」，用 20 条语音的代价避免十万级 token 白编。
 
 ```bash
-# 0) M0：先确认所选 codec 的重建质量（中文能听懂才继续）
 python scripts/eval_codec_reconstruction.py \
   --data data/aishell1/processed --split dev --num 20 \
   --codec-type mimi --device cuda:0 --output outputs/05_route_b_codec_check
+```
 
-# 1) 数据：优先用 MiniMind-O 已 token 化的 sft_a2a（Click 一下即可下载）
+输出重建失真 / STOI / PESQ / 往返 ASR CER 到 `outputs/05_route_b_codec_check/`。
+
+`--data` 支持三种输入，中英文与「回答音频域」都能用同一条命令跑：AISHELL 风格目录（读 `{split}.csv` 的 `path`/`text`）、项目 JSONL 清单（读 `audio` + 文本参照，或读 `answer_codes` + `answer_text`）、或直接指定单个清单文件。用 `--asr-language` 指定识别语言，评分单位随之从字符级 CER 切换为词级 WER：
+
+```bash
+# 英文数据集：重建 + 识别质量（WER）
+python scripts/eval_codec_reconstruction.py \
+  --data data/voiceassistant400k_50k --split dev --num 20 \
+  --asr-language en --codec-type mimi --device cuda:0 \
+  --output outputs/05_route_b_codec_check_en
+
+# sft_a2a 回答音频域：只有 code 没有波形，直接解码后算往返错误率（zh/en 都行）
+python scripts/eval_codec_reconstruction.py \
+  --data data/route_b/s2s --split dev --num 50 \
+  --asr-language en --codec-type mimi --device cuda:0 \
+  --output outputs/05_route_b_codec_check_s2s_en
+```
+
+> 行类型不同，能报的指标也不同：有**波形**的行会重新 `encode → decode`，因此 mel 失真 / STOI / PESQ 全有；只有 **code** 的行（`data/route_b/s2s`，即 `sft_a2a` 的回答音频）没有参考波形，代码会直接解码 code 得到音频，只算往返错误率。文本参照按语料取：指令类语料取 `instruction`（`audio` 存的是**问题/指令语音**，`answer` 是文字回答），AISHELL 类取 `text`，s2s 清单取 `answer_text`；都没有则跳过错误率。
+
+> 本步常规只覆盖 AISHELL 朗读语音；上一条 s2s 命令正是补上「B1 真正的目标域（`sft_a2a` 回答音频，TTS 合成域）」的往返校验。
+
+### 2. 构建语音到语音数据（05）
+
+优先用 MiniMind-O 已经 token 化好的 `sft_a2a`（`--download` 会从 ModelScope 拉取）：
+
+```bash
 python scripts/prepare_speech_to_speech.py --download \
   --file-name sft_a2a.parquet --lang zh \
   --output data/route_b/s2s --device cuda:0
-# 说明：完整 sft_a2a.parquet 有 414024 行 / 5.7 GB，中文占约 34.65% 且偏向文件后段，
-# 用 --limit 抽小样本时可能一条中文都取不到（统计里会显示 kept: 0）；冒烟请用
-# --file-name sft_a2a_mini.parquet，或把 --limit 调大。读取按 row group 流式进行。
+```
 
-# 2) 可选 B0 预训练：先学 codec token 的分布
+输出 `data/route_b/s2s/{train,dev}.jsonl` + `codes/` 缓存。
+
+> 完整 `sft_a2a.parquet` 有 414024 行 / 5.7 GB，中文占约 34.65% 且偏向文件后段，用 `--limit` 抽小样本时可能一条中文都取不到（统计里会显示 `kept: 0`）；冒烟请用 `--file-name sft_a2a_mini.parquet`，或把 `--limit` 调大。读取按 row group 流式进行。
+
+### 3. 构建纯音频语料与 token 缓存（05，可选 B0 前置）
+
+B0 只需要「一串串音频」，不需要问答配对。这一步把散落在各数据集里的音频汇总成一份清单，再用冻结 codec **一次性**编码成 `.npy` 离散 token——codec 编码比一次 LLM step 还贵，放进训练循环里每个 epoch 重跑是不可接受的，所以全部离线缓存。
+
+#### 3.1 汇总纯音频清单（`prepare_audio_lm_corpus.py`）
+
+```bash
 python scripts/prepare_audio_lm_corpus.py --data-root data --output data/route_b/audio_lm
+```
+
+脚本读取三类已有数据，只取其中的音频路径，输出 `data/route_b/audio_lm/{train,dev}.jsonl`：
+
+| 来源 | 读什么 | 语言 | 采样率 |
+|---|---|---|---|
+| AISHELL-1 | `data/aishell1/processed/{train,dev}.csv` 的 `path` 列 | zh | 16 kHz |
+| moss_speech_qa | `data/moss_speech_qa/{train,dev}.jsonl` 的 `audio`（问题是 Qwen3-TTS 合成音） | zh | 24 kHz |
+| voiceassistant400k_50k | 同上的 `audio`，**默认不引入**，需加 `--include-english` | en | 22.05 kHz |
+
+每行只有 `{"audio": "<绝对路径>", "source": "...", "lang": "..."}` 三个字段，同时写出 `metadata.json` 记录各来源行数。两个容易踩的点：
+
+- **路径基准不统一**：AISHELL 的 CSV 存的是仓库根相对路径，moss/va 的 JSONL 存的是相对自己目录的路径。脚本会依次尝试「仓库根 / 清单所在目录」，并把结果**统一转成绝对路径**——因为下游 `cache_audio_tokens.py` 是相对它自己的清单目录解析的，这里留相对路径会静默全部失效。
+- **采样率不统一**：清单不做重采样，交给 codec 内部处理（codec 是 24 kHz，16 kHz 的 AISHELL 在 `encode` 里会自动上采样）。
+
+无论 AISHELL 还是 moss，这里都只是**列出**音频，真正的量化在下一步。
+
+#### 3.2 编码成离散 token 缓存（`cache_audio_tokens.py`）
+
+```bash
 python scripts/cache_audio_tokens.py \
   --data data/route_b/audio_lm --output data/route_b/audio_lm_codes \
   --codec-type mimi --device cuda:0 --batch-size 16
+```
+
+脚本按 manifest 逐条读音频 → 按 batch 送进冻结 Mimi → 每条存一个 `.npy`，并把清单重写成指向缓存的版本：
+
+```text
+data/route_b/audio_lm_codes/
+├── codes/train/0000000.npy      # 每条音频一个 shard，int16，形状 (Q=8, T)
+├── codes/dev/0000000.npy
+├── train.jsonl                  # 重写后的清单：{"codes": "codes/train/0000000.npy", ...}
+├── dev.jsonl
+└── metadata.json                # codec 类型 / num_codebooks / codebook_size / sr / frame_rate
+```
+
+要点：
+
+- **shard 形状 `(Q, T)`**：`Q=8` 个码本 × `T` 帧，12.5 Hz 即每帧 80 ms，用 `int16` 存（codebook 值 `< 2048`）。训练时 `dataset/audio_token_dataset.py` 会把 `(Q, T)` 展平成 `(T*Q,)` 的 frame-major 序列。
+- **可复用 / 可续跑**：默认遇到已存在的 shard 直接跳过（`reused`），加 `--overwrite` 强制重编；`--limit N` 只处理前 N 条（冒烟用）。日志里 `encoded / reused / failed / skipped_long` 四个计数器可直接判断是否正常。
+- **过滤规则**：读不出来的音频、编码后长度为 0 的、超过 `--max-seconds`（默认 40 s）的都会被丢弃，并**从清单里删掉对应行**，保证清单不会指向不存在的 `.npy`。这一点是踩过坑的：编码是攒批延迟写入的，所以脚本不能在缓冲期间去探盘判断文件是否存在，只能等最终 flush 后按实际写出的 key 复核一遍。
+- **缓存带元信息**：`metadata.json` 记录 codec 类型与码本参数，换 codec 必须换 `--output` 目录，避免旧 token 被静默复用。
+- **清单只在最后一次性写出**：所以缓存运行到一半时 `train.jsonl` 还不存在，训练脚本此刻读会报 `FileNotFoundError`，属预期行为。
+
+> 如果第 2 节（`sft_a2a`）已经把回答侧 token 一起产出了，那部分音频就**不需要再走本步**：`prepare_speech_to_speech.py` 直接从 parquet 里取回答 token、只把问题音频过一遍 Mimi，`.npy` 落在同一套 `codes/` 布局下（回答侧 `*_a.npy`、问题侧 `*_p.npy`）。本节只针对 B0 的纯音频语料。
+
+### 4. B0 音频 LM 预训练（05，可选）
+
+在纯音频语料上先学 codec token 的分布，再用它初始化第 5 节：
+
+```bash
 CUDA_VISIBLE_DEVICES=6,7 torchrun --nproc_per_node=2 \
   trainer/train_audio_lm_pretrain.py \
   --data data/route_b/audio_lm_codes \
   --minimind-model /gpu3/guhj/models/minimind-3 \
   --output outputs/05_route_b_audio_lm --epochs 3 --batch-size 8 \
   --tune full --num-workers 4 --wandb --wandb-name route_b_b0
+```
 
-# 3) B1/B2：语音到语音指令微调（只监督回答语音）
+### 5. 语音到语音指令微调（06，B1/B2）
+
+只监督回答语音段（prompt / 输入音频 / padding 全部 `-100`）：
+
+```bash
 CUDA_VISIBLE_DEVICES=6,7 torchrun --nproc_per_node=2 \
   trainer/train_speech_to_speech.py \
   --data data/route_b/s2s \
   --init-from outputs/05_route_b_audio_lm/model_epoch_003 \
   --output outputs/06_route_b_s2s --epochs 3 --batch-size 4 \
   --tune full --num-workers 4 --wandb --wandb-name route_b_s2s
+```
 
-# 4) 推理
+不跑 B0 时可去掉 `--init-from`，直接用 MiniMind 权重冷启动。
+
+### 6. 端到端推理（06）
+
+```bash
 python scripts/infer_speech_to_speech.py \
   --audio examples/disgusted_to_happy.wav \
   --model outputs/06_route_b_s2s/model_epoch_003 \

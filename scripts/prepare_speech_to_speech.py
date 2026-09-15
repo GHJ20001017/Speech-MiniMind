@@ -9,6 +9,10 @@ tokenised answer audio, so we only need to:
 3. encode the *question* audio bytes with the same frozen Mimi codec, and
 4. write both as ``.npy`` shards plus a JSONL manifest the trainer reads.
 
+Manifest rows also carry the assistant ``answer_text`` so the M0 reconstruction
+gate can score round-trip CER/WER on the answer-audio domain without re-reading
+the parquet.
+
 Tokens in ``answer_audios`` are stored flat as 8 codes per frame, with a
 per-layer stop token (``>= codebook_size``) terminating each layer; those are
 truncated here because the trainer appends ``<|audio_end|>`` itself.
@@ -244,7 +248,8 @@ def main() -> None:
                 else:
                     stats["no_question"] += 1
             pending.append(
-                {"index": index, "codes": codes, "audio": question_audio}
+                {"index": index, "codes": codes, "audio": question_audio,
+                 "answer_text": str(assistant_turns[-1].get("content", "")).strip()}
             )
         if index + 1 >= stop_at:
             break
@@ -291,6 +296,10 @@ def main() -> None:
                 "source": f"minimind_o/{args.file_name}",
                 "lang": args.lang if args.lang != "all" else "mixed",
                 "frames": int(item["codes"].shape[1]),
+                # Text reference, kept so round-trip ASR can compute CER/WER on
+                # the *answer* audio domain (zh and en) without re-reading the
+                # 5.7 GB parquet.
+                "answer_text": item.get("answer_text", ""),
             }
         )
         stats["kept"] += 1

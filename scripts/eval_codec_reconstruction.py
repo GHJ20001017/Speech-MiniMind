@@ -6,18 +6,37 @@ lost by the waveform -> codes -> waveform round trip.  This script reports:
 * **mel distortion** - mean absolute error between log-mel spectrograms of the
   original and the reconstruction (always available, needs no extra packages);
 * **STOI / PESQ** - if ``pystoi`` / ``pesq`` happen to be installed;
-* **round-trip ASR CER** - WER/CER of the reconstructed audio transcribed by the
-  Route-A SenseVoice frontend, which is the metric that actually matters for
-  "is the generated speech intelligible".
+* **round-trip ASR CER / WER** - character (zh) or word (en) error rate of the
+  reconstructed audio transcribed by the Route-A SenseVoice frontend, which is
+  the metric that actually matters for "is the generated speech intelligible".
 
 It also dumps paired ``orig_*.wav`` / ``recon_*.wav`` files so you can listen.
 
+``--data`` accepts either an AISHELL-style processed dir (``{split}.csv`` with
+``path``/``text``), or any dir of the project JSONL manifests (``{split}.jsonl``
+with ``audio`` + ``answer``), or a single manifest file.  That lets the same
+gate run on Chinese read speech *and* on the English/mixed corpora
+(``voiceassistant400k_50k``, ``moss_speech_qa``) without converting CSV first.
+
 Usage::
 
+    # Chinese read speech (AISHELL CSV)
     python scripts/eval_codec_reconstruction.py \
         --data data/aishell1/processed --split dev --num 20 \
         --codec-type mimi --device cuda:0 \
         --output outputs/05_route_b_codec_check
+
+    # English corpus (JSONL manifest), scored with WER
+    python scripts/eval_codec_reconstruction.py \
+        --data data/voiceassistant400k_50k --split dev --num 20 \
+        --asr-language en --codec-type mimi --device cuda:0 \
+        --output outputs/05_route_b_codec_check_en
+
+    # sft_a2a answer-audio domain (codes only + answer_text), zh or en
+    python scripts/eval_codec_reconstruction.py \
+        --data data/route_b/s2s --split dev --num 50 \
+        --asr-language en --codec-type mimi --device cuda:0 \
+        --output outputs/05_route_b_codec_check_s2s_en
 """
 
 from __future__ import annotations
@@ -41,7 +60,7 @@ from model.audio_codec import build_frozen_audio_codec  # noqa: E402
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--data", type=Path, required=True,
-                        help="AISHELL processed dir (CSV) or a dir of JSONL manifests")
+                        help="AISHELL processed dir (CSV), a dir of JSONL manifests, or one manifest")
     parser.add_argument("--split", default="dev")
     parser.add_argument("--num", type=int, default=20, help="how many utterances to check")
     parser.add_argument("--codec-type", default="mimi", choices=("mimi", "encodec"))
@@ -51,14 +70,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--save-audio", type=int, default=10,
                         help="how many orig/recon WAV pairs to write for listening")
     parser.add_argument("--asr-cer", action=argparse.BooleanOptionalAction, default=True,
-                        help="compute round-trip ASR CER with the SenseVoice frontend")
+                        help="compute round-trip ASR error rate with the SenseVoice frontend")
+    parser.add_argument("--asr-language", default="zh", choices=("zh", "en", "yue", "ja", "ko", "auto"),
+                        help="language hint for the round-trip SenseVoice ASR")
     parser.add_argument("--sensevoice-model", default="iic/SenseVoiceSmall")
     parser.add_argument("--seed", type=int, default=7)
     return parser.parse_args()
 
 
-def load_aishell_rows(data: Path, split: str, num: int) -> list[tuple[str, str]]:
-    """Return ``[(audio_path, transcript), ...]`` from an AISHELL CSV manifest.
+def load_aishell_rows(data: Path, split: str, num: int) -> list[dict]:
+    """Return manifest rows from an AISHELL CSV manifest.
 
     AISHELL manifests store repo-root-relative paths (``data/aishell1/...``), so
     resolve against the repo root first and fall back to the manifest directory.
@@ -66,15 +87,80 @@ def load_aishell_rows(data: Path, split: str, num: int) -> list[tuple[str, str]]
     manifest = data / f"{split}.csv"
     if not manifest.exists():
         raise SystemExit(f"manifest not found: {manifest}")
-    rows: list[tuple[str, str]] = []
+    rows: list[dict] = []
     with manifest.open(encoding="utf-8") as handle:
         for row in csv.DictReader(handle):
             path = Path(row["path"])
             if not path.is_absolute():
                 candidate = ROOT / path
                 path = candidate if candidate.exists() else data / path
-            rows.append((str(path), row.get("text", "")))
+            rows.append({"audio": str(path), "codes": None,
+                         "transcript": (row.get("text") or "").strip()})
     return rows[:num] if num else rows
+
+
+def load_jsonl_rows(manifest: Path, num: int) -> list[dict]:
+    """Return manifest rows from a project JSONL manifest.
+
+    Three row shapes are recognised:
+
+    * ``{"audio", "instruction"|"answer"|"text"}`` - raw audio corpora (moss,
+      VoiceAssistant-400K, AISHELL exports).  The waveform is re-encoded on the
+      fly, so mel distortion / STOI / PESQ are available.
+    * ``{"answer_codes", "answer_text"}`` - the Route-B s2s manifest, where the
+      answer audio only exists as ``.npy`` codes.  There is no reference
+      waveform, so only the round-trip error rate is scored (this is how the
+      ``sft_a2a`` answer-audio domain, zh *and* en, gets validated).
+    * ``{"codes"}`` - the Route-B B0 token cache; also code-only, but has no
+      transcript, so nothing is scored (it exists so the loader does not crash).
+    """
+    rows: list[dict] = []
+    base = manifest.parent
+
+    def resolve(value: str) -> str:
+        path = Path(value)
+        if path.is_absolute():
+            return str(path)
+        candidate = ROOT / path
+        return str(candidate if candidate.exists() else base / path)
+
+    with manifest.open(encoding="utf-8") as handle:
+        for line in handle:
+            line = line.strip()
+            if not line:
+                continue
+            record = json.loads(line)
+            audio = str(record.get("audio", "")).strip()
+            codes = str(record.get("answer_codes") or record.get("codes") or "").strip()
+            if not audio and not codes:
+                continue
+            transcript = str(
+                record.get("answer_text") or record.get("instruction") or record.get("text")
+                or record.get("transcript") or record.get("answer") or ""
+            ).strip()
+            rows.append({
+                "audio": resolve(audio) if audio else None,
+                "codes": resolve(codes) if codes else None,
+                "transcript": transcript,
+            })
+    return rows[:num] if num else rows
+
+
+def resolve_rows(data: Path, split: str, num: int) -> tuple[list[dict], str]:
+    """Pick the manifest loader from what ``--data`` actually contains.
+
+    Returns ``(rows, kind)`` where ``kind`` is ``"csv"`` or ``"jsonl"`` so the
+    caller can label the summary.
+    """
+    if data.is_file():
+        return load_jsonl_rows(data, num), "jsonl"
+    if (data / f"{split}.csv").exists():
+        return load_aishell_rows(data, split, num), "csv"
+    if (data / f"{split}.jsonl").exists():
+        return load_jsonl_rows(data / f"{split}.jsonl", num), "jsonl"
+    raise SystemExit(
+        f"no manifest found under {data} (looked for {split}.csv and {split}.jsonl)"
+    )
 
 
 def log_mel_np(audio: np.ndarray, sample_rate: int, n_mels: int = 80) -> np.ndarray:
@@ -84,23 +170,37 @@ def log_mel_np(audio: np.ndarray, sample_rate: int, n_mels: int = 80) -> np.ndar
     return features
 
 
-def cer(reference: str, hypothesis: str) -> float:
-    """Character error rate via Levenshtein distance (no external deps)."""
-    reference = "".join(reference.split())
-    hypothesis = "".join(hypothesis.split())
-    if not reference:
+def cer(reference: str, hypothesis: str, level: str = "char") -> float:
+    """Error rate via Levenshtein distance (no external deps).
+
+    ``level="char"`` scores Chinese (character error rate); ``level="word"``
+    scores space-delimited languages (word error rate, WER).  Punctuation is
+    stripped for the word level so ASR punctuation differences do not inflate it.
+    """
+    if level == "word":
+        import re
+
+        def strip(text: str) -> list[str]:
+            return [t for t in re.sub(r"[^\w\s']", " ", text.lower()).split() if t]
+
+        reference_units: list[str] = strip(reference)
+        hypothesis_units: list[str] = strip(hypothesis)
+    else:
+        reference_units = list("".join(reference.split()))
+        hypothesis_units = list("".join(hypothesis.split()))
+    if not reference_units:
         return float("nan")
-    previous = list(range(len(hypothesis) + 1))
-    for i, ref_char in enumerate(reference, start=1):
+    previous = list(range(len(hypothesis_units) + 1))
+    for i, ref_unit in enumerate(reference_units, start=1):
         current = [i]
-        for j, hyp_char in enumerate(hypothesis, start=1):
+        for j, hyp_unit in enumerate(hypothesis_units, start=1):
             current.append(min(
                 previous[j] + 1,
                 current[j - 1] + 1,
-                previous[j - 1] + (ref_char != hyp_char),
+                previous[j - 1] + (ref_unit != hyp_unit),
             ))
         previous = current
-    return previous[-1] / len(reference)
+    return previous[-1] / len(reference_units)
 
 
 def main() -> None:
@@ -114,9 +214,10 @@ def main() -> None:
     print(f"codec: {args.codec_type} Q={codec.num_codebooks} vocab={codec.codebook_size} "
           f"sr={codec.sample_rate} frame_rate={codec.frame_rate_hz:.2f}Hz")
 
-    rows = load_aishell_rows(args.data, args.split, args.num)
+    rows, manifest_kind = resolve_rows(args.data, args.split, args.num)
     if not rows:
         raise SystemExit("no utterances selected")
+    transcript_level = "word" if args.asr_language == "en" else "char"
 
     asr = None
     if args.asr_cer:
@@ -125,23 +226,63 @@ def main() -> None:
 
             asr = AutoModel(model=args.sensevoice_model, device=args.device,
                             disable_update=True)
-            print("round-trip ASR enabled")
+            print(f"round-trip ASR enabled (language={args.asr_language}, "
+                  f"scoring={'WER' if transcript_level == 'word' else 'CER'})")
         except Exception as error:  # noqa: BLE001 - optional dependency
             print(f"round-trip ASR disabled ({error})")
 
     import soundfile as sf
 
     base_samples: list[dict] = []
-    for index, (path, transcript) in enumerate(rows):
-        waveform, rate = sf.read(path, dtype="float32", always_2d=False)
-        if waveform.ndim > 1:
-            waveform = waveform.mean(axis=1)
-        base_samples.append({"index": index, "path": path, "transcript": transcript,
-                             "waveform": waveform.astype(np.float32), "rate": int(rate)})
+    for index, row in enumerate(rows):
+        if row["audio"]:
+            waveform, rate = sf.read(row["audio"], dtype="float32", always_2d=False)
+            if waveform.ndim > 1:
+                waveform = waveform.mean(axis=1)
+            base_samples.append({"index": index, "path": row["audio"],
+                                 "transcript": row["transcript"],
+                                 "waveform": waveform.astype(np.float32),
+                                 "rate": int(rate), "codes": None})
+        else:
+            # Code-only row (Route-B answer shard): keep the codes, rebuild the
+            # reference by decoding them, so the round-trip error rate still
+            # measures "can a listener recover the words from these codes".
+            base_samples.append({"index": index, "path": row["codes"],
+                                 "transcript": row["transcript"],
+                                 "waveform": None, "rate": codec.sample_rate,
+                                 "codes": row["codes"]})
 
     records: list[dict] = []
     for item in base_samples:
-        index, path, transcript = item["index"], item["path"], item["transcript"]
+        index, path = item["index"], item["path"]
+        codes_path = item["codes"]
+
+        if codes_path:
+            shard = np.load(codes_path)
+            if shard.ndim == 1:
+                shard = shard[None, :]
+            code_tensor = torch.from_numpy(np.asarray(shard, dtype=np.int64))[None, :, :]
+            code_lengths = torch.tensor([code_tensor.size(2)], dtype=torch.long)
+            recon, recon_lengths = codec.decode(code_tensor, code_lengths)
+            recon_np = recon[0, : int(recon_lengths[0])].numpy()
+            rate = codec.sample_rate
+            record = {
+                "index": index,
+                "path": path,
+                "source": "codes",
+                "duration_s": round(len(recon_np) / codec.sample_rate, 3),
+                "frames": int(code_lengths[0]),
+                "tokens_per_s": round(float(code_lengths[0]) / max(len(recon_np) / codec.sample_rate, 1e-6), 3),
+            }
+            if index < args.save_audio:
+                sf.write(str(audio_dir / f"{index:03d}_recon.wav"), recon_np, codec.sample_rate,
+                         subtype="PCM_16")
+            item["recon"] = recon_np
+            records.append(record)
+            print(f"[{index + 1}/{len(rows)}] codes frames={record['frames']} "
+                  f"(no reference waveform)", flush=True)
+            continue
+
         waveform, rate = item["waveform"], item["rate"]
         tensor = torch.from_numpy(waveform)[None, :]
         lengths = torch.tensor([tensor.size(1)], dtype=torch.long)
@@ -158,6 +299,7 @@ def main() -> None:
         record = {
             "index": index,
             "path": path,
+            "source": "waveform",
             "duration_s": round(len(waveform) / rate, 3),
             "frames": int(code_lengths[0]),
             "tokens_per_s": round(float(code_lengths[0]) / max(len(waveform) / rate, 1e-6), 3),
@@ -187,19 +329,22 @@ def main() -> None:
         print(f"[{index + 1}/{len(rows)}] frames={record['frames']} mel_mae={record['mel_mae']}",
               flush=True)
 
-    # Round-trip ASR: transcribe every reconstruction, then score the CERs.
+    # Round-trip ASR: transcribe every reconstruction, then score the error rates.
     if asr is not None:
         try:
             import re
 
             for position, item in enumerate(base_samples):
-                result = asr.generate(input=item["recon"], cache={}, language="zh",
+                result = asr.generate(input=item["recon"], cache={},
+                                      language=args.asr_language,
                                       use_itn=False, batch_size_s=60)
                 hypothesis = result[0]["text"] if result else ""
                 hypothesis = re.sub(r"<\|[^|]*\|>", "", hypothesis).strip()
                 records[position]["asr_hypothesis"] = hypothesis
                 if item["transcript"]:
-                    records[position]["cer"] = round(cer(item["transcript"], hypothesis), 4)
+                    records[position]["cer"] = round(
+                        cer(item["transcript"], hypothesis, transcript_level), 4
+                    )
         except Exception as error:  # noqa: BLE001 - optional dependency
             print(f"round-trip ASR failed ({error})")
 
@@ -209,15 +354,24 @@ def main() -> None:
         writer.writeheader()
         writer.writerows(records)
 
-    summary: dict[str, float] = {
+    mel_values = [r["mel_mae"] for r in records if "mel_mae" in r]
+    summary: dict[str, float | str | int] = {
         "utterances": len(records),
-        "mel_mae_mean": float(np.mean([r["mel_mae"] for r in records])),
+        "waveform_rows": sum(1 for r in records if r.get("source") == "waveform"),
+        "codes_rows": sum(1 for r in records if r.get("source") == "codes"),
+        "manifest_kind": manifest_kind,
+        "asr_language": args.asr_language,
         "tokens_per_s_mean": float(np.mean([r["tokens_per_s"] for r in records])),
     }
+    if mel_values:
+        summary["mel_mae_mean"] = float(np.mean(mel_values))
     for key in ("stoi", "pesq", "cer"):
         values = [r[key] for r in records if key in r]
         if values:
             summary[f"{key}_mean"] = float(np.mean(values))
+    if "cer_mean" in summary:
+        summary["error_rate_mean"] = summary["cer_mean"]
+        summary["error_rate_level"] = transcript_level
     (args.output / "summary.json").write_text(
         json.dumps(summary | {
             "codec_type": args.codec_type,

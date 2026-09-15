@@ -38,11 +38,29 @@ python scripts/eval_codec_reconstruction.py \
   --output outputs/05_route_b_codec_check
 ```
 
+`--data` 支持 AISHELL 风格目录（`{split}.csv`）、项目 JSONL 清单或单个清单文件，并区分两类行：有**波形**的行会重新 `encode → decode`，可算 mel 失真 / STOI / PESQ；只有 **code** 的行（如 `data/route_b/s2s` 的 `sft_a2a` 回答音频）无参考波形，脚本直接解码 code 后只算往返错误率。用 `--asr-language`（`zh`/`en`/…）指定识别语言，评分单位自动从 CER 切成 WER：
+
+```bash
+# 英文数据集
+python scripts/eval_codec_reconstruction.py \
+  --data data/voiceassistant400k_50k --split dev --num 20 \
+  --asr-language en --codec-type mimi --device cuda:0 \
+  --output outputs/05_route_b_codec_check_en
+
+# sft_a2a 回答音频域（只有 code）
+python scripts/eval_codec_reconstruction.py \
+  --data data/route_b/s2s --split dev --num 50 \
+  --asr-language en --codec-type mimi --device cuda:0 \
+  --output outputs/05_route_b_codec_check_s2s_en
+```
+
 输出 `metrics.csv` / `summary.json` 与 `audio/` 下的 `orig_*.wav` / `recon_*.wav` 对照：
 
-- `mel_mae`：log-Mel 重建失真（始终可用）；
+- `mel_mae`：log-Mel 重建失真（仅波形行）；
 - `stoi` / `pesq`：装了 `pystoi` / `pesq` 才有；
-- `cer`：把重建音频再送一遍 SenseVoice 做 ASR，与原始转写算字符错误率——**这是"还能不能听懂"的最终判据**。
+- `cer` / `error_rate_mean`：把重建音频再送一遍 SenseVoice 做 ASR，与原始转写算错误率（zh 为字符级 CER，en 为词级 WER）——**这是"还能不能听懂"的最终判据**。
+
+文本参照的取法与语料对应：指令类语料的 `audio` 是问题/指令语音，故取 `instruction`；AISHELL 类清单取 `text`；s2s 清单取 `answer_text`；都没有转写时只报 mel/STOI/PESQ。
 
 **门槛**：中文可懂、无明显金属音。不达标就换 `--codec-type encodec`，或换更大的码本。
 
@@ -173,9 +191,9 @@ python scripts/infer_speech_to_speech.py \
 
 | 阶段 | 指标 | 脚本 |
 |---|---|---|
-| M0 codec | `mel_mae`、STOI/PESQ、往返 CER | `scripts/eval_codec_reconstruction.py` |
+| M0 codec | `mel_mae`、STOI/PESQ、往返 CER/WER（`--asr-language` 选语言） | `scripts/eval_codec_reconstruction.py` |
 | M1 B0 | 音频 token CE / perplexity | `metrics.csv` |
-| M2 B1 | 回答段 token 准确率、往返 CER | `train_speech_to_speech.py`、`infer_speech_to_speech.py --print-hypothesis` |
+| M2 B1 | 回答段 token 准确率、往返 CER/WER | `train_speech_to_speech.py`、`infer_speech_to_speech.py --print-hypothesis --asr-language` |
 | M3 B2 | 多任务指令跟随、端到端可懂性 | 同上 |
 
 ## 8. 已知局限

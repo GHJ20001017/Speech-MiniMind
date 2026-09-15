@@ -10,9 +10,11 @@ per split:
 * ``data/voiceassistant400k_50k/{train,dev}.jsonl`` - English QA audio (deferred
   by default; pass ``--include-english`` to pull it in).
 
-Output rows are ``{"audio": "<abs>", "source": ..., "lang": ...}`` and are
-consumed by ``scripts/cache_audio_tokens.py`` to produce the ``.npy`` shards the
-B0 trainer reads.
+Output rows are ``{"audio": "<abs>", "source": ..., "lang": ..., "text": ...}``
+and are consumed by ``scripts/cache_audio_tokens.py`` to produce the ``.npy``
+shards the B0 trainer reads.  ``text`` is an optional transcript kept so the M0
+reconstruction gate (``eval_codec_reconstruction.py``) can score round-trip
+CER/WER directly on this manifest; it is ignored by training.
 """
 
 from __future__ import annotations
@@ -73,7 +75,8 @@ def collect_aishell(data_root: Path) -> dict[str, list[dict]]:
                 audio = resolve_audio(row["path"], manifest)
                 if audio is not None:
                     splits[split].append(
-                        {"audio": str(audio), "source": "aishell1", "lang": "zh"}
+                        {"audio": str(audio), "source": "aishell1", "lang": "zh",
+                         "text": (row.get("text") or "").strip()}
                     )
     return splits
 
@@ -93,8 +96,25 @@ def collect_jsonl(manifest: Path, source: str, lang: str) -> list[dict]:
                 continue
             path = resolve_audio(audio, manifest)
             if path is not None:
-                rows.append({"audio": str(path), "source": source, "lang": lang})
+                rows.append({"audio": str(path), "source": source, "lang": lang,
+                             "text": _text_reference(record)})
     return rows
+
+
+def _text_reference(record: dict) -> str:
+    """Best-effort transcript of *the audio in this row*, for the M0 gate.
+
+    Order matters: in the instruction corpora the ``audio`` field holds the
+    **question/instruction** speech (VoiceAssistant-400K ``question_audio``,
+    moss Qwen3-TTS synthesized instruction), so its spoken text is
+    ``instruction`` - not ``answer``, which is the *text* reply and does not
+    match the audio.  ``text`` covers AISHELL-style JSONL exports.
+    """
+    for key in ("instruction", "text", "transcript", "answer"):
+        value = record.get(key)
+        if value:
+            return str(value).strip()
+    return ""
 
 
 def main() -> None:

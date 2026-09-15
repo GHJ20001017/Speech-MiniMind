@@ -190,6 +190,8 @@ def process_split(
                         "source": row.get("source", "unknown"),
                         "lang": row.get("lang", "zh"),
                         "index": index}
+        if row.get("text"):
+            mapped["text"] = row["text"]
         if is_s2s:
             if not pieces.get("answer_audio"):
                 counters["failed"] += 1
