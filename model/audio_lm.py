@@ -313,14 +313,28 @@ def generate_audio_tokens(
 
     ``prompt_ids`` must already contain the ``<|audio_start|>`` that opens the
     answer. Returns the generated *audio* token ids (special tokens excluded).
+
+    The frame-major layout fixes which codebook each position carries: slot ``n``
+    of the answer belongs to codebook ``n % Q``.  Only that block (plus the audio
+    end token) is kept in the distribution, so a partially trained model cannot
+    drift into another codebook and emit ids that :func:`from_lm_tokens` maps
+    back to an out-of-range code value.
     """
     device = next(model.parameters()).device
     generated: list[int] = []
     ids = prompt_ids.to(device)
     stop_id = eos_token_id if eos_token_id is not None else spec.audio_eos_id
-    for _ in range(max_new_tokens):
+    for step in range(max_new_tokens):
         logits = model(input_ids=ids).logits[:, -1, :]
         next_logits = logits[0]
+        # Restrict to the codebook that this slot is supposed to carry.
+        codebook = step % spec.num_codebooks
+        lower = spec.audio_offset + codebook * spec.codebook_size
+        upper = lower + spec.codebook_size
+        mask = torch.full_like(next_logits, float("-inf"))
+        mask[lower:upper] = 0.0
+        mask[stop_id] = 0.0
+        next_logits = next_logits + mask
         if temperature and temperature > 0:
             probs = torch.softmax(next_logits / temperature, dim=-1)
             if top_k:
