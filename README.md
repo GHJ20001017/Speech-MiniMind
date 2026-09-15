@@ -425,8 +425,6 @@ WAV ──► 冻结 codec 编码器 ──► 离散 audio tokens ──► 音
 
 路线 B 的第一道闸门：冻结 codec 必须能把中文语音编成离散 token 再还原回「人能听懂」的波形，否则后面的音频 LM 训练没有意义。
 
-**为什么它必须排在第 3 节的 token 缓存之前**：本步只吃原始 WAV + AISHELL 转写，**不依赖任何 token 缓存**——它自己在内存里跑一遍 `encode → decode`，并用转写算往返 CER（`.npy` 里只剩 code，没有 ground truth，无法事后补验）。反过来，缓存**是由 codec 产出的**：换 codec 就得把所有 `.npy` 重新编一遍（`metadata.json` 按 codec 记录，必须换 `--output`）。所以顺序一定是「先定 codec，再批量编码」，用 20 条语音的代价避免十万级 token 白编。
-
 ```bash
 python scripts/eval_codec_reconstruction.py \
   --data data/aishell1/processed --split dev --num 20 \
@@ -450,10 +448,6 @@ python scripts/eval_codec_reconstruction.py \
   --asr-language en --codec-type mimi --device cuda:0 \
   --output outputs/05_route_b_codec_check_s2s_en
 ```
-
-> 行类型不同，能报的指标也不同：有**波形**的行会重新 `encode → decode`，因此 mel 失真 / STOI / PESQ 全有；只有 **code** 的行（`data/route_b/s2s`，即 `sft_a2a` 的回答音频）没有参考波形，代码会直接解码 code 得到音频，只算往返错误率。文本参照按语料取：指令类语料取 `instruction`（`audio` 存的是**问题/指令语音**，`answer` 是文字回答），AISHELL 类取 `text`，s2s 清单取 `answer_text`；都没有则跳过错误率。
-
-> 本步常规只覆盖 AISHELL 朗读语音；上一条 s2s 命令正是补上「B1 真正的目标域（`sft_a2a` 回答音频，TTS 合成域）」的往返校验。
 
 ### 2. 构建语音到语音数据（05）
 
