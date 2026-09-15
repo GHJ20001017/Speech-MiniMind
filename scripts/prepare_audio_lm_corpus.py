@@ -47,13 +47,17 @@ def resolve_audio(value: str, manifest: Path) -> Path | None:
     the moss/voiceassistant JSONLs store *manifest-relative* ones
     (``audio/000000.wav``).  Try the repo root first, then the manifest dir, and
     return ``None`` when neither exists so callers can skip quietly.
+
+    The result is always absolutised: this manifest is consumed by scripts such
+    as ``cache_audio_tokens.py`` that re-resolve relative entries against *their*
+    manifest directory, so a relative path here would silently break.
     """
     path = Path(value)
     if path.is_absolute():
         return path if path.exists() else None
     for candidate in (ROOT / path, manifest.parent / path):
         if candidate.exists():
-            return candidate
+            return candidate.resolve()
     return None
 
 

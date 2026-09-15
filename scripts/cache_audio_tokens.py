@@ -85,8 +85,21 @@ def read_audio(path: Path) -> tuple[np.ndarray, int] | None:
 
 
 def resolve(manifest: Path, value: str) -> Path:
+    """Resolve an audio path from a manifest row to an absolute path.
+
+    Upstream manifests mix two conventions (repo-root-relative from AISHELL CSVs,
+    manifest-relative from the moss/voiceassistant JSONLs), and some - like the
+    ``audio_lm`` corpus - store absolute paths.  Try all three so a relative
+    entry is never silently joined against the wrong directory.
+    """
     path = Path(value)
-    return path if path.is_absolute() else (manifest.parent / path)
+    if path.is_absolute():
+        return path
+    root = Path(__file__).resolve().parents[1]
+    for candidate in (root / path, manifest.parent / path):
+        if candidate.exists():
+            return candidate.resolve()
+    return (manifest.parent / path).resolve()
 
 
 def flush_batch(codec, batch: list[dict], code_dir: Path, counters: dict) -> set[str]:
