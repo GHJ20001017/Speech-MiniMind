@@ -19,19 +19,21 @@ Usage
     # full-mode tuned model, SenseVoice-Small frontend (recommended)
     python scripts/infer_speech_minimind.py \\
       --audio path/to/utterance.wav \\
-      --instruction "请将这段语音准确转写为中文文本。" \\
       --encoder-type sensevoice \\
       --sensevoice-model outputs/sensevoice-small \\
-      --projector-checkpoint outputs/03_speech_minimind_projector/projector_epoch_005.pt \\
+      --projector-checkpoint outputs/04_speech_minimind_sft/projector_epoch_003.pt \\
       --minimind-model outputs/04_speech_minimind_sft/model_epoch_003
 
     # conformer frontend
     python scripts/infer_speech_minimind.py \\
       --audio path/to/utterance.wav \\
-      --instruction "请将这段语音准确转写为中文文本。" \\
       --encoder-checkpoint outputs/02_acoustic_encoder/tiny_conformer_ctc.pt \\
-      --projector-checkpoint outputs/03_speech_minimind/projector_epoch_005.pt \\
+      --projector-checkpoint outputs/04_speech_minimind_sft/projector_epoch_003.pt \\
       --minimind-model outputs/04_speech_minimind_sft/model_epoch_003
+
+The default ``--instruction`` is the fixed stage-2 system prompt
+(``你是一个语音助手，根据用户的音频内容回答用户的问题``); pass ``--instruction`` only
+if you deliberately trained with a different prompt.
 
 All weights are loaded from the paths you pass; nothing is downloaded here.
 """
@@ -52,6 +54,7 @@ from model.frozen_encoder import build_frozen_encoder  # noqa: E402
 from model.minimind_adapter import generate_from_speech, load_minimind  # noqa: E402
 from model.speech_projector import SpeechProjector  # noqa: E402
 from scripts.analyze_audio import read_wav  # noqa: E402
+from dataset.speech_dataset import DEFAULT_SYSTEM_PROMPT  # noqa: E402
 
 SAMPLE_RATE = 16000
 
@@ -138,7 +141,8 @@ def run(args) -> None:
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--audio", type=str, required=True, help="16-bit PCM WAV (16 kHz preferred; auto-resampled)")
-    parser.add_argument("--instruction", default="请将这段语音准确转写为中文文本。", help="text instruction for the model")
+    parser.add_argument("--instruction", default=DEFAULT_SYSTEM_PROMPT,
+                        help="text instruction for the model (must match stage-2 training)")
     parser.add_argument("--encoder-type", choices=("sensevoice", "conformer", "paraformer"), default="sensevoice",
                         help="frozen acoustic encoder backend")
     parser.add_argument("--encoder-checkpoint", type=Path,

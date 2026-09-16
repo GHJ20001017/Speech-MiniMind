@@ -1,13 +1,17 @@
 """Resample non-16kHz waveform audio in a speech instruction JSONL to 16kHz.
 
-The merged ``data/stage2_mixed/{train,dev}.jsonl`` references audio from three
-sources whose native rates differ (AISHELL=16kHz, moss_speech_qa TTS=24kHz,
-voiceassistant400k=22050Hz). ``train_speech_minimind.py`` enforces 16kHz input,
-so this script rewrites the non-16kHz rows to resampled 16-bit PCM WAV copies
-under an output audio directory and repoints their ``audio`` field to the new
-absolute path (source files are left untouched; 16kHz rows are unchanged).
+The stage-2 corpus (from the ModelScope dataset) mixes sources whose native
+rates differ (AISHELL=16kHz, moss_speech_qa TTS=24kHz, voiceassistant400k=22050Hz).
+``train_speech_minimind.py`` enforces 16kHz input, so this script rewrites the
+non-16kHz rows to resampled 16-bit PCM WAV copies under an output audio
+directory and repoints their audio field to the new absolute path (source files
+are left untouched; 16kHz rows are unchanged).
 
-Output layout: ``<out>/<split>/<row_index>.wav`` (16-bit PCM, target sample rate).
+Accept either a single JSONL (stage-2 ``wav`` rows, or legacy ``audio`` rows)
+or a directory of ``{train,dev,...}.jsonl``. The manifest is rewritten in place;
+every other field is preserved.
+
+Output layout: ``<out>/<split>/<row_index>.wav`` (16-bit PCM, target rate).
 Idempotent: rows already pointing at 16kHz audio are skipped.
 
 Requires: soundfile (read/write) and soxr (fast high-quality resample); falls
@@ -49,8 +53,16 @@ def resample_audio(y: np.ndarray, sr: int, target: int) -> np.ndarray:
     return np.stack([_resample_1d(y[:, c], sr, target) for c in range(y.shape[1])], axis=1)
 
 
-def process_manifest(manifest: Path, out_dir: Path, target: int, overwrite: bool) -> dict:
-    split = manifest.stem
+def audio_field(record: dict) -> str:
+    """Field name holding the audio path: stage-2 ``wav`` or legacy ``audio``."""
+    if str(record.get("wav", "")).strip():
+        return "wav"
+    return "audio"
+
+
+def process_manifest(manifest: Path, out_dir: Path, target: int, overwrite: bool,
+                     split: str | None = None) -> dict:
+    split = split or manifest.stem
     rows: list[dict] = []
     with manifest.open(encoding="utf-8") as handle:
         for line in handle:
@@ -66,7 +78,8 @@ def process_manifest(manifest: Path, out_dir: Path, target: int, overwrite: bool
 
     out_rows: list[dict] = []
     for idx, record in enumerate(rows):
-        audio = str(record.get("audio", "")).strip()
+        field = audio_field(record)
+        audio = str(record.get(field, "")).strip()
         if not audio:
             out_rows.append(record)
             continue
@@ -82,7 +95,7 @@ def process_manifest(manifest: Path, out_dir: Path, target: int, overwrite: bool
             sf.write(str(dest), resampled_audio, target, subtype="PCM_16")
             written += 1
         rec = dict(record)
-        rec["audio"] = str(dest.resolve())
+        rec[field] = str(dest.resolve())
         out_rows.append(rec)
         resampled += 1
 
@@ -100,25 +113,33 @@ def process_manifest(manifest: Path, out_dir: Path, target: int, overwrite: bool
 def main() -> None:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--data", type=Path, required=True,
-                   help="directory containing train.jsonl and dev.jsonl")
+                   help="a JSONL manifest, or a directory with {train,dev}.jsonl")
     p.add_argument("--sr", type=int, default=TARGET, help="target sample rate (default 16000)")
     p.add_argument("--out-audio-dir", type=Path, default=None,
-                   help="where to write resampled wavs (default <data>/resampled_audio)")
+                   help="where to write resampled wavs (default <data-dir>/resampled_audio)")
     p.add_argument("--overwrite", action="store_true",
                    help="rewrite resampled wavs even if they already exist")
-    p.add_argument("--splits", default="train,dev")
+    p.add_argument("--splits", default="train,dev",
+                   help="split names to process when --data is a directory")
     args = p.parse_args()
 
-    out_dir = args.out_audio_dir or (args.data / "resampled_audio")
+    if args.data.is_file():
+        manifests = [(args.data, args.data.stem)]
+        base = args.data.parent
+    else:
+        manifests = [(args.data / f"{s.strip()}.jsonl", s.strip())
+                     for s in args.splits.split(",") if s.strip()]
+        base = args.data
+
+    out_dir = args.out_audio_dir or (base / "resampled_audio")
     out_dir.mkdir(parents=True, exist_ok=True)
     print(f"resampler soxr={HAS_SOXR} target={args.sr} out={out_dir}", flush=True)
 
-    for split in [s.strip() for s in args.splits.split(",") if s.strip()]:
-        manifest = args.data / f"{split}.jsonl"
+    for manifest, split in manifests:
         if not manifest.exists():
             print(f"! missing {manifest}", flush=True)
             continue
-        stats = process_manifest(manifest, out_dir, args.sr, args.overwrite)
+        stats = process_manifest(manifest, out_dir, args.sr, args.overwrite, split)
         print("DONE", json.dumps(stats, ensure_ascii=False), flush=True)
 
 

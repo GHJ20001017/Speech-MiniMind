@@ -58,21 +58,6 @@ conda activate speech-llm
 python -m pip install -r requirements.txt
 ```
 
-### 多卡训练（DDP）
-
-第 3 / 5 / 8 节的四个训练脚本（`train_conformer_ctc.py`、`train_conformer_streaming_ctc.py`、`train_speech_projector.py`、`train_speech_minimind.py`）都已支持多卡分布式训练，下面的所有训练命令都用 `torchrun --nproc_per_node=<N>` 启动，并用 `CUDA_VISIBLE_DEVICES` **显式指定使用哪几张卡**（共享服务器上其他任务会占显存，必须挑空闲卡）。
-
-启动前先确认哪些卡空闲（`memory.free` 大的才是可用卡）：
-
-```bash
-nvidia-smi --query-gpu=index,memory.used,memory.free --format=csv
-```
-
-- `CUDA_VISIBLE_DEVICES=0,1,2,3` 指定本次使用的 GPU 卡号（可任意挑选，按需调整）；`--nproc_per_node=<N>` 必须等于你指定的卡数，否则会报错或撞上被占用的卡。
-- `--nproc_per_node=<N>` 开 N 张卡；脚本按 rank 自动分配设备、用 `DistributedSampler` 切分数据、跨卡求平均 loss。
-- 训练/验证 loss、checkpoint、`metrics.csv`、`loss_curve.png`、wandb 记录全部只在 rank 0 执行，各卡模型权重经梯度同步保持一致。
-- 需要单卡训练时，把开头的 `torchrun --nproc_per_node=<N>` 换成 `python`，并用 `CUDA_VISIBLE_DEVICES=<一张空闲卡>` 指定该卡即可（无 `RANK`/`WORLD_SIZE`/`LOCAL_RANK` 环境变量时脚本自动退化为单卡行为）。
-
 ### 1. 语音分析（00/01）
 
 对示例音频生成波形、频谱、STFT 动画：
@@ -82,14 +67,74 @@ python scripts/analyze_audio.py examples/disgusted_to_happy.wav \
   --plot outputs/example.png --stft-plot outputs/stft.png --stft-gif outputs/stft_process.gif
 ```
 
-### 2. AISHELL-1 数据准备（02）
+### 2. 数据集
+
+本项目后续训练用到的数据集都统一放在 **ModelScope** 上：编码器用的 manifest、stage-1 转写语料与编码器权重都在主仓库；只有体量最大的 AISHELL-1 **原始音频**因为太大，改用 `scripts/download_aishell1.py` 从 ModelScope 镜像下载。
+
+- 主仓库（AISHELL-1 `processed` manifest/vocab、stage-1 转写语料、编码器权重）：<https://www.modelscope.cn/models/ghjghj1017/Tiny_Conformer>
 
 ```bash
-# 下载数据（国内用 ModelScope 镜像，支持断点续传）
-python scripts/download_aishell1.py
+python -m pip install modelscope
 
-# 生成 train/dev/test.csv 和 vocab.txt
-python scripts/prepare_aishell1.py
+# 1) 声学编码器（02）用的 manifest 与字符词表：下载主仓库，再把 processed.tar.gz 解压到 data/aishell1/
+python -c "from modelscope.hub.snapshot_download import snapshot_download; snapshot_download('ghjghj1017/Tiny_Conformer', local_dir='outputs/Tiny_Conformer')"
+mkdir -p data/aishell1
+tar -xzf outputs/Tiny_Conformer/processed.tar.gz -C data/aishell1
+
+# 2) AISHELL-1 原始音频（约 15G，支持断点续传），下载并解压到 data/aishell1/data_aishell/
+python scripts/download_aishell1.py
+```
+
+主仓库里跟 AISHELL-1 有关的两份数据分工如下（**都只是"整理好的文档"，不含任何音频字节**）：
+
+- **`processed.tar.gz`**：解压后是 `data/aishell1/processed/{train,dev,test}.csv`（表头 `path,text`）与 `vocab.txt`，供第 3/4 节的声学编码器训练与评估使用。CSV 的 `path` 指向 `data/aishell1/data_aishell/wav/...`。
+- **`aishell-1/aishell-1-{train,dev,test}.parquet`**：第 5 节 Projector 用的 stage-1 转写语料，六列（`wav` / `prompt` / `answer` / `source` / `task` / `lang`），`wav` 同样指向 `data/aishell1/data_aishell/wav/...`。
+
+下载后按第 2.2 节的目录布局把数据放到 `data/` 下，训练脚本即从这些路径读取。
+
+#### 2.1 数据集组成
+
+**stage 1** —— 只含 AISHELL-1，指令固定为「请转写为中文」，答案就是转写文本。按 AISHELL-1 **官方划分**拆成 `train` / `dev` / `test`，训练时不再切分。声学编码器（第 3/4 节）读 `data/aishell1/processed/` 的 CSV，Speech Projector（第 5 节）读 `data/speech2text_corpus/stage1_aishell/` 的 JSONL；两者记录的是同一批音频，只是格式不同。
+
+| 划分 | 行数 | 用途 |
+|---|---:|---|
+| train | 120098 | 第 3/4 节声学编码器（`processed/train.csv`）、第 5 节 Speech Projector（`stage1_aishell/train.jsonl`） |
+| dev | 14326 | 编码器开发集；Projector 与 test 合并为验证集 |
+| test | 7176 | 编码器测试集；Projector 与 dev 合并为验证集 |
+
+**stage 2** —— AISHELL-1 之外的全部自然问答 / 指令数据，统一为同一行格式，用于第 8 节指令微调 Speech LLM。每行仍带 `prompt`，但**训练第 8 节时只读取 `wav` 与 `answer`**（`prompt` 供 TTS 合成问题音频用，不再作为文本输入），统一配固定系统提示词「你是一个语音助手，根据用户的音频内容回答用户的问题」。由以下来源筛选、去重、统一格式后合成：
+
+| 来源 | 保留内容 | 语言 | 音频 |
+|---|---|---|---|
+| COIG 人类价值观 | instruction/output 问答 | zh | 文本，需 TTS |
+| Firefly OpenQA + Dictionary | 开放问答、词典解释 | zh | 文本，需 TTS |
+| COIG-CQIA | 仅高质量子集 | zh | 文本，需 TTS |
+| COIG 翻译指令 | 仅高质量中文子集 | zh | 文本，需 TTS |
+| moss_speech_qa | 仅首轮问答 | zh | 已合成音频 |
+| VoiceAssistant-400K | 全部保留 | en | 原始音频 |
+
+#### 2.2 本地目录布局
+
+下载后把数据放到 `data/` 下，训练脚本按下列路径读取：
+
+```text
+data/
+├── aishell1/
+│   ├── data_aishell/            # 原始音频（wav/、transcript/、resource_aishell/），download_aishell1.py 下载
+│   └── processed/               # 第 3/4 节编码器读取，来自 ModelScope 的 processed.tar.gz
+│       ├── train.csv            # 表头 path,text
+│       ├── dev.csv
+│       ├── test.csv
+│       └── vocab.txt            # 字符词表，首行 <blank>，其后每行一个汉字
+└── speech2text_corpus/
+    ├── stage1_aishell/          # 第 5 节 Projector 读取，由 aishell-1/*.parquet 转出
+    │   ├── train.jsonl          # AISHELL-1 官方 train 划分
+    │   ├── dev.jsonl
+    │   └── test.jsonl
+    └── splits/                  # 第 8 节 Speech LLM 读取（stage 2，按来源分层切分）
+        ├── train.jsonl
+        ├── val.jsonl
+        └── test.jsonl
 ```
 
 ### 3. 训练中文声学编码器（02，Tiny Conformer + CTC）
@@ -172,26 +217,13 @@ python -m pip install funasr modelscope
 python -c "from modelscope.hub.snapshot_download import snapshot_download; snapshot_download('iic/SenseVoiceSmall', local_dir='outputs/sensevoice-small')"
 ```
 
-SenseVoice 不需要流式 encoder。仓库的 `SenseVoiceFrozenEncoder` 会使用 SenseVoice 的离线 `WavFrontend`，将一个 batch 的 fbank/LFR 特征一次性送入 `SenseVoiceEncoderSmall`，输出批量帧级声学表示，再交给 `SpeechProjector`。编码器参数全程冻结，训练时仍可使用 waveform 和 Mel/Fbank augmentation。
-
-```python
-from funasr import AutoModel
-
-model = AutoModel(model="iic/SenseVoiceSmall", device="cuda", disable_update=True)
-for p in model.parameters():
-    p.requires_grad_(False)
-model.eval()
-```
-
-> **注意**：SenseVoice 的 encoder hidden state 不是 ASR 文本输出，而是 Projector 使用的连续帧级声学表示。其 encoder 支持 batch forward，输出维度由模型自动读取；当前默认 frontend 为 16kHz、80-bin fbank、LFR `m=7/n=6`。
-
 ### 5. 训练语音投影器连接 MiniMind（03，Speech Projector）
 
-使用 **SenseVoice-Small 作为冻结编码器**。先下载 [MiniMind Transformers 权重](https://github.com/jingyaogong/minimind)（如 `minimind-3`）到本地目录，然后：
+使用 **SenseVoice-Small 作为冻结编码器**。`train_speech_projector.py` 读第 2 节下载的 stage-1 目录 `data/speech2text_corpus/stage1_aishell/`（内含 `train.jsonl` / `dev.jsonl` / `test.jsonl`，每行 `{"wav": "...", "prompt": "请转写为中文", "answer": "..."}`），因此先确认第 2 节的数据集已放好，再下载 [MiniMind Transformers 权重](https://github.com/jingyaogong/minimind)（如 `minimind-3`）到本地目录：
 
 ```bash
 CUDA_VISIBLE_DEVICES=0,1,2,3 torchrun --nproc_per_node=4 trainer/train_speech_projector.py \
-  --data data/aishell1/processed \
+  --data data/speech2text_corpus/stage1_aishell \
   --encoder-type sensevoice \
   --sensevoice-model outputs/sensevoice-small \
   --minimind-model /path/to/minimind-3 \
@@ -199,9 +231,7 @@ CUDA_VISIBLE_DEVICES=0,1,2,3 torchrun --nproc_per_node=4 trainer/train_speech_pr
   --wandb --wandb-name projector_sensevoice
 ```
 
-无论用哪个后端，都冻结编码器和 MiniMind，只训练约 0.8M 参数的 `SpeechProjector`。这一步得到的是**语音条件的转写桥接模型**，还不是完整的 Speech LLM。
-
-脚本会按所选后端自动设置 `SpeechProjector.acoustic_dim`（SenseVoice 通常为 512，Conformer=256，Paraformer=512），并把输入统一为 16kHz 波形。SenseVoice 的 encoder 会对一个 batch 的 frontend 特征执行批量 forward；对较长训练集可用 `--hidden-cache <dir>` 缓存每段音频的 encoder hidden state，避免每个 epoch 重复跑前端。后续第 8 节的 `train_speech_minimind.py` 也支持同样的 `--encoder-type` / `--sensevoice-model`，保证前后两阶段使用同一编码器。
+无论用哪个编码器后端，都冻结编码器和 MiniMind，只训练约 0.8M 参数的 `SpeechProjector`。这一步得到的是**语音条件的转写桥接模型**，还不是完整的 Speech LLM。
 
 训练过程（AISHELL-1，约 9.5k step）的 loss 曲线：
 
@@ -211,85 +241,34 @@ CUDA_VISIBLE_DEVICES=0,1,2,3 torchrun --nproc_per_node=4 trainer/train_speech_pr
 
 train loss 从约 8.5 收敛到约 0.5；dev loss 从约 0.96 稳定下降到约 0.64。
 
-### 6. 构建指令微调数据（用于下一阶段）
+### 6. 统一 stage 2 音频采样率（`resample_stage2_mixed.py`）
 
-> 说明：本节为**下一步完整语音指令微调（Speech LLM）**准备数据；训练第 5 节的 Projector **不需要**它——`train_speech_projector.py` 默认用 `data/aishell1/processed`（CSV）即可。仅当你想用指令格式（`--data-format jsonl`）训练 Projector 时才需运行本节。
-
-先直接把 AISHELL-1 转写标注转成统一的语音指令格式：
-
-```bash
-python scripts/prepare_speech_instructions.py \
-  --input data/aishell1/processed --output data/speech_instructions
-```
-
-每行 JSON：`{"audio": "...", "instruction": "请将这段语音准确转写为中文文本。", "answer": "...", "task": "transcription"}`。
-
-再混合外部指令数据构建小规模训练集：
-
-```bash
-python scripts/build_stage2_mixture.py \
-  --aishell data/aishell1/processed --sources data/external_speech_instructions \
-  --output data/stage2_mixture --total 5000
-```
-
-（`data/external_speech_instructions/` 下可选放 `meeting.jsonl`、`instruction.jsonl`、`understanding.jsonl`。）
-
-### 7. 构建并合成语音问答数据 + 合并统一指令集
-
-从多个来源构建问答类语音数据，并合并成一份标准指令微调数据集：
-
-```bash
-# 从 moss-003 SFT 抽取中文多轮子集
-python scripts/prepare_moss_speech_qa.py --input /path/to/moss.zip --output data/moss_speech_qa
-
-# 用 Qwen3-TTS 把 instruction 文本合成为真实中文音频
-python scripts/generate_moss_speech_qa_tts.py --data data/moss_speech_qa
-
-# 从 VoiceAssistant-400K 随机抽样并下载本地音频
-python scripts/prepare_voiceassistant_400k.py --num-samples 50000 --output data/voiceassistant400k_50k
-
-# 把 speech_instructions / moss_speech_qa / voiceassistant400k_50k 合并为一份标准指令集
-python scripts/merge_speech_instruction_datasets.py \
-  --data-root data --output data/stage2_mixed
-```
-
-合并脚本输出 `data/stage2_mixed/{train,dev}.jsonl`，每行统一为：
-`{"audio": "<绝对路径>", "instruction": "...", "answer": "...", "task": "...", "source": "...", "lang": "zh|en"}`
-并把三类数据的音频路径统一解析为绝对路径（三者的相对基准原本不同），moss 的多轮 `history` 会按单轮格式丢弃。可以配合 `--skip-missing-audio` 跳过缺失音频的条目。
-
-三个来源的音频原生采样率不一致（`speech_instructions`/AISHELL=16kHz、`moss_speech_qa`(Qwen3-TTS)=24kHz、`voiceassistant400k_50k`=22050Hz），而下游 `train_speech_minimind.py` 强制要求 **16kHz** 输入。合并后先统一重采样到 16kHz：
+第 2 节下载的 stage 2 切分音频采样率仍不一致（moss_speech_qa 与合成语音的 Qwen3-TTS=24kHz、VoiceAssistant-400K=22050Hz，AISHELL-1=16kHz），而 `train_speech_minimind.py` 强制 16kHz 输入。用 `resample_stage2_mixed.py` 统一到 16kHz：
 
 ```bash
 # 需要 soundfile + soxr（无 soxr 时自动回退 scipy）
 python -m pip install soundfile soxr
 
-python scripts/resample_stage2_mixed.py --data data/stage2_mixed --sr 16000
+# 第 2 节下载的 stage 2 三份清单
+python scripts/resample_stage2_mixed.py --data data/speech2text_corpus/splits --splits train,val,test --sr 16000
 ```
-
-脚本把非 16kHz 的音频重采样为 16-bit PCM WAV，写入 `data/stage2_mixed/resampled_audio/{train,dev}/`，并把 `train/dev.jsonl` 中对应行的 `audio` 路径更新到新文件（原音频不动，其余字段保持不变）。脚本幂等：已是 16kHz 的行直接跳过。
 
 ### 8. 指令微调语音 LLM（04，真正的 Speech-MiniMind）
 
-在第 5 节的 Projector 桥接基础上，用第 6/7 节的指令数据**微调 MiniMind 本身**（LoRA），让它变成能听语音、理解指令、生成回答的完整 Speech LLM：
+在第 5 节的 Projector 桥接基础上，**微调整个 MiniMind**（LoRA 或全参），并以较小学习率同步训练 Projector，让它变成能听语音、生成回答的完整 Speech LLM。
 
-```bash
-CUDA_VISIBLE_DEVICES=0,1,2,3 torchrun --nproc_per_node=4 trainer/train_speech_minimind.py \
-  --data data/stage2_mixed \
-  --encoder-type sensevoice \
-  --sensevoice-model outputs/sensevoice-small \
-  --projector-checkpoint outputs/03_speech_minimind_projector/projector_epoch_005.pt \
-  --minimind-model /path/to/minimind-3 \
-  --output outputs/04_speech_minimind_sft --epochs 3 --batch-size 2 \
-  --lora-r 8 --lora-alpha 16 \
-  --wandb --wandb-name speech_minimind_sft
+训练数据就是第 2 节的 stage 2：`train_speech_minimind.py` **每行只读取 `wav` 和 `answer` 两个字段**——语音问题本身在音频里，`prompt` 只是给 TTS 用的朗读文本，不参与训练。因为不再有逐行指令，Dataset 对每一行统一下发同一个固定系统提示词：
+
+```text
+你是一个语音助手，根据用户的音频内容回答用户的问题
 ```
 
-默认冻结语音编码器和 Speech Projector，只对 MiniMind 做指令微调；如果希望在指令微调阶段同步适配 Projector，可显式打开可选参数：
+可用 `--system-prompt` 覆盖（推理时需要传同一个值）。数据侧把第 2 节下载的 stage 2 切分和第 6 节的重采样做完即可：
 
 ```bash
-# Projector 与 MiniMind 一起训练；--projector-lr 不传时复用 --lr
+# Projector 与 MiniMind 一起训练；--projector-lr 是 Projector 的独立小学习率
 CUDA_VISIBLE_DEVICES=0,1,2,3 torchrun --nproc_per_node=4 trainer/train_speech_minimind.py \
-  --data data/stage2_mixed \
+  --data data/speech2text_corpus/splits \
   --encoder-type sensevoice --sensevoice-model outputs/sensevoice-small \
   --projector-checkpoint outputs/03_speech_minimind_projector/projector_epoch_005.pt \
   --minimind-model /path/to/minimind-3 \
@@ -298,17 +277,7 @@ CUDA_VISIBLE_DEVICES=0,1,2,3 torchrun --nproc_per_node=4 trainer/train_speech_mi
   --wandb --wandb-name speech_minimind_sft
 ```
 
-- `--tune lora`（默认）：只对 MiniMind 注入并训练 **LoRA adapter**（约 0.5% 可训练参数）；`--tune full`：全参数微调 MiniMind。
-- 默认冻结语音编码器和 Speech Projector；传入 `--tune-projector` 后会把 Projector 加入优化器，与 MiniMind 一起训练。可用 `--projector-lr` 单独设置学习率（不传时复用 `--lr`）。编码器始终冻结。
-- 损失只在 `answer` 部分计算（prompt 与语音前缀用 -100 mask），标准 SFT。
-- `--augment`（默认开启）：在 Dataset 的 `__getitem__` 阶段按样本随机增强训练音频，原始音频文件不会被修改；验证集始终不增强。使用 `--no-augment` 可关闭。当前包括随机变速、加噪、音量、时间遮挡、低通和简易混响。
-- `--augment-mel`（默认开启）：在声学前端生成 Mel/Fbank 后，按 batch 随机做 SpecAugment 的频率遮挡和时间遮挡；同样只作用于训练集，验证集关闭。使用 `--no-augment-mel` 可关闭。
-- 常见参数：`--tune lora|full`、`--tune-projector`、`--projector-lr`、`--augment`、`--lang-filter zh|en`（只练单一语言）、`--limit N`（先小规模试跑）、`--lora-r/--lora-alpha`（LoRA 秩）、`--epochs`、`--wandb`（上传指标，可选 `--wandb-project <name>`、`--wandb-name <run>`，project 默认 `Speech-MiniMind`）。
-- `--tune lora` 依赖 `peft`：`python -m pip install peft`。
-- 开启 Projector 微调时，每个 epoch 额外保存 `projector_epoch_XXX.pt`，可直接作为后续推理或继续训练的 `--projector-checkpoint`。
-- 输出 `outputs/04_speech_minimind_sft/`：`config.json`、`metrics.csv`、`lora_epoch_XXX/adapter_model.safetensors`（lora 模式）或 `model_epoch_XXX/model.safetensors`（full 模式，完整可加载模型）。
-
-训练过程（stage2 混合指令集，约 145k step / 3 epoch）的 loss 曲线：
+训练过程（stage 2 语料，约 145k step / 3 epoch）的 loss 曲线：
 
 | train/loss_step | dev/loss |
 |---|---|
@@ -316,41 +285,48 @@ CUDA_VISIBLE_DEVICES=0,1,2,3 torchrun --nproc_per_node=4 trainer/train_speech_mi
 
 train loss 从约 8 收敛到约 0.85；dev loss 稳定下降到约 0.58。
 
-### 9. 测试指令微调模型（推理 / WebUI 互动平台）
+### 9. 评估与测试指令微调模型（离线指标 / 推理 / WebUI）
 
-第 8 节只生成 checkpoint，仓库补了两个**测试入口**来实际"用"模型：一个 CLI 推理脚本（`infer_speech_minimind.py`）和一个网页互动平台（`visualize_speech_minimind_webui.py`，FastAPI + WebSocket）。两者复用同一套推理管线：
+第 8 节只记录 `dev_loss`，它衡量文本 token 的 teacher-forcing 交叉熵，**不能替代生成质量评估**。例如同一批音频里既有短问答也有长解释，平均 loss 会把「回答准确」和「内容失配」混成一个数。
+
+另外注意，第 8 节用固定系统提示词「你是一个语音助手，根据用户的音频内容回答用户的问题」训练，**推理与评测必须使用同一个提示词**（`infer_speech_minimind.py` / `evaluate_speech_minimind.py` 的默认值即为此），否则 prompt 与训练不一致，生成质量会明显下降。
+
+第 8 节还会在 `--tune-projector` 时把 Projector 与 LLM 一起微调。因此推理时必须使用同一阶段的 projector：`outputs/04_speech_minimind_sft/projector_epoch_XXX.pt`，而不是旧的 `outputs/03_speech_minimind_projector/projector_epoch_005.pt`。混用阶段会让转写也明显变差。
+
+仓库提供三个入口：离线评测（`evaluate_speech_minimind.py`）、单条 CLI 推理（`infer_speech_minimind.py`）和网页互动平台（`visualize_speech_minimind_webui.py`）。三者复用同一套推理管线：
 
 ```text
 WAV ──▶ frozen 声学编码器(sensevoice/conformer/paraformer) ──▶ SpeechProjector(冻结)
         ──▶ 语音前缀 embeddings ⊕ 指令文本 tokens ──▶ MiniMind(微调后) ──▶ 回答文本
 ```
 
-因为 MiniMind 的输入前缀是**连续语音向量**（不是 token id），`generate_from_speech`（`model/minimind_adapter.py`）会先把语音前缀与指令文本拼成 `inputs_embeds`，优先走 `model.generate(inputs_embeds=...)`，若不支持则回退到逐 token 的自回归贪婪解码。
+#### 离线生成评估
+
+`evaluate_speech_minimind.py` 逐条生成答案，并按 `source / task / lang` 分层输出 exact match 与字符级（中文）或词级（英文）错误率。它读的是 stage 2 的行（`wav` + `answer`；每行没有 `instruction` 时自动回落到固定系统提示词），先用小型分层抽样确认配置，再跑到完整 dev：
+
+```bash
+# 全量 val split（生成式评估较慢；确认配置后再跑）
+python scripts/evaluate_speech_minimind.py \
+  --data data/speech2text_corpus/splits/val.jsonl \
+  --encoder-type sensevoice --sensevoice-model outputs/sensevoice-small \
+  --projector-checkpoint outputs/04_speech_minimind_sft/projector_epoch_003.pt \
+  --minimind-model outputs/04_speech_minimind_sft/model_epoch_003 \
+  --output outputs/04_speech_minimind_sft/eval_stage2_full
+```
+
+输出 `predictions.csv`（逐条音频/提示词/参考/生成/错误率）、`group_metrics.csv`（按来源、任务、语言）和 `report.json`（总指标与配置）。别只看总错误率：长答案问答会淹没短问答的错误；至少要同时看 `moss_speech_qa`、`coig_*` / `firefly_*`、`voiceassistant_400k` 几组。
 
 #### CLI 推理
 
 ```bash
-# full 全参微调模型 + paraformer 前端（推荐）
+# full 全参微调模型 + SenseVoice 前端；projector 必须来自 04 阶段
 python scripts/infer_speech_minimind.py \
   --audio path/to/utterance.wav \
-  --instruction "请将这段语音准确转写为中文文本。" \
   --encoder-type sensevoice \
   --sensevoice-model outputs/sensevoice-small \
-  --projector-checkpoint outputs/03_speech_minimind_projector/projector_epoch_005.pt \
-  --minimind-model outputs/04_speech_minimind_sft/model_epoch_003
-
-# 同样可用 conformer 前端 + tiny-conformer 训练的 projector
-python scripts/infer_speech_minimind.py \
-  --audio path/to/utterance.wav \
-  --instruction "请将这段语音准确转写为中文文本。" \
-  --encoder-checkpoint outputs/02_acoustic_encoder/tiny_conformer_ctc.pt \
-  --projector-checkpoint outputs/03_speech_minimind_projector/projector_epoch_005.pt \
+  --projector-checkpoint outputs/04_speech_minimind_sft/projector_epoch_003.pt \
   --minimind-model outputs/04_speech_minimind_sft/model_epoch_003
 ```
-
-- `--minimind-model`：第 8 节输出目录。`full` 传 `model_epoch_XXX/`；`lora` 传 `lora_epoch_XXX/`（需 `--tune lora`，脚本会用 peft 重新挂载 adapter）。
-- 输入 WAV 非 16kHz 时自动重采样到 16kHz（paraformer 前端强制要求 16kHz）。
-- 可选 `--temperature`（>0 采样）、`--max-new-tokens`、`--verbose`。
 
 #### WebUI 互动平台（FastAPI + WebSocket，双模式）
 
@@ -361,41 +337,13 @@ python -m pip install fastapi uvicorn soundfile qwen-tts   # 首次需要
 python scripts/visualize_speech_minimind_webui.py \
   --encoder-type sensevoice \
   --sensevoice-model outputs/sensevoice-small \
-  --projector-checkpoint outputs/03_speech_minimind_projector/projector_epoch_005.pt \
+  --projector-checkpoint outputs/04_speech_minimind_sft/projector_epoch_003.pt \
   --minimind-model outputs/04_speech_minimind_sft/model_epoch_003 \
+  --instruction "你是一个语音助手，根据用户的音频内容回答用户的问题" \
   --tts-model /gpu3/guhj/models/Qwen3-TTS-12Hz-1.7B-CustomVoice \
   --tts-speaker Serena \
   --host 0.0.0.0 --port 7861 --ssl-auto
 ```
-
-启动时传入 `--tts-model` 后，MiniMind 每次生成最终文本回答，服务端会调用 Qwen3-TTS 的 `generate_custom_voice` 合成为 WAV，并通过同一条 WebSocket 返回浏览器自动播放；不传该参数时保留原来的纯文本模式。可用 `--tts-speaker Serena` 和 `--tts-language Chinese` 选择 Qwen3-TTS 的预置音色与语言。
-
-启动后浏览器访问 `https://<host>:7861`（用 `--ssl-auto`）或 `http://localhost:7861`（端口转发），页面提供两个模式页签：
-
-- **① 音频上传**：选择本地音频文件（WAV / MP3 / M4A 等）→ 选择/输入指令（内置转写、概括、话题、翻译等预设）→ 点"运行"。服务端用 `ffmpeg` 把音频解码成 16kHz 单声道（无 ffmpeg 时回退到标准库 `wave`，仅支持 16-bit PCM WAV），显示输入波形并流式输出回答。也有一次性 HTTP 接口：`POST /api/infer?instruction=...`，请求体直接是音频字节，返回 JSON。
-- **② 麦克风实时**：点击"开始监听"后浏览器采集 16kHz 单声道 PCM，通过**一条常连的 WebSocket**（`/ws`）持续推送到服务端。服务端内置的**能量 VAD**（自适应噪声底，无需 `webrtcvad`）实时断句：检测到说话结束后自动跑模型，并把回答**逐 token 流式**回传，停顿即出字、无需每次点按。页面可实时调整 VAD 灵敏度与断句静音时长，并显示麦克风电平。
-
-> 麦克风需要**安全上下文**：仅在 `http://localhost` 或 `https://` 下浏览器才允许 `getUserMedia`。两种做法二选一：
->
-> 1. **推荐：`--ssl-auto`**（上面命令已带）。脚本首次启动时用 `openssl` 生成自签证书（存在 `scripts/.webui_ssl/`，之后复用），用 `https://<host>:7861` 访问。浏览器会提示证书不受信任，点一次「高级 → 继续前往 \<host\>」即可，此后即为安全上下文，任何浏览器/设备都能用麦克风。也可自己指定证书：`--ssl-keyfile key.pem --ssl-certfile cert.pem`。
-> 2. **端口转发**：`ssh -N -L 7861:127.0.0.1:7861 <user>@<host>`，再访问 `http://localhost:7861`。
->
-> （`http://192.168.x.x:7861` 这类明文局域网地址浏览器一律拒绝麦克风，与页面代码无关。）
-
-VAD 相关参数（默认值适合安静的近距离说话）：
-
-| 参数 | 默认 | 说明 |
-| --- | --- | --- |
-| `--vad-frame-ms` | `30` | 每帧时长（毫秒） |
-| `--vad-start-mult` | `2.5` | 帧能量 > 噪声底 × 该值视为起句 |
-| `--vad-stop-mult` | `1.5` | 帧能量 < 噪声底 × 该值计入静音 |
-| `--vad-min-speech-ms` | `250` | 最短语音时长，低于此不算一句话 |
-| `--vad-silence-ms` | `700` | 断句所需尾部静音时长 |
-| `--vad-max-utterance-s` | `30` | 单句硬上限，超过强制切分 |
-| `--no-vad-adaptive` | 关 | 关闭后冻结噪声底，不做自适应 |
-| `--ssl-auto` | 关 | 生成/复用 `scripts/.webui_ssl/` 自签证书并以 https 提供服务（麦克风必需） |
-
-其余参数（`--tune`、`--max-new-tokens`、`--max-speech-tokens`、`--temperature` 等）与 CLI 一致。
 
 实际运行效果（上传一段语音，模型转写为中文文本）：
 

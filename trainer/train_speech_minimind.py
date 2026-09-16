@@ -10,10 +10,13 @@ The acoustic encoder is always frozen. The SpeechProjector is frozen by default
 and can optionally be fine-tuned with ``--tune-projector`` when the target
 MiniMind and speech frontend need to adapt together.
 
-Data: any JSONL with ``audio, instruction, answer`` (e.g. the merged
-``data/stage2_mixed/{train,dev}.jsonl`` produced by
-``merge_speech_instruction_datasets.py``). The ``lang``/``task`` fields are
-ignored by training but may optionally filter rows.
+Data: a stage-2 directory of ``wav, answer`` manifests (``train.jsonl`` and
+``dev.jsonl`` / ``val.jsonl``) as produced by
+``scripts/synthesize_stage2_tts_and_split.py``. Rows carry only the audio path
+and the reference answer; every sample is trained against a fixed system prompt
+(``--system-prompt``, default "你是一个语音助手，根据用户的音频内容回答用户的问题").
+The train/dev split comes from the manifests, so no re-splitting happens here.
+The optional ``lang`` field can filter rows via ``--lang-filter``.
 
 Loss is computed only over the ``answer`` portion (prompt tokens are masked).
 
@@ -37,7 +40,11 @@ from tqdm import tqdm
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from dataset.speech_dataset import SpeechAugmentConfig, SpeechInstructionDataset  # noqa: E402
+from dataset.speech_dataset import (  # noqa: E402
+    DEFAULT_SYSTEM_PROMPT,
+    SpeechAugmentConfig,
+    SpeechInstructionDataset,
+)
 from model.frozen_encoder import build_frozen_encoder  # noqa: E402
 from model import ddp_utils  # noqa: E402
 from model.minimind_adapter import forward_inputs_embeds, load_minimind  # noqa: E402
@@ -196,7 +203,7 @@ def add_lora(
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--data", type=Path, required=True,
-                        help="dir or single JSONL with {train,dev}.jsonl (audio/instruction/answer)")
+                        help="stage-2 split dir with train.jsonl (+ dev.jsonl/val.jsonl)")
     parser.add_argument("--encoder-checkpoint", type=Path,
                         default=Path("outputs/02_acoustic_encoder/tiny_conformer_ctc.pt"))
     parser.add_argument("--encoder-type", choices=("sensevoice", "conformer", "paraformer"), default="sensevoice",
@@ -237,8 +244,8 @@ def main() -> None:
                         help="apply random waveform augmentation inside the training dataset")
     parser.add_argument("--augment-mel", action=argparse.BooleanOptionalAction, default=True,
                         help="apply SpecAugment masks after the encoder frontend")
-    parser.add_argument("--dev-file", type=Path, default=None,
-                        help="dev JSONL when --data is a single train JSONL")
+    parser.add_argument("--system-prompt", default=DEFAULT_SYSTEM_PROMPT,
+                        help="fixed instruction prepended to every stage-2 row (audio-only data)")
     parser.add_argument("--seed", type=int, default=7)
     parser.add_argument("--wandb", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--wandb-project", default="Speech-MiniMind")
@@ -299,21 +306,41 @@ def main() -> None:
         optimizer_groups.append({"params": projector_params, "lr": args.projector_lr or args.lr})
     optimizer = torch.optim.AdamW(optimizer_groups)
 
-    # ---- data ----
+    # ---- data ---- (train/dev are separate manifests produced by the splitter)
     args.output.mkdir(parents=True, exist_ok=True)
 
     def resolve(manifest, training: bool):
         config = SpeechAugmentConfig(enabled=args.augment and training)
-        return SpeechInstructionDataset(manifest, augment=config, lang_filter=args.lang_filter, limit=args.limit)
+        return SpeechInstructionDataset(
+            manifest,
+            system_prompt=args.system_prompt,
+            augment=config,
+            lang_filter=args.lang_filter,
+            limit=args.limit,
+        )
 
     if args.data.is_dir():
-        train_manifest, dev_manifest = args.data / "train.jsonl", args.data / "dev.jsonl"
-        if not train_manifest.exists() or not dev_manifest.exists():
-            raise FileNotFoundError(f"need {args.data}/{{train,dev}}.jsonl")
+        train_manifest = args.data / "train.jsonl"
+        # "dev" is the trainer's name; accept "val" as produced by the splitter.
+        dev_manifest = next(
+            (args.data / name for name in ("dev.jsonl", "val.jsonl")
+             if (args.data / name).exists()),
+            None,
+        )
     else:
-        if not args.dev_file:
-            raise SystemExit("For single-file data, pass --dev-file <path>")
-        train_manifest, dev_manifest = args.data, args.dev_file
+        train_manifest = args.data
+        dev_manifest = next(
+            (args.data.parent / name for name in ("dev.jsonl", "val.jsonl")
+             if (args.data.parent / name).exists()),
+            None,
+        )
+    if not train_manifest.exists():
+        raise FileNotFoundError(f"train manifest not found: {train_manifest}")
+    if dev_manifest is None:
+        raise FileNotFoundError(
+            f"no dev/val manifest next to {train_manifest}; run "
+            "scripts/synthesize_stage2_tts_and_split.py to produce the train/val/test splits"
+        )
 
     train_set = resolve(train_manifest, training=True)
     dev_set = resolve(dev_manifest, training=False)

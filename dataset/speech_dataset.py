@@ -20,6 +20,14 @@ from scripts.analyze_audio import read_wav
 
 SAMPLE_RATE = 16000
 
+# Repo root so repo-relative audio paths resolve no matter the working dir.
+ROOT = Path(__file__).resolve().parents[1]
+
+# Shared instruction for the stage-2 chat-style corpus: every row carries only
+# the audio and its reference answer, so the model always sees this system
+# prompt instead of a per-row instruction. Inference reuses it verbatim.
+DEFAULT_SYSTEM_PROMPT = "你是一个语音助手，根据用户的音频内容回答用户的问题"
+
 
 def augment_mel_features(features: torch.Tensor, frequency_width: int = 64,
                          time_width: int = 10, probability: float = 0.5) -> torch.Tensor:
@@ -106,11 +114,22 @@ class SpeechWaveformAugmenter:
 
 
 class SpeechInstructionDataset(Dataset):
-    """Load ``audio,instruction,answer`` JSONL with optional online augmentation."""
+    """Load one stage-2 ``wav,answer`` JSONL manifest with online augmentation.
 
-    def __init__(self, manifest: Path, augment: SpeechAugmentConfig | None = None,
+    Each row keeps only the audio path and the reference answer; the instruction
+    fed to the model is the fixed :data:`DEFAULT_SYSTEM_PROMPT`. Rows without an
+    answer or audio path are dropped.
+
+    The train/dev split is decided by the manifest itself
+    (``synthesize_stage2_tts_and_split.py`` writes ``train/val/test.jsonl``), so
+    the dataset never re-splits rows at training time.
+    """
+
+    def __init__(self, manifest: Path, system_prompt: str = DEFAULT_SYSTEM_PROMPT,
+                 augment: SpeechAugmentConfig | None = None,
                  lang_filter: str | None = None, limit: int = 0) -> None:
         self.manifest = Path(manifest)
+        self.system_prompt = system_prompt
         self.rows: list[dict[str, str]] = []
         with self.manifest.open(encoding="utf-8") as handle:
             for line in handle:
@@ -119,11 +138,10 @@ class SpeechInstructionDataset(Dataset):
                 record = json.loads(line)
                 if lang_filter and record.get("lang") != lang_filter:
                     continue
-                audio = str(record.get("audio", "")).strip()
-                instruction = str(record.get("instruction", "")).strip()
+                audio = str(record.get("wav") or "").strip()
                 answer = str(record.get("answer", "")).strip()
                 if audio and answer:
-                    self.rows.append({"audio": audio, "instruction": instruction, "answer": answer})
+                    self.rows.append({"audio": audio, "answer": answer})
         if limit:
             self.rows = self.rows[:limit]
         self.augmenter = SpeechWaveformAugmenter(augment or SpeechAugmentConfig())
@@ -135,12 +153,15 @@ class SpeechInstructionDataset(Dataset):
         row = self.rows[index]
         path = Path(row["audio"])
         if not path.is_absolute():
-            path = self.manifest.parent / path
+            # stage-2 audio paths are repo-root-relative in the shipped
+            # dataset, else relative to the manifest.
+            repo_relative = ROOT / path
+            path = repo_relative if repo_relative.exists() else self.manifest.parent / path
         waveform, rate = read_wav(path)
         if rate != SAMPLE_RATE:
             raise ValueError(f"expected {SAMPLE_RATE} Hz waveform, got {rate} (path={path})")
         waveform = self.augmenter(waveform, rate)
-        return torch.from_numpy(waveform), rate, row["instruction"], row["answer"]
+        return torch.from_numpy(waveform), rate, self.system_prompt, row["answer"]
 
 
 class AishellCSVDataset(Dataset):

@@ -59,8 +59,10 @@ sys.path.insert(0, str(ROOT))
 # reuse the shared load pipeline of the CLI so behaviour stays identical
 from scripts.infer_speech_minimind import load_pipeline, SAMPLE_RATE  # noqa: E402
 from model.minimind_adapter import stream_from_speech  # noqa: E402
+from dataset.speech_dataset import DEFAULT_SYSTEM_PROMPT  # noqa: E402
 
 PRESET_INSTRUCTIONS = [
+    DEFAULT_SYSTEM_PROMPT,
     "请将这段语音准确转写为中文文本。",
     "简要概括这段语音说了什么。",
     "这段语音属于什么话题？请用一句话回答。",

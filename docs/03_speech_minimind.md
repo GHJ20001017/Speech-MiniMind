@@ -36,7 +36,7 @@ MiniMind 接收的却是文本 token embedding，例如 hidden size 为 768：
 训练样例可以写成：
 
 ```text
-语音 embedding + “请将这段语音转写为文字：” + “今天天气很好”
+语音 embedding + “请转写为中文” + “今天天气很好”
 ```
 
 输入 embedding 的排列为：
@@ -56,9 +56,11 @@ labels = [-100, ..., -100,  # 语音前缀和 prompt
 
 MiniMind 的源码和权重由官方仓库维护，本项目不复制其大模型文件。请先下载一个 Transformers 格式的 MiniMind 模型目录，再运行：
 
+`--data` 指向第 2 节下载的 stage-1 目录（内含 AISHELL-1 官方划分的 `train.jsonl` / `dev.jsonl` / `test.jsonl`，训练时不再切分）：
+
 ```bash
 python trainer/train_speech_projector.py \
-  --data data/aishell1/processed \
+  --data data/speech2text_corpus/stage1_aishell \
   --encoder-checkpoint outputs/02_acoustic_encoder/tiny_conformer_ctc.pt \
   --minimind-model /path/to/minimind-3 \
   --output outputs/03_speech_minimind \
@@ -70,17 +72,8 @@ python trainer/train_speech_projector.py \
 
 ## 5. 这一步还不是什么
 
-AISHELL-1 只有语音和转写文本，没有“听完语音后回答问题”的标注。因此本章得到的是语音条件的转写桥接模型，还不是完整的 Speech LLM。下一步需要加入语音指令数据，训练问答、分类和信息抽取，并保留 CTC loss 作为辅助目标。
+AISHELL-1 只有语音和转写文本，没有“听完语音后回答问题”的标注。因此本章得到的是语音条件的转写桥接模型，还不是完整的 Speech LLM。下一步需要加入语音问答数据，训练问答、分类和信息抽取。
 
-可以先运行 `scripts/prepare_speech_instructions.py` 生成第二阶段统一格式：
+第二阶段数据（stage 2）来自 ModelScope 仓库，已把 AISHELL-1 之外的自然问答 / 指令来源（COIG、Firefly、moss_speech_qa、VoiceAssistant-400K 等）筛选、去重、统一成同一行格式并切分好，见 README 第 2 节。
 
-```bash
-python scripts/prepare_speech_instructions.py \
-  --input data/aishell1/processed \
-  --output data/speech_instructions \
-  --include-text-ops
-```
-
-输出为 `train.jsonl`、`dev.jsonl`、`test.jsonl` 和 `metadata.json`。主任务是 `transcription`；可选的 `char_count`、`first_character`、`last_character` 是由转写文本直接验证的辅助指令任务。它们用于先验证数据接口和 instruction-following，不能替代真实的语音摘要、问答或意图识别标注。
-
-为了让小模型先跑通第二阶段，可以使用 `scripts/build_stage2_mixture.py` 生成 5,000 条左右的混合数据。它预留 50% 中文 ASR、20% 会议、20% 语音指令、10% 理解任务的配额，并从 `data/external_speech_instructions/` 读取后面补充的真实 JSONL。外部数据没有准备好时，脚本会使用带有 `aishell1_fallback` 标记的转写样本填充空缺，方便测试数据管线，但这些样本不能用于宣称模型已经学会语音问答。
+有了第二阶段的语音问答数据，就可以进入下一章微调整个 MiniMind（LoRA 或全参），并同步以小学习率训练 Projector。

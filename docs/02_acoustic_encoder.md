@@ -30,15 +30,21 @@ cd /gpu3/guhj/Speech-MiniMind
 
 ## 2. 下载 AISHELL-1
 
-AISHELL-1 是中文普通话朗读语料，包含训练、开发和测试划分。下载脚本默认从国内 ModelScope 镜像获取数据，并解压到 `data/aishell1`：
+AISHELL-1 是中文普通话朗读语料，包含训练、开发和测试划分。**原始音频**体积较大（约 15G），用仓库里的下载脚本从 ModelScope 镜像获取（支持断点续传）：
 
 ```bash
-python scripts/download_aishell1.py
+python scripts/download_aishell1.py --output data/aishell1
 ```
 
-也可以直接用浏览器下载 [ModelScope 上的 `data_aishell.tgz`](https://www.modelscope.cn/datasets/OmniData/AISHELL-1/tree/master/raw/33)，再将文件放到 `data/aishell1/data_aishell.tgz`。如需切换回 OpenSLR，可传入 `--url https://www.openslr.org/resources/33/data_aishell.tgz`。
+整理好的 manifest（`train/dev/test.csv`）和字符词表 `vocab.txt` 则随 ModelScope 仓库的 `processed.tar.gz` 一起发布，下载主仓库后解压到 `data/aishell1/`：
 
-脚本使用 `curl` 的断点续传和自动重试；如果网络中断，直接再次运行同一命令即可从已有文件继续。下载完成后会创建 `.extracted` 标记，再次运行时不会重复下载或解压。目录大致如下：
+```bash
+python -c "from modelscope.hub.snapshot_download import snapshot_download; snapshot_download('ghjghj1017/Tiny_Conformer', local_dir='outputs/Tiny_Conformer')"
+mkdir -p data/aishell1
+tar -xzf outputs/Tiny_Conformer/processed.tar.gz -C data/aishell1
+```
+
+AISHELL-1 数据放到 `data/aishell1/`，目录大致如下：
 
 ```text
 data/aishell1/
@@ -46,18 +52,16 @@ data/aishell1/
 │   ├── wav/
 │   ├── transcript/
 │   └── resource_aishell/
-└── data_aishell.tgz
+└── processed/
+    ├── train.csv
+    ├── dev.csv
+    ├── test.csv
+    └── vocab.txt
 ```
 
-## 3. 生成 manifest 和词表
+## 3. manifest 和词表
 
-训练脚本需要 CSV manifest 和字符词表：
-
-```bash
-python scripts/prepare_aishell1.py
-```
-
-结果位于 `data/aishell1/processed`：
+训练脚本需要 CSV manifest 和字符词表，它们来自 ModelScope 仓库 `processed.tar.gz`，解压到 `data/aishell1/processed`：
 
 ```text
 processed/
@@ -139,7 +143,7 @@ CTC 解码：我爱北京
 
 ## 7. 开始训练
 
-确认 `train.csv`、`vocab.txt` 已生成后运行：
+确认 `data/aishell1/processed/train.csv`、`vocab.txt` 就位后运行：
 
 ```bash
 python trainer/train_conformer_ctc.py \

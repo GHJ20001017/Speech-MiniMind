@@ -1,15 +1,25 @@
-"""Train a minimal Speech-MiniMind projector bridge on AISHELL CSV or JSONL data.
+"""Train a minimal Speech-MiniMind projector bridge.
 
-AISHELL (`*.csv`) keeps legacy format:
+The stage-1 input is a pre-split directory (downloaded from ModelScope, see
+the README dataset section)::
 
-    path,text
+    data/speech2text_corpus/stage1_aishell/
+        train.jsonl   # AISHELL-1 official train split
+        dev.jsonl     # AISHELL-1 official dev split
+        test.jsonl    # AISHELL-1 official test split
 
-JSONL instruction data (`*.jsonl`) should provide:
+Each file holds rows::
 
-    audio,instruction,answer
+    {"wav": "...", "prompt": "请转写为中文", "answer": "..."}
 
-`Aishell` samples still use a fixed prompt (from --prompt).
-Instruction JSONL uses `instruction` as prompt and `answer` as target text.
+The split is fixed by the dataset, so training never re-splits.  The
+validation run combines ``dev.jsonl`` and ``test.jsonl``.
+
+Each LLM sequence is arranged exactly as::
+
+    [speech embeddings] + [prompt tokens] + [answer tokens]
+
+Only the answer tokens contribute to the loss.
 """
 
 from __future__ import annotations
@@ -43,39 +53,30 @@ from scripts.analyze_audio import read_wav  # noqa: E402
 SAMPLE_RATE = 16000
 
 
-class AishellCSVDataset(Dataset):
-    def __init__(self, manifest: Path, prompt: str, augmenter=None) -> None:
-        with manifest.open(encoding="utf-8") as handle:
-            self.rows = list(csv.DictReader(handle))
-        self.prompt = prompt
-        self.manifest = manifest
-        self.augmenter = augmenter or SpeechWaveformAugmenter(SpeechAugmentConfig())
+class Stage1JSONLDataset(Dataset):
+    """Read ``wav/prompt/answer`` rows from one stage-1 JSONL split file.
 
-    def __len__(self) -> int:
-        return len(self.rows)
+    Stage 1 is pre-split into ``<dir>/{train,dev,test}.jsonl`` following the
+    AISHELL-1 official partition, so this dataset just reads one file and
+    never re-splits at training time.  The validation run combines the
+    AISHELL ``dev`` and ``test`` files.
+    """
 
-    def __getitem__(self, index: int) -> tuple[torch.Tensor, int, str, str, str]:
-        row = self.rows[index]
-        audio = Path(row["path"])
-        audio_array, rate = read_wav(audio)
-        if rate != SAMPLE_RATE:
-            raise ValueError(f"expected {SAMPLE_RATE} Hz waveform, got {rate} (path={audio})")
-        waveform = self.augmenter(audio_array, rate)
-        text = "".join(row["text"].split())
-        return torch.from_numpy(waveform.astype(np.float32)), rate, self.prompt, text, row["path"]
-
-
-class InstructionJSONLDataset(Dataset):
-    def __init__(self, manifest: Path, prompt_fallback: str, augmenter=None) -> None:
+    def __init__(
+        self,
+        manifest: Path,
+        prompt_fallback: str,
+        augmenter=None,
+    ) -> None:
         rows: list[dict[str, str]] = []
         with manifest.open(encoding="utf-8") as handle:
-            for line in handle:
+            for line_number, line in enumerate(handle, 1):
                 line = line.strip()
                 if not line:
                     continue
                 record = json.loads(line)
-                audio = str(record.get("audio", "")).strip()
-                prompt = str(record.get("instruction", "")).strip()
+                audio = str(record.get("wav") or "").strip()
+                prompt = str(record.get("prompt") or "").strip()
                 answer = str(record.get("answer", "")).strip()
                 if not audio or not answer:
                     continue
@@ -84,8 +85,12 @@ class InstructionJSONLDataset(Dataset):
                         "audio": audio,
                         "prompt": prompt or prompt_fallback,
                         "answer": answer,
+                        "line": str(line_number),
                     }
                 )
+
+        if not rows:
+            raise ValueError(f"stage1 split file has no usable rows: {manifest}")
         self.rows = rows
         self.manifest = manifest
         self.augmenter = augmenter or SpeechWaveformAugmenter(SpeechAugmentConfig())
@@ -97,18 +102,63 @@ class InstructionJSONLDataset(Dataset):
         row = self.rows[index]
         audio_path = Path(row["audio"])
         if not audio_path.is_absolute():
-            audio_path = self.manifest.parent / audio_path
+            # The stage-1 manifests store paths relative to the repo root, so
+            # prefer that interpretation before the manifest dir.
+            repo_relative = ROOT / audio_path
+            manifest_relative = self.manifest.parent / audio_path
+            audio_path = repo_relative if repo_relative.exists() else manifest_relative
         audio_array, rate = read_wav(audio_path)
         if rate != SAMPLE_RATE:
             raise ValueError(f"expected {SAMPLE_RATE} Hz waveform, got {rate} (path={audio_path})")
         waveform = self.augmenter(audio_array, rate)
-        return torch.from_numpy(waveform.astype(np.float32)), rate, row["prompt"], row["answer"], str(audio_path)
+        return (
+            torch.from_numpy(waveform.astype(np.float32)),
+            rate,
+            row["prompt"],
+            row["answer"],
+            str(audio_path.resolve()),
+        )
+
+
+class ConcatStage1Dataset(Dataset):
+    """Concatenate several stage-1 split files into one dataset.
+
+    Used for the validation set, which is AISHELL ``dev`` + ``test``. Child
+    lengths are always read live, so trimming a child's ``.rows`` (e.g. for a
+    ``--limit`` smoke test) stays consistent with ``__len__``.
+    """
+
+    def __init__(self, datasets: list[Dataset]) -> None:
+        self.datasets = list(datasets)
+        self.rows = [row for dataset in self.datasets for row in dataset.rows]
+
+    def __len__(self) -> int:
+        return sum(len(dataset) for dataset in self.datasets)
+
+    def __getitem__(self, index: int):
+        for dataset in self.datasets:
+            if index < len(dataset):
+                return dataset[index]
+            index -= len(dataset)
+        raise IndexError(index)
+
+
+def apply_limit(dataset: Dataset, limit: int) -> None:
+    """Trim a dataset in place to at most ``limit`` rows (smoke tests)."""
+    if isinstance(dataset, ConcatStage1Dataset):
+        remaining = limit
+        for child in dataset.datasets:
+            child.rows = child.rows[:remaining]
+            remaining -= len(child.rows)
+        dataset.rows = [row for child in dataset.datasets for row in child.rows]
+    else:
+        dataset.rows = dataset.rows[:limit]
 
 
 def collate(batch: list[tuple[torch.Tensor, int, str, str, str]]) -> tuple[torch.Tensor, torch.Tensor, list[str], list[str], list[str]]:
-    waveforms, rates, prompts, texts, paths = zip(*batch)
+    waveforms, rates, prompts, answers, paths = zip(*batch)
     lengths = torch.tensor([item.size(0) for item in waveforms], dtype=torch.long)
-    return pad_sequence(waveforms, batch_first=True), lengths, list(prompts), list(texts), list(paths)
+    return pad_sequence(waveforms, batch_first=True), lengths, list(prompts), list(answers), list(paths)
 
 
 def make_batch_embeddings(
@@ -117,22 +167,49 @@ def make_batch_embeddings(
     projected: torch.Tensor,
     projected_lengths: torch.Tensor,
     prompts: list[str],
-    texts: list[str],
+    answers: list[str],
     device: torch.device,
     max_length: int,
     max_speech_tokens: int,
 ):
+    """Build ``[speech][prompt][answer]`` embeddings and answer-only labels."""
     sequences: list[torch.Tensor] = []
     labels: list[torch.Tensor] = []
-    for speech, speech_length, prompt, text in zip(projected, projected_lengths.tolist(), prompts, texts):
-        speech = speech[: min(speech_length, max_speech_tokens, max_length - 2)]
-        prompt_ids = tokenizer(prompt, add_special_tokens=True, return_tensors="pt")["input_ids"][0]
-        target_ids = tokenizer(text + (tokenizer.eos_token or ""), add_special_tokens=False, return_tensors="pt")["input_ids"][0]
-        ids = torch.cat([prompt_ids, target_ids])[: max(max_length - speech.size(0), 1)]
-        prompt_count = min(prompt_ids.numel(), ids.numel())
-        text_labels = ids.clone()
+    for speech, speech_length, prompt, answer in zip(
+        projected, projected_lengths.tolist(), prompts, answers
+    ):
+        max_speech_length = max(0, min(max_speech_tokens, max_length - 2))
+        speech = speech[: min(int(speech_length), max_speech_length)]
+
+        prompt_ids = tokenizer(
+            prompt, add_special_tokens=True, return_tensors="pt"
+        )["input_ids"][0]
+        answer_ids = tokenizer(
+            answer, add_special_tokens=False, return_tensors="pt"
+        )["input_ids"][0]
+        if tokenizer.eos_token_id is not None:
+            eos = torch.tensor([tokenizer.eos_token_id], dtype=answer_ids.dtype)
+            answer_ids = torch.cat([answer_ids, eos])
+
+        text_ids = torch.cat([prompt_ids, answer_ids])
+        text_budget = max_length - speech.size(0)
+        if text_budget <= 0:
+            raise ValueError(
+                f"max_length={max_length} leaves no room for prompt/answer tokens "
+                f"after {speech.size(0)} speech embeddings"
+            )
+        text_ids = text_ids[:text_budget]
+        prompt_count = min(prompt_ids.numel(), text_ids.numel())
+        if prompt_count >= text_ids.numel():
+            raise ValueError(
+                "prompt tokens consume the whole sequence budget; no answer "
+                "tokens remain for the loss"
+            )
+
+        text_labels = text_ids.clone()
         text_labels[:prompt_count] = -100
-        embeddings = torch.cat([speech, token_embeddings(model, ids.to(device)).squeeze(0)], dim=0)
+        text_embeddings = token_embeddings(model, text_ids.to(device)).squeeze(0)
+        embeddings = torch.cat([speech, text_embeddings], dim=0)
         label = torch.cat([torch.full((speech.size(0),), -100, device=device, dtype=torch.long), text_labels.to(device)])
         sequences.append(embeddings)
         labels.append(label)
@@ -196,7 +273,7 @@ def run_epoch(args, encoder, projector, lm, tokenizer, loader, device, optimizer
         ddp_utils.set_epoch(sampler, epoch)
     projector.train(training)
     total_loss = 0.0
-    for waveforms, lengths, prompts, texts, paths in tqdm(loader, desc="train" if training else "dev", unit="batch", disable=not ddp_utils.is_main()):
+    for waveforms, lengths, prompts, answers, paths in tqdm(loader, desc="train" if training else "dev", unit="batch", disable=not ddp_utils.is_main()):
         if cache_dir is not None:
             acoustic, acoustic_lengths = load_or_encode_batch(
                 encoder, waveforms, lengths, paths, cache_dir, device,
@@ -215,7 +292,7 @@ def run_epoch(args, encoder, projector, lm, tokenizer, loader, device, optimizer
             projected,
             projected_lengths,
             prompts,
-            texts,
+            answers,
             device,
             args.max_length,
             args.max_speech_tokens,
@@ -239,52 +316,58 @@ def run_epoch(args, encoder, projector, lm, tokenizer, loader, device, optimizer
 
 
 def resolve_dataset(
-    data_root: Path,
-    split: str,
-    data_format: str,
+    data_dir: Path,
+    kind: str,
     prompt_fallback: str,
     augmenter=None,
-) -> tuple[Dataset, str]:
-    csv_path = data_root / f"{split}.csv"
-    jsonl_path = data_root / f"{split}.jsonl"
+) -> Dataset:
+    """Load the stage-1 ``train`` or ``dev`` set from pre-split JSONL files.
 
-    if data_root.is_file():
-        if split != data_root.stem and not data_root.name.startswith(split):
-            raise ValueError(
-                f"--data 为单文件时需要文件名与 split 对齐（当前 split={split}，data={data_root}）"
+    ``--data`` is a directory holding ``train.jsonl`` / ``dev.jsonl`` /
+    ``test.jsonl`` (the stage-1 layout downloaded from ModelScope).
+    The validation set concatenates the ``dev`` and ``test`` files; nothing is
+    re-split here.
+    """
+    data_dir = Path(data_dir)
+    if data_dir.is_file():
+        raise ValueError(
+            f"--data must be a directory with train/dev/test JSONL files: {data_dir}"
+        )
+    if not data_dir.is_dir():
+        raise FileNotFoundError(f"stage1 split dir 不存在: {data_dir}")
+    if kind == "train":
+        wanted = ["train.jsonl"]
+    else:
+        wanted = [name for name in ("dev.jsonl", "test.jsonl")
+                  if (data_dir / name).exists()]
+        if not wanted:
+            raise FileNotFoundError(
+                f"no dev.jsonl/test.jsonl under {data_dir}; "
+                "download the stage-1 dataset (see the README dataset section)"
             )
-        if data_root.suffix.lower() == ".csv":
-            return AishellCSVDataset(data_root, prompt_fallback, augmenter), "csv"
-        if data_root.suffix.lower() == ".jsonl":
-            return InstructionJSONLDataset(data_root, prompt_fallback, augmenter), "jsonl"
-        raise ValueError(f"--data 单文件仅支持 .csv/.jsonl: {data_root}")
-
-    if not data_root.exists() or not data_root.is_dir():
-        raise FileNotFoundError(f"data path not found: {data_root}")
-
-    if data_format == "csv":
-        if not csv_path.exists():
-            raise FileNotFoundError(f"csv split不存在: {csv_path}")
-        return AishellCSVDataset(csv_path, prompt_fallback, augmenter), "csv"
-
-    if data_format == "jsonl":
-        if not jsonl_path.exists():
-            raise FileNotFoundError(f"jsonl split不存在: {jsonl_path}")
-        return InstructionJSONLDataset(jsonl_path, prompt_fallback, augmenter), "jsonl"
-
-    # auto mode: prefer legacy csv for backward compatibility
-    if csv_path.exists():
-        return AishellCSVDataset(csv_path, prompt_fallback, augmenter), "csv"
-    if jsonl_path.exists():
-        return InstructionJSONLDataset(jsonl_path, prompt_fallback, augmenter), "jsonl"
-    raise FileNotFoundError(
-        f"未发现数据文件: {data_root / 'train.csv'}/{data_root / 'train.jsonl'} (split={split})"
-    )
+    datasets = []
+    for name in wanted:
+        manifest = data_dir / name
+        if not manifest.exists():
+            raise FileNotFoundError(f"stage1 split file 不存在: {manifest}")
+        datasets.append(Stage1JSONLDataset(
+            manifest,
+            prompt_fallback=prompt_fallback,
+            augmenter=augmenter,
+        ))
+    if len(datasets) == 1:
+        return datasets[0]
+    return ConcatStage1Dataset(datasets)
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--data", type=Path, default=Path("data/aishell1/processed"))
+    parser.add_argument(
+        "--data",
+        type=Path,
+        default=Path("data/speech2text_corpus/stage1_aishell"),
+        help="stage-1 split dir with train.jsonl (+ dev.jsonl/test.jsonl)",
+    )
     parser.add_argument("--encoder-type", choices=("sensevoice", "conformer", "paraformer"), default="sensevoice",
                         help="frozen acoustic encoder backend (sensevoice=batched offline default, conformer=offline, paraformer=FunASR streaming)")
     parser.add_argument("--encoder-checkpoint", type=Path, default=Path("outputs/02_acoustic_encoder/tiny_conformer_ctc.pt"))
@@ -302,7 +385,6 @@ def main() -> None:
     parser.add_argument("--max-length", type=int, default=2048)
     parser.add_argument("--max-speech-tokens", type=int, default=512)
     parser.add_argument("--prompt", default="请将这段语音转写为文字：")
-    parser.add_argument("--data-format", choices=("auto", "csv", "jsonl"), default="auto")
     parser.add_argument("--limit", type=int, default=0, help="limit examples for a quick smoke test")
     parser.add_argument("--augment", action=argparse.BooleanOptionalAction, default=True,
                         help="apply random waveform augmentation inside the training dataset")
@@ -339,14 +421,12 @@ def main() -> None:
 
     train_augmenter = SpeechWaveformAugmenter(SpeechAugmentConfig(enabled=args.augment))
     dev_augmenter = SpeechWaveformAugmenter(SpeechAugmentConfig(enabled=False))
-    train_set, train_format = resolve_dataset(args.data, "train", args.data_format, args.prompt, train_augmenter)
-    dev_set, dev_format = resolve_dataset(args.data, "dev", args.data_format, args.prompt, dev_augmenter)
-    if train_format != dev_format:
-        raise ValueError(f"train/dev 数据格式不一致: train={train_format}, dev={dev_format}")
+    train_set = resolve_dataset(args.data, "train", args.prompt, train_augmenter)
+    dev_set = resolve_dataset(args.data, "dev", args.prompt, dev_augmenter)
 
     if args.limit:
-        train_set.rows = train_set.rows[: args.limit]
-        dev_set.rows = dev_set.rows[: min(args.limit, len(dev_set))]
+        apply_limit(train_set, args.limit)
+        apply_limit(dev_set, args.limit)
 
     train_sampler = ddp_utils.make_sampler(train_set, shuffle=True)
     dev_sampler = ddp_utils.make_sampler(dev_set, shuffle=False)
@@ -367,7 +447,7 @@ def main() -> None:
         print(f"device: {device}")
         print(f"acoustic_dim: {acoustic_dim} (frame_shift_ms={encoder.output_frame_shift_ms})")
         print(f"projector_parameters: {sum(p.numel() for p in projector.parameters()):,}")
-        print(f"data_format: {train_format}")
+        print(f"data: {args.data}")
         print(f"train_set_rows: {len(train_set)}")
         print(f"dev_set_rows: {len(dev_set)}")
 
