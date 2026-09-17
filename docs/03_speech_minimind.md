@@ -33,24 +33,31 @@ MiniMind 接收的却是文本 token embedding，例如 hidden size 为 768：
 
 ## 3. 语音前缀如何进入语言模型
 
-训练样例可以写成：
+训练样例按 MiniMind 原生 chat template 排布，语音占据 `user` 轮的内容位：
 
 ```text
-语音 embedding + “请转写为中文” + “今天天气很好”
+<|im_start|>system
+请转写为中文<|im_end|>
+<|im_start|>user
+{语音}<|im_end|>
+<|im_start|>assistant
+今天天气很好<|im_end|>
 ```
 
-输入 embedding 的排列为：
+`{语音}` 是 Projector 输出的连续 speech embedding，不是 token id，所以文本被拆成语音前后两段：
 
 ```text
-[speech_1, ..., speech_M, prompt_1, ..., prompt_N, target_1, ..., target_K]
+[system 轮 + user 轮开头, speech_1, ..., speech_M, user 轮结尾 + assistant 轮开头, target_1, ..., target_K]
 ```
 
 损失只计算目标文本部分。`-100` 是 PyTorch 交叉熵的 ignore index：
 
 ```text
-labels = [-100, ..., -100,  # 语音前缀和 prompt
-          target_1, ..., target_K]
+labels = [-100, ..., -100,  # system/user 前缀、语音前缀、assistant 轮开头
+          target_1, ..., target_K]   # {answer}<|im_end|>
 ```
+
+这与 MiniMind 官方 `SFTDataset.generate_labels` 的约定一致：loss 从 `<|im_start|>assistant\n` 之后开始，并且把结束标记 `<|im_end|>` 计入 loss。
 
 ## 4. 运行代码
 

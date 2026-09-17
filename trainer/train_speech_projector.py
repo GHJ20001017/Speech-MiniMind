@@ -15,11 +15,14 @@ Each file holds rows::
 The split is fixed by the dataset, so training never re-splits.  The
 validation run combines ``dev.jsonl`` and ``test.jsonl``.
 
-Each LLM sequence is arranged exactly as::
+Samples use MiniMind's native chat template, with the row's ``prompt`` rendered
+into the ``system`` turn and the spoken utterance occupying the ``user`` turn::
 
-    [speech embeddings] + [prompt tokens] + [answer tokens]
+    <|im_start|>system\n{prompt}<|im_end|>\n<|im_start|>user\n{语音}<|im_end|>\n<|im_start|>assistant\n{answer}<|im_end|>
 
-Only the answer tokens contribute to the loss.
+This matches ``train_speech_minimind.py`` exactly, so the projector checkpoint
+transfers to stage 2 without a layout mismatch. Only the ``{answer}<|im_end|>``
+span contributes to the loss.
 """
 
 from __future__ import annotations
@@ -46,6 +49,7 @@ sys.path.insert(0, str(ROOT))
 from dataset.speech_dataset import SpeechAugmentConfig, SpeechWaveformAugmenter
 from model.frozen_encoder import FrozenSpeechEncoder, build_frozen_encoder  # noqa: E402
 from model import ddp_utils  # noqa: E402
+from model.chat_format import encode_answer, encode_assistant_header, encode_prompt  # noqa: E402
 from model.minimind_adapter import forward_inputs_embeds, load_minimind, token_embeddings  # noqa: E402
 from model.speech_projector import SpeechProjector  # noqa: E402
 from scripts.analyze_audio import read_wav  # noqa: E402
@@ -172,45 +176,49 @@ def make_batch_embeddings(
     max_length: int,
     max_speech_tokens: int,
 ):
-    """Build ``[speech][prompt][answer]`` embeddings and answer-only labels."""
+    """Build chat-template embeddings with answer-only labels.
+
+    Layout per sample (MiniMind chat template, speech inside the ``user`` turn)::
+
+        <|im_start|>system\\n{prompt}<|im_end|>\\n<|im_start|>user\\n
+        [speech tokens]
+        <|im_end|>\\n<|im_start|>assistant\\n{answer}<|im_end|>
+    """
     sequences: list[torch.Tensor] = []
     labels: list[torch.Tensor] = []
     for speech, speech_length, prompt, answer in zip(
         projected, projected_lengths.tolist(), prompts, answers
     ):
-        max_speech_length = max(0, min(max_speech_tokens, max_length - 2))
+        prefix = torch.tensor(encode_prompt(tokenizer, prompt), dtype=torch.long)
+        header = torch.tensor(encode_assistant_header(tokenizer), dtype=torch.long)
+        answer_ids = torch.tensor(encode_answer(tokenizer, answer), dtype=torch.long)
+
+        # Keep the whole prefix/header plus at least one answer token; the
+        # speech prefix absorbs whatever budget is left.
+        max_speech_length = max(
+            0, min(max_speech_tokens, max_length - prefix.numel() - header.numel() - 1)
+        )
         speech = speech[: min(int(speech_length), max_speech_length)]
 
-        prompt_ids = tokenizer(
-            prompt, add_special_tokens=True, return_tensors="pt"
-        )["input_ids"][0]
-        answer_ids = tokenizer(
-            answer, add_special_tokens=False, return_tensors="pt"
-        )["input_ids"][0]
-        if tokenizer.eos_token_id is not None:
-            eos = torch.tensor([tokenizer.eos_token_id], dtype=answer_ids.dtype)
-            answer_ids = torch.cat([answer_ids, eos])
-
-        text_ids = torch.cat([prompt_ids, answer_ids])
-        text_budget = max_length - speech.size(0)
-        if text_budget <= 0:
+        suffix = torch.cat([header, answer_ids])[
+            : max_length - prefix.numel() - speech.size(0)
+        ]
+        if suffix.numel() <= header.numel():
             raise ValueError(
-                f"max_length={max_length} leaves no room for prompt/answer tokens "
-                f"after {speech.size(0)} speech embeddings"
-            )
-        text_ids = text_ids[:text_budget]
-        prompt_count = min(prompt_ids.numel(), text_ids.numel())
-        if prompt_count >= text_ids.numel():
-            raise ValueError(
-                "prompt tokens consume the whole sequence budget; no answer "
-                "tokens remain for the loss"
+                f"max_length={max_length} leaves no room for answer tokens after "
+                f"{speech.size(0)} speech embeddings and {prefix.numel()} prompt tokens"
             )
 
-        text_labels = text_ids.clone()
-        text_labels[:prompt_count] = -100
-        text_embeddings = token_embeddings(model, text_ids.to(device)).squeeze(0)
-        embeddings = torch.cat([speech, text_embeddings], dim=0)
-        label = torch.cat([torch.full((speech.size(0),), -100, device=device, dtype=torch.long), text_labels.to(device)])
+        prefix_embeddings = token_embeddings(model, prefix.to(device))
+        suffix_embeddings = token_embeddings(model, suffix.to(device))
+        embeddings = torch.cat([prefix_embeddings, speech, suffix_embeddings], dim=0)
+        label = torch.cat([
+            torch.full(
+                (prefix.numel() + speech.size(0) + header.numel(),),
+                -100, device=device, dtype=torch.long,
+            ),
+            suffix[header.numel():].to(device),
+        ])
         sequences.append(embeddings)
         labels.append(label)
     padded = pad_sequence(sequences, batch_first=True)
@@ -384,7 +392,8 @@ def main() -> None:
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--max-length", type=int, default=2048)
     parser.add_argument("--max-speech-tokens", type=int, default=512)
-    parser.add_argument("--prompt", default="请将这段语音转写为文字：")
+    parser.add_argument("--prompt", default="请将这段语音转写为文字：",
+                        help="fallback system prompt for rows without a prompt field")
     parser.add_argument("--limit", type=int, default=0, help="limit examples for a quick smoke test")
     parser.add_argument("--augment", action=argparse.BooleanOptionalAction, default=True,
                         help="apply random waveform augmentation inside the training dataset")

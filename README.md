@@ -231,6 +231,17 @@ CUDA_VISIBLE_DEVICES=0,1,2,3 torchrun --nproc_per_node=4 trainer/train_speech_pr
   --wandb --wandb-name projector_sensevoice
 ```
 
+每行按 MiniMind 原生 chat template 排布，语音占据 `user` 轮的内容位，行内 `prompt` 进 `system` 轮；只对 `{answer}<|im_end|>` 计算 loss：
+
+```text
+<|im_start|>system
+请转写为中文<|im_end|>
+<|im_start|>user
+{语音}<|im_end|>
+<|im_start|>assistant
+今天天气很好<|im_end|>
+```
+
 无论用哪个编码器后端，都冻结编码器和 MiniMind，只训练约 0.8M 参数的 `SpeechProjector`。这一步得到的是**语音条件的转写桥接模型**，还不是完整的 Speech LLM。
 
 训练过程（AISHELL-1，约 9.5k step）的 loss 曲线：
@@ -246,9 +257,6 @@ train loss 从约 8.5 收敛到约 0.5；dev loss 从约 0.96 稳定下降到约
 第 2 节下载的 stage 2 切分音频采样率仍不一致（moss_speech_qa 与合成语音的 Qwen3-TTS=24kHz、VoiceAssistant-400K=22050Hz，AISHELL-1=16kHz），而 `train_speech_minimind.py` 强制 16kHz 输入。用 `resample_stage2_mixed.py` 统一到 16kHz：
 
 ```bash
-# 需要 soundfile + soxr（无 soxr 时自动回退 scipy）
-python -m pip install soundfile soxr
-
 # 第 2 节下载的 stage 2 三份清单
 python scripts/resample_stage2_mixed.py --data data/speech2text_corpus/splits --splits train,val,test --sr 16000
 ```
@@ -263,7 +271,18 @@ python scripts/resample_stage2_mixed.py --data data/speech2text_corpus/splits --
 你是一个语音助手，根据用户的音频内容回答用户的问题
 ```
 
-可用 `--system-prompt` 覆盖（推理时需要传同一个值）。数据侧把第 2 节下载的 stage 2 切分和第 6 节的重采样做完即可：
+可用 `--system-prompt` 覆盖（推理时需要传同一个值）。排布与第 5 节同一套 chat template：系统提示词进 `system` 轮，语音进 `user` 轮，loss 只算 `{answer}<|im_end|>`：
+
+```text
+<|im_start|>system
+你是一个语音助手，根据用户的音频内容回答用户的问题<|im_end|>
+<|im_start|>user
+{语音}<|im_end|>
+<|im_start|>assistant
+今天天气不错<|im_end|>
+```
+
+数据侧把第 2 节下载的 stage 2 切分和第 6 节的重采样做完即可：
 
 ```bash
 # Projector 与 MiniMind 一起训练；--projector-lr 是 Projector 的独立小学习率

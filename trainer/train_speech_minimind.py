@@ -18,7 +18,13 @@ and the reference answer; every sample is trained against a fixed system prompt
 The train/dev split comes from the manifests, so no re-splitting happens here.
 The optional ``lang`` field can filter rows via ``--lang-filter``.
 
-Loss is computed only over the ``answer`` portion (prompt tokens are masked).
+Samples are laid out with MiniMind's native chat template, the spoken utterance
+sitting inside the ``user`` turn::
+
+    <|im_start|>system\n{system}<|im_end|>\n<|im_start|>user\n{语音}<|im_end|>\n<|im_start|>assistant\n{answer}<|im_end|>
+
+Loss is computed only over the ``{answer}<|im_end|>`` span; the system/user
+prefix, the speech embeddings and the assistant header are all masked.
 
 Requires: peft (``pip install peft``), plus the same torch/transformers as the
 rest of the project. Mimics ``forward_inputs_embeds`` for the LLM forward.
@@ -47,6 +53,7 @@ from dataset.speech_dataset import (  # noqa: E402
 )
 from model.frozen_encoder import build_frozen_encoder  # noqa: E402
 from model import ddp_utils  # noqa: E402
+from model.chat_format import encode_answer, encode_assistant_header, encode_prompt  # noqa: E402
 from model.minimind_adapter import forward_inputs_embeds, load_minimind  # noqa: E402
 from model.speech_projector import SpeechProjector  # noqa: E402
 
@@ -77,8 +84,15 @@ def make_sft_batch(
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Build (inputs_embeds, attention_mask, labels) with prompt masking.
 
-    Layout per sample: [speech tokens][instruction tokens][answer tokens]
-    Labels mark only the answer portion as trainable.
+    Layout per sample (MiniMind chat template, speech inside the ``user`` turn)::
+
+        <|im_start|>system\\n{system}<|im_end|>\\n<|im_start|>user\\n
+        [speech tokens]
+        <|im_end|>\\n<|im_start|>assistant\\n{answer}<|im_end|>
+
+    Labels mark only the trailing ``{answer}<|im_end|>`` as trainable; the
+    system/user prefix, the speech embeddings and the assistant header are
+    masked with -100.
     """
     seqs_emb: list[torch.Tensor] = []
     seqs_mask: list[torch.Tensor] = []
@@ -86,24 +100,34 @@ def make_sft_batch(
     for speech, speech_len, instruction, answer in zip(
         projected, projected_lengths.tolist(), instructions, answers
     ):
-        speech = speech[: min(speech_len, max_speech_tokens, max_length - 2)]
-        prompt_ids = tokenizer(
-            instruction, add_special_tokens=True, return_tensors="pt"
-        )["input_ids"][0].to(device)
-        target_ids = tokenizer(
-            answer + (tokenizer.eos_token or ""), add_special_tokens=False, return_tensors="pt"
-        )["input_ids"][0].to(device)
+        prefix = torch.tensor(
+            encode_prompt(tokenizer, instruction), dtype=torch.long, device=device
+        )
+        header = torch.tensor(
+            encode_assistant_header(tokenizer), dtype=torch.long, device=device
+        )
+        answer_ids = torch.tensor(
+            encode_answer(tokenizer, answer), dtype=torch.long, device=device
+        )
 
-        all_ids = torch.cat([prompt_ids, target_ids])[: max_length - speech.size(0)]
-        prompt_count = min(prompt_ids.numel(), all_ids.numel())
+        # Keep the whole prefix/header plus at least one answer token; the
+        # speech prefix absorbs whatever budget is left.
+        text_budget = max_length - prefix.numel() - header.numel() - 1
+        speech = speech[: min(speech_len, max_speech_tokens, max(1, text_budget))]
+        suffix = torch.cat([header, answer_ids])[
+            : max_length - prefix.numel() - speech.size(0)
+        ]
 
         # `model` may be a PeftModel (optionally DDP-wrapped); unwrap to reach
         # the base LM's embeddings.
         base_model = ddp_utils.unwrap(model)
         base_model = base_model.get_base_model() if hasattr(base_model, "get_base_model") else base_model
-        text_embeds = base_model.model.embed_tokens(all_ids).unsqueeze(0)  # [1, T, H]
+        prefix_embeds = base_model.model.embed_tokens(prefix).unsqueeze(0)  # [1, P, H]
+        suffix_embeds = base_model.model.embed_tokens(suffix).unsqueeze(0)  # [1, Q, H]
 
-        emb = torch.cat([speech.unsqueeze(0), text_embeds], dim=1)  # [1, S+T, H]
+        emb = torch.cat(
+            [prefix_embeds, speech.unsqueeze(0), suffix_embeds], dim=1
+        )  # [1, P+S+Q, H]
         seq_len = emb.size(1)
         pad_len = max_length - seq_len
         if pad_len > 0:
@@ -111,7 +135,8 @@ def make_sft_batch(
         mask = torch.zeros(max_length, device=device, dtype=torch.long)
         mask[:seq_len] = 1
         label = torch.full((max_length,), -100, device=device, dtype=torch.long)
-        label[speech.size(0) + prompt_count : seq_len] = all_ids[prompt_count:]
+        answer_start = prefix.numel() + speech.size(0) + header.numel()
+        label[answer_start:seq_len] = suffix[header.numel():]
 
         seqs_emb.append(emb)
         seqs_mask.append(mask)

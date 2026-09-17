@@ -8,6 +8,8 @@ from pathlib import Path
 import torch
 from torch import nn
 
+from model.chat_format import encode_assistant_header, encode_prompt
+
 
 def load_minimind(model_path: Path, device: torch.device):
     """Load a Transformers-format MiniMind checkpoint.
@@ -101,19 +103,24 @@ def generate_from_speech(
     """Autoregressively generate an answer given a speech prefix + instruction.
 
     The model consumes continuous speech embeddings (from the frozen encoder +
-    projector) prepended to the tokenised instruction, mirroring the training
-    layout ``[speech tokens][instruction tokens]``. Because the prefix is not
-    a token-id sequence, we build ``inputs_embeds`` manually and try to run
-    ``model.generate`` on it; MiniMind's exported decoder may not accept
-    ``inputs_embeds`` through ``generate``, in which case we fall back to a
-    simple greedy autoregressive loop over ``logits``.
+    projector) sitting inside the ``user`` turn of MiniMind's chat template::
+
+        <|im_start|>system\\n{instruction}<|im_end|>\\n<|im_start|>user\\n
+        [speech embeddings]
+        <|im_end|>\\n<|im_start|>assistant\\n
+
+    exactly mirroring what ``train_speech_minimind.make_sft_batch`` supervises.
+    Because the prefix is not a token-id sequence, we build ``inputs_embeds``
+    manually and try to run ``model.generate`` on it; MiniMind's exported
+    decoder may not accept ``inputs_embeds`` through ``generate``, in which case
+    we fall back to a simple greedy autoregressive loop over ``logits``.
 
     Args:
         model: MiniMind LM, possibly wrapped (DDP / peft).
         tokenizer: its AutoTokenizer.
         speech_embeds: ``(1, T_sp, H)`` projected speech prefix embeddings.
         speech_lengths: ``(1,)`` real count of speech tokens.
-        instruction: text instruction to prepend after the speech prefix.
+        instruction: system prompt rendered into the ``system`` turn.
         device: execution device.
         max_new_tokens: answer length cap.
         max_speech_tokens: cap on how many speech tokens we keep.
@@ -125,12 +132,16 @@ def generate_from_speech(
     base = _unwrap_for_generate(model)
     speech = speech_embeds[:, : speech_lengths[0], :][:, :max_speech_tokens, :]
 
-    prompt_ids = tokenizer(
-        instruction, add_special_tokens=True, return_tensors="pt"
-    )["input_ids"].to(device)
-    prompt_embeds = base.model.embed_tokens(prompt_ids)  # [1, P, H]
+    prefix_ids = torch.tensor(
+        encode_prompt(tokenizer, instruction), dtype=torch.long, device=device
+    ).unsqueeze(0)
+    header_ids = torch.tensor(
+        encode_assistant_header(tokenizer), dtype=torch.long, device=device
+    ).unsqueeze(0)
+    prefix_embeds = base.model.embed_tokens(prefix_ids)  # [1, P, H]
+    header_embeds = base.model.embed_tokens(header_ids)  # [1, Q, H]
 
-    inputs_embeds = torch.cat([speech, prompt_embeds], dim=1)  # [1, S+P, H]
+    inputs_embeds = torch.cat([prefix_embeds, speech, header_embeds], dim=1)
     seq_len = inputs_embeds.size(1)
     attention_mask = torch.ones((1, seq_len), dtype=torch.long, device=device)
 
@@ -180,6 +191,8 @@ def stream_from_speech(
     caller can update a UI incrementally instead of waiting for the whole answer.
     The final yield carries the full text in both fields.
 
+    Uses the same chat-template layout as :func:`generate_from_speech`.
+
     Internally uses ``transformers.TextIteratorStreamer`` on ``model.generate``
     (KV-cache enabled). If ``generate(inputs_embeds=...)`` is unsupported it
     falls back to the greedy loop and yields after each token we can emit.
@@ -189,12 +202,16 @@ def stream_from_speech(
     base = _unwrap_for_generate(model)
     speech = speech_embeds[:, : speech_lengths[0], :][:, :max_speech_tokens, :]
 
-    prompt_ids = tokenizer(
-        instruction, add_special_tokens=True, return_tensors="pt"
-    )["input_ids"].to(device)
-    prompt_embeds = base.model.embed_tokens(prompt_ids)
+    prefix_ids = torch.tensor(
+        encode_prompt(tokenizer, instruction), dtype=torch.long, device=device
+    ).unsqueeze(0)
+    header_ids = torch.tensor(
+        encode_assistant_header(tokenizer), dtype=torch.long, device=device
+    ).unsqueeze(0)
+    prefix_embeds = base.model.embed_tokens(prefix_ids)
+    header_embeds = base.model.embed_tokens(header_ids)
 
-    inputs_embeds = torch.cat([speech, prompt_embeds], dim=1)
+    inputs_embeds = torch.cat([prefix_embeds, speech, header_embeds], dim=1)
     seq_len = inputs_embeds.size(1)
     attention_mask = torch.ones((1, seq_len), dtype=torch.long, device=device)
 
