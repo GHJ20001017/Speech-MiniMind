@@ -18,7 +18,7 @@ validation run combines ``dev.jsonl`` and ``test.jsonl``.
 Samples use MiniMind's native chat template, with the row's ``prompt`` rendered
 into the ``system`` turn and the spoken utterance occupying the ``user`` turn::
 
-    <|im_start|>system\n{prompt}<|im_end|>\n<|im_start|>user\n{语音}<|im_end|>\n<|im_start|>assistant\n{answer}<|im_end|>
+    <|im_start|>system\n{prompt}<|im_end|>\n<|im_start|>user\n<|audio_start|>{语音}<|audio_end|><|im_end|>\n<|im_start|>assistant\n{answer}<|im_end|>
 
 This matches ``train_speech_minimind.py`` exactly, so the projector checkpoint
 transfers to stage 2 without a layout mismatch. Only the ``{answer}<|im_end|>``
@@ -180,9 +180,9 @@ def make_batch_embeddings(
 
     Layout per sample (MiniMind chat template, speech inside the ``user`` turn)::
 
-        <|im_start|>system\\n{prompt}<|im_end|>\\n<|im_start|>user\\n
+        <|im_start|>system\\n{prompt}<|im_end|>\\n<|im_start|>user\\n<|audio_start|>
         [speech tokens]
-        <|im_end|>\\n<|im_start|>assistant\\n{answer}<|im_end|>
+        <|audio_end|><|im_end|>\\n<|im_start|>assistant\\n{answer}<|im_end|>
     """
     sequences: list[torch.Tensor] = []
     labels: list[torch.Tensor] = []

@@ -105,9 +105,9 @@ def generate_from_speech(
     The model consumes continuous speech embeddings (from the frozen encoder +
     projector) sitting inside the ``user`` turn of MiniMind's chat template::
 
-        <|im_start|>system\\n{instruction}<|im_end|>\\n<|im_start|>user\\n
+        <|im_start|>system\\n{instruction}<|im_end|>\\n<|im_start|>user\\n<|audio_start|>
         [speech embeddings]
-        <|im_end|>\\n<|im_start|>assistant\\n
+        <|audio_end|><|im_end|>\\n<|im_start|>assistant\\n
 
     exactly mirroring what ``train_speech_minimind.make_sft_batch`` supervises.
     Because the prefix is not a token-id sequence, we build ``inputs_embeds``

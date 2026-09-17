@@ -237,12 +237,12 @@ CUDA_VISIBLE_DEVICES=0,1,2,3 torchrun --nproc_per_node=4 trainer/train_speech_pr
 <|im_start|>system
 请转写为中文<|im_end|>
 <|im_start|>user
-{语音}<|im_end|>
+<|audio_start|>{语音}<|audio_end|><|im_end|>
 <|im_start|>assistant
 今天天气很好<|im_end|>
 ```
 
-无论用哪个编码器后端，都冻结编码器和 MiniMind，只训练约 0.8M 参数的 `SpeechProjector`。这一步得到的是**语音条件的转写桥接模型**，还不是完整的 Speech LLM。
+语音两侧的 `<|audio_start|>`(14) / `<|audio_end|>`(15) 是 MiniMind-3 tokenizer 自带的特殊 token，与路线 B（`model/audio_lm.py`）用的是同一对，两条路线对「音频在此」的信号因此一致。无论用哪个编码器后端，都冻结编码器和 MiniMind，只训练约 0.8M 参数的 `SpeechProjector`。这一步得到的是**语音条件的转写桥接模型**，还不是完整的 Speech LLM。
 
 训练过程（AISHELL-1，约 9.5k step）的 loss 曲线：
 
@@ -277,7 +277,7 @@ python scripts/resample_stage2_mixed.py --data data/speech2text_corpus/splits --
 <|im_start|>system
 你是一个语音助手，根据用户的音频内容回答用户的问题<|im_end|>
 <|im_start|>user
-{语音}<|im_end|>
+<|audio_start|>{语音}<|audio_end|><|im_end|>
 <|im_start|>assistant
 今天天气不错<|im_end|>
 ```

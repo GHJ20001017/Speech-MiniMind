@@ -21,10 +21,11 @@ The optional ``lang`` field can filter rows via ``--lang-filter``.
 Samples are laid out with MiniMind's native chat template, the spoken utterance
 sitting inside the ``user`` turn::
 
-    <|im_start|>system\n{system}<|im_end|>\n<|im_start|>user\n{语音}<|im_end|>\n<|im_start|>assistant\n{answer}<|im_end|>
+    <|im_start|>system\n{system}<|im_end|>\n<|im_start|>user\n<|audio_start|>{语音}<|audio_end|><|im_end|>\n<|im_start|>assistant\n{answer}<|im_end|>
 
 Loss is computed only over the ``{answer}<|im_end|>`` span; the system/user
-prefix, the speech embeddings and the assistant header are all masked.
+prefix, the speech embeddings, both audio markers and the assistant header are
+all masked.
 
 Requires: peft (``pip install peft``), plus the same torch/transformers as the
 rest of the project. Mimics ``forward_inputs_embeds`` for the LLM forward.
@@ -86,13 +87,13 @@ def make_sft_batch(
 
     Layout per sample (MiniMind chat template, speech inside the ``user`` turn)::
 
-        <|im_start|>system\\n{system}<|im_end|>\\n<|im_start|>user\\n
+        <|im_start|>system\\n{system}<|im_end|>\\n<|im_start|>user\\n<|audio_start|>
         [speech tokens]
-        <|im_end|>\\n<|im_start|>assistant\\n{answer}<|im_end|>
+        <|audio_end|><|im_end|>\\n<|im_start|>assistant\\n{answer}<|im_end|>
 
     Labels mark only the trailing ``{answer}<|im_end|>`` as trainable; the
-    system/user prefix, the speech embeddings and the assistant header are
-    masked with -100.
+    system/user prefix, the speech embeddings, both audio markers and the
+    assistant header are masked with -100.
     """
     seqs_emb: list[torch.Tensor] = []
     seqs_mask: list[torch.Tensor] = []

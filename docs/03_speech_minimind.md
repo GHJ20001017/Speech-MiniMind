@@ -39,21 +39,21 @@ MiniMind 接收的却是文本 token embedding，例如 hidden size 为 768：
 <|im_start|>system
 请转写为中文<|im_end|>
 <|im_start|>user
-{语音}<|im_end|>
+<|audio_start|>{语音}<|audio_end|><|im_end|>
 <|im_start|>assistant
 今天天气很好<|im_end|>
 ```
 
-`{语音}` 是 Projector 输出的连续 speech embedding，不是 token id，所以文本被拆成语音前后两段：
+`{语音}` 是 Projector 输出的连续 speech embedding，不是 token id，所以文本被拆成语音前后两段（`<|audio_start|>` / `<|audio_end|>` 是 MiniMind-3 tokenizer 自带的特殊 token，id 14 / 15，与路线 B 用的是同一对）：
 
 ```text
-[system 轮 + user 轮开头, speech_1, ..., speech_M, user 轮结尾 + assistant 轮开头, target_1, ..., target_K]
+[system 轮 + user 轮开头 + <|audio_start|>, speech_1, ..., speech_M, <|audio_end|> + user 轮结尾 + assistant 轮开头, target_1, ..., target_K]
 ```
 
 损失只计算目标文本部分。`-100` 是 PyTorch 交叉熵的 ignore index：
 
 ```text
-labels = [-100, ..., -100,  # system/user 前缀、语音前缀、assistant 轮开头
+labels = [-100, ..., -100,  # system/user 前缀、<|audio_start|>、语音前缀、<|audio_end|>、assistant 轮开头
           target_1, ..., target_K]   # {answer}<|im_end|>
 ```
 
