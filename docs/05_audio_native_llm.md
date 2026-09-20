@@ -2,7 +2,7 @@
 
 ## 1. 与路线 A 的区别
 
-路线 A 是**级联式**：冻结声学编码器给出**连续**帧级向量 → Projector → MiniMind → **文本**。
+路线 A 是**级联式**：冻结声学编码器给出**连续**帧级向量 → Projector → Qwen3-0.6B → **文本**。
 
 路线 B 是**原生音频**：语音被量化成**离散 codebook token**，同一个 LLM 直接在 token 序列上建模并生成，再由解码器还原波形：
 
@@ -84,14 +84,14 @@ python scripts/eval_codec_reconstruction.py \
 
 ## 3. 词表布局与训练目标
 
-`model/audio_lm.py` 定义音频 token 的排布。音频块紧跟在文本词表之后：
+`model/audio_lm.py` 定义音频 token 的排布。LLM 是 **Qwen3-0.6B（非思考模式）**，音频块紧跟在它的文本词表之后（`len(tokenizer) = 151672`）：
 
 ```text
 [0, audio_offset)                     文本 token（保持预训练权重）
 [audio_offset + q*C, +C)              codebook q 的 C 个码（q = 0..Q-1）
 ```
 
-三个特殊 token 复用 MiniMind-3 tokenizer 自带的 `<|audio_start|>`(14) / `<|audio_end|>`(15) / `<|audio_pad|>`(16)（`register_audio_special_tokens` 会发现已存在而跳过；换成普通文本 tokenizer 时才追加为 `additional_special_tokens`）。因此它们位于 `audio_offset` **之下**，`total_vocab_size` 取「音频块末尾」与「特殊 token 最大 id + 1」两者的较大值。
+三个特殊 token `<|audio_start|>` / `<|audio_end|>` / `<|audio_pad|>` **并不在 Qwen3-0.6B 的词表里**：官方 tokenizer 会把 `<|audio_start|>` 拆成 `[27, 91, 16736, 4906, 91, 29]` 六个互不相关的字节 token。`register_audio_special_tokens` 现在直接委托 `model/chat_format.py` 的 `ensure_audio_tokens`（与路线 A 共用同一份定义），首次运行时把它们**追加**到文本词表之上，落在 id **151669 / 151670 / 151671** —— 仍在 151936 行的 embedding 表内，所以**标记本身不需要扩表**，只是把这三行从「未使用」变成「音频标记」；音频块（8×2048）随后接在 `audio_offset = 151672` 之后。`total_vocab_size` 仍取「音频块末尾」与「特殊 token 最大 id + 1」两者的较大值。
 
 一帧 `t` 的 `Q` 个 code 被**展平**成 `t*Q + q` 的连续 token（与 MiniMind-O 的 `answer_audios` 一致）。训练序列：
 
@@ -153,6 +153,8 @@ python scripts/cache_audio_tokens.py \
 
 ## 5. 训练
 
+> **旧检查点不兼容，必须重训**：此前训练过的路线 B 检查点（B0 / B1）是针对 **6400 词表的 MiniMind 文本词表**训出来的，与 Qwen3-0.6B 骨架（151672 文本词表、不同的 tokenizer 与 embedding 行）**不兼容**：直接加载会得到错的 `audio_offset` 和无意义的 embedding 行。`--init-from` 只能指向用当前 Qwen3 骨架训出来的 B0 目录，旧产物一律重训。
+
 ### B0：音频 LM 预训练
 
 先让模型学会 codec token 的分布（等价于「音频版文本 LM」）：
@@ -161,7 +163,7 @@ python scripts/cache_audio_tokens.py \
 CUDA_VISIBLE_DEVICES=6,7 torchrun --nproc_per_node=2 \
   trainer/train_audio_lm_pretrain.py \
   --data data/route_b/audio_lm_codes \
-  --minimind-model /gpu3/guhj/models/minimind-3 \
+  --qwen3-model /gpu3/guhj/models/Qwen3-0.6B \
   --output outputs/05_route_b_audio_lm --epochs 3 --batch-size 8 \
   --num-codebooks 8 --codebook-size 2048 --max-frames 128 \
   --tune full --num-workers 4 --wandb --wandb-name route_b_b0
@@ -183,10 +185,13 @@ CUDA_VISIBLE_DEVICES=6,7 torchrun --nproc_per_node=2 \
   --output outputs/06_route_b_s2s --epochs 3 --batch-size 4 \
   --num-codebooks 8 --codebook-size 2048 \
   --max-answer-frames 256 --max-prompt-frames 256 \
-  --tune full --num-workers 4 --wandb --wandb-name route_b_s2s
+  --tune full --num-workers 4 \
+  --lr-schedule cosine --warmup-ratio 0.03 --min-lr-ratio 0.1 --loss-ema 0.02 \
+  --wandb --wandb-name route_b_s2s
 ```
 
-- `--init-from` 必须是**已经扩过词表**的 B0 目录；只给 `--minimind-model` 会重新随机初始化音频块（仅用于冒烟）。
+- `--init-from` 必须是**已经扩过词表**的 B0 目录；只给 `--qwen3-model` 会重新随机初始化音频块（仅用于冒烟）。
+- 每步记 `train/loss_step`（跨卡、按监督 token 加权的均值）、`train/loss_ema`（`--loss-ema`，默认 0.02）和 `train/lr`；学习率默认 `--lr-schedule cosine`，前 `--warmup-ratio`（0.03）线性 warmup 后 cosine 衰减到 `--min-lr-ratio`（0.1）倍，`--lr-schedule none` 可还原恒定 lr。`torchrun` 需要 `speech-llm` 环境已激活，否则用 `/gpu3/guhj/envs/speech-llm/bin/python -m torch.distributed.run`。
 - `--code-dropout 0.05` 会随机替换**输入**语音的部分帧，提升对编码噪声的鲁棒性（目标段永不被污染）。
 - 每个 epoch 额外记录 `dev_token_acc`：输出语音 token 的 teacher-forcing 准确率。
 
@@ -219,4 +224,4 @@ python scripts/infer_speech_to_speech.py \
 1. **codec 质量是天花板**：请先看 M0 的往返 CER 再解读 B2 的结果，区分「量化损失」与「模型能力」。
 2. **合成回答音频**：自有 s2s 配对依赖 TTS，音色与腔调单一。
 3. **纯声学 token 语义弱**：若模型收敛但答非所问，可后续加一路文本辅助头（同骨干并行预测回答文本），推理时仍只解码音频。
-4. **显存**：请优先单码本或限制帧数；`--max-length` 直接决定序列长度。
+4. **显存**：请优先单码本或限制帧数；`--max-length` 直接决定序列长度。全参微调时输出词表决定 loss 的峰值显存：路线 B 的词表是 168,056 行（151,672 text + 8×2048 audio），一次性过 LM head 在 `--batch-size 2`×4112 token 下要留 4 份 `(B, L, vocab)` fp32 张量（约 21 GiB），见 `model/chunked_loss.py` 与 `--loss-chunk`（默认 256，按块前向并在反向重算）：改小 `--max-answer-frames`/`--max-prompt-frames` 比降 batch size 更有效，因为损失与序列长度线性相关。

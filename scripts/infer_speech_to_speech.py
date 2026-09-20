@@ -33,7 +33,7 @@ sys.path.insert(0, str(ROOT))
 
 from model.audio_codec import build_frozen_audio_codec  # noqa: E402
 from model.audio_lm import from_lm_tokens, generate_audio_tokens  # noqa: E402
-from model.minimind_adapter import load_minimind  # noqa: E402
+from model.qwen3_adapter import load_qwen3  # noqa: E402
 
 
 def parse_args() -> argparse.Namespace:
@@ -79,7 +79,7 @@ def main() -> None:
 
     import soundfile as sf
 
-    model, tokenizer = load_minimind(args.model, device)
+    model, tokenizer = load_qwen3(args.model, device)
     model.eval()
 
     codec = build_frozen_audio_codec(args.codec_type, args.codec_model, device)

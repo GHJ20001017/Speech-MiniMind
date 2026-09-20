@@ -1,7 +1,7 @@
-"""Web UI to test the instruction-tuned Speech-MiniMind (chapter 04).
+"""Web UI to test the instruction-tuned Qwen3-0.6B Speech LLM (chapter 04).
 
 Two interaction modes over one page, both backed by the same frozen-encoder +
-projector + tuned-MiniMind pipeline as ``infer_speech_minimind.py``:
+projector + tuned-Qwen3 pipeline as ``infer_speech_qwen3.py``:
 
 * **audio upload**  — pick/drop a WAV (or any format ffmpeg can read), the
   server decodes it to 16 kHz mono, runs the model and streams the answer.
@@ -21,19 +21,19 @@ Usage
     pip install fastapi uvicorn soundfile qwen-tts
 
     # full-mode tuned model, SenseVoice-Small frontend (recommended);
-    # --tts-model enables text-to-speech after every MiniMind answer.
-    python scripts/visualize_speech_minimind_webui.py \\
+    # --tts-model enables text-to-speech after every Qwen3 answer.
+    python scripts/visualize_speech_qwen3_webui.py \\
       --encoder-type sensevoice \\
       --sensevoice-model outputs/sensevoice-small \\
-      --projector-checkpoint outputs/03_speech_minimind_projector/projector_epoch_005.pt \\
-      --minimind-model outputs/04_speech_minimind_sft/model_epoch_003 \\
+      --projector-checkpoint outputs/03_speech_qwen3_projector/projector_epoch_005.pt \\
+      --qwen3-model outputs/04_speech_qwen3_sft/model_epoch_003 \\
       --tts-model /gpu3/guhj/models/Qwen3-TTS-12Hz-1.7B-CustomVoice \\
       --tts-speaker Serena \\
       --host 0.0.0.0 --port 7861 --ssl-auto
 
 All weights come from the paths you pass; nothing is downloaded here.
 Open http://<host>:<port> (or https:// with --ssl-auto) in a browser to use it.
-When ``--tts-model`` is supplied, each final MiniMind answer is normalized,
+When ``--tts-model`` is supplied, each final Qwen3 answer is normalized,
 synthesized by Qwen3-TTS, and returned as a WAV message for browser playback.
 """
 
@@ -57,8 +57,8 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 # reuse the shared load pipeline of the CLI so behaviour stays identical
-from scripts.infer_speech_minimind import load_pipeline, SAMPLE_RATE  # noqa: E402
-from model.minimind_adapter import stream_from_speech  # noqa: E402
+from scripts.infer_speech_qwen3 import load_pipeline, SAMPLE_RATE  # noqa: E402
+from model.qwen3_adapter import stream_from_speech  # noqa: E402
 from dataset.speech_dataset import DEFAULT_SYSTEM_PROMPT  # noqa: E402
 
 PRESET_INSTRUCTIONS = [
@@ -240,7 +240,7 @@ def decode_bytes_to_mono16k(data: bytes) -> np.ndarray:
 # Inference engine: shared, serialized, streams partial text.
 # --------------------------------------------------------------------------- #
 class SpeechEngine:
-    """Frozen encoder + projector + tuned MiniMind behind a single lock."""
+    """Frozen encoder + projector + tuned Qwen3 behind a single lock."""
 
     def __init__(self, encoder, projector, lm, tokenizer, device, max_speech_tokens: int,
                  tts_model=None, tts_speaker: str = "Serena", tts_language: str = "Chinese") -> None:
@@ -993,8 +993,8 @@ def main() -> None:
                         help="SenseVoice-Small model id or local directory")
     parser.add_argument("--paraformer-model", default=None)
     parser.add_argument("--projector-checkpoint", type=Path, required=True)
-    parser.add_argument("--minimind-model", type=Path, required=True,
-                        help="chapter-04 tuned MiniMind dir (full or lora)")
+    parser.add_argument("--qwen3-model", type=Path, required=True,
+                        help="chapter-04 tuned Qwen3 dir (full or lora)")
     parser.add_argument("--tune", choices=("lora", "full"), default="full")
     parser.add_argument("--max-new-tokens", type=int, default=256)
     parser.add_argument("--max-speech-tokens", type=int, default=512)

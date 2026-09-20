@@ -1,35 +1,38 @@
-"""CLI inference for the instruction-tuned Speech-MiniMind (chapter 04).
+"""CLI inference for the instruction-tuned Qwen3-0.6B Speech LLM (chapter 04).
 
-Loads the same pipeline as ``train_speech_minimind.py`` but in eval mode:
+Loads the same pipeline as ``train_speech_qwen3.py`` but in eval mode:
 
     audio ──▶ frozen acoustic encoder (sensevoice / conformer / paraformer)
               ──▶ SpeechProjector (frozen) ──▶ speech prefix embeddings
-              ──concat──▶ MiniMind (tuned) ──▶ answer text
+              ──concat──▶ Qwen3-0.6B (tuned) ──▶ answer text
 
-The tuned MiniMind checkpoint is the **chapter-04 output** (full or LoRA):
+The tuned Qwen3 checkpoint is the **chapter-04 output** (full or LoRA):
 
-* full mode   -> ``outputs/04_speech_minimind_sft/model_epoch_XXX/``
-* lora mode   -> ``outputs/04_speech_minimind_sft/lora_epoch_XXX/`` (needs peft
+* full mode   -> ``outputs/04_speech_qwen3_sft/model_epoch_XXX/``
+* lora mode   -> ``outputs/04_speech_qwen3_sft/lora_epoch_XXX/`` (needs peft
   to re-attach the adapters)
+
+Decoding follows Qwen3's non-thinking guidance: greedy by default, and
+``--temperature > 0`` opts into sampling (with top-p / top-k).
 
 Usage
 -----
 .. code-block:: bash
 
     # full-mode tuned model, SenseVoice-Small frontend (recommended)
-    python scripts/infer_speech_minimind.py \\
+    python scripts/infer_speech_qwen3.py \\
       --audio path/to/utterance.wav \\
       --encoder-type sensevoice \\
       --sensevoice-model outputs/sensevoice-small \\
-      --projector-checkpoint outputs/04_speech_minimind_sft/projector_epoch_003.pt \\
-      --minimind-model outputs/04_speech_minimind_sft/model_epoch_003
+      --projector-checkpoint outputs/04_speech_qwen3_sft/projector_epoch_003.pt \\
+      --qwen3-model outputs/04_speech_qwen3_sft/model_epoch_003
 
     # conformer frontend
-    python scripts/infer_speech_minimind.py \\
+    python scripts/infer_speech_qwen3.py \\
       --audio path/to/utterance.wav \\
       --encoder-checkpoint outputs/02_acoustic_encoder/tiny_conformer_ctc.pt \\
-      --projector-checkpoint outputs/04_speech_minimind_sft/projector_epoch_003.pt \\
-      --minimind-model outputs/04_speech_minimind_sft/model_epoch_003
+      --projector-checkpoint outputs/04_speech_qwen3_sft/projector_epoch_003.pt \\
+      --qwen3-model outputs/04_speech_qwen3_sft/model_epoch_003
 
 The default ``--instruction`` is the fixed stage-2 system prompt
 (``你是一个语音助手，根据用户的音频内容回答用户的问题``); pass ``--instruction`` only
@@ -51,7 +54,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from model.frozen_encoder import build_frozen_encoder  # noqa: E402
-from model.minimind_adapter import generate_from_speech, load_minimind  # noqa: E402
+from model.qwen3_adapter import generate_from_speech, load_qwen3  # noqa: E402
 from model.speech_projector import SpeechProjector  # noqa: E402
 from scripts.analyze_audio import read_wav  # noqa: E402
 from dataset.speech_dataset import DEFAULT_SYSTEM_PROMPT  # noqa: E402
@@ -78,7 +81,7 @@ def resolve_audio(value: str) -> tuple[np.ndarray, int]:
 
 
 def load_pipeline(args, device: torch.device):
-    """Load frozen encoder + projector + tuned MiniMind, all on ``device``."""
+    """Load frozen encoder + projector + tuned Qwen3, all on ``device``."""
     encoder = build_frozen_encoder(
         args.encoder_type,
         checkpoint=str(args.encoder_checkpoint) if args.encoder_type == "conformer" else None,
@@ -88,12 +91,18 @@ def load_pipeline(args, device: torch.device):
     acoustic_dim = encoder.output_dim
 
     proj_ckpt = torch.load(args.projector_checkpoint, map_location=device, weights_only=False)
-    llm_dim = int(proj_ckpt.get("llm_hidden_size", 768))
+    llm_dim = int(proj_ckpt.get("llm_hidden_size", 1024))
     projector = SpeechProjector(acoustic_dim, llm_dim).to(device)
     projector.load_state_dict(proj_ckpt["projector"])
     projector.eval()
 
-    lm, tokenizer = load_minimind(args.minimind_model, device)
+    lm, tokenizer = load_qwen3(args.qwen3_model, device)
+    if int(lm.config.hidden_size) != llm_dim:
+        raise SystemExit(
+            f"projector was trained against a {llm_dim}-dim backbone but "
+            f"{args.qwen3_model} is {lm.config.hidden_size}-dim; pair a matching "
+            "projector checkpoint with this model"
+        )
     for p in lm.parameters():
         p.requires_grad_(False)
     lm.eval()
@@ -101,7 +110,7 @@ def load_pipeline(args, device: torch.device):
     if args.tune == "lora":
         from peft import PeftModel  # re-attach LoRA adapters from the ckpt dir
 
-        lm = PeftModel.from_pretrained(lm, args.minimind_model, is_trainable=False)
+        lm = PeftModel.from_pretrained(lm, args.qwen3_model, is_trainable=False)
         lm.eval()
 
     return encoder, projector, lm, tokenizer, llm_dim
@@ -128,6 +137,10 @@ def run(args) -> None:
         max_new_tokens=args.max_new_tokens,
         max_speech_tokens=args.max_speech_tokens,
         temperature=args.temperature,
+        top_p=args.top_p,
+        top_k=args.top_k,
+        repetition_penalty=args.repetition_penalty,
+        no_repeat_ngram_size=args.no_repeat_ngram_size,
     )
     print("\n=== instruction ===")
     print(args.instruction)
@@ -153,13 +166,18 @@ def main() -> None:
     parser.add_argument("--paraformer-model", default=None, help="FunASR model id/dir (paraformer backend)")
     parser.add_argument("--projector-checkpoint", type=Path, required=True,
                         help="trained SpeechProjector ckpt (outputs/03_*/projector_epoch_XXX.pt)")
-    parser.add_argument("--minimind-model", type=Path, required=True,
-                        help="chapter-04 tuned MiniMind dir (full: model_epoch_XXX; lora: lora_epoch_XXX)")
+    parser.add_argument("--qwen3-model", type=Path, required=True,
+                        help="chapter-04 tuned Qwen3 dir (full: model_epoch_XXX; lora: lora_epoch_XXX)")
     parser.add_argument("--tune", choices=("lora", "full"), default="full",
                         help="must match how the checkpoint was trained")
     parser.add_argument("--max-new-tokens", type=int, default=256)
     parser.add_argument("--max-speech-tokens", type=int, default=512)
-    parser.add_argument("--temperature", type=float, default=0.0, help=">0 enables sampling; 0 = greedy")
+    parser.add_argument("--temperature", type=float, default=0.0,
+                        help=">0 enables sampling; 0 = greedy (Qwen3's non-thinking default)")
+    parser.add_argument("--top-p", type=float, default=0.95, help="sampling top-p (only with --temperature > 0)")
+    parser.add_argument("--top-k", type=int, default=20, help="sampling top-k (only with --temperature > 0)")
+    parser.add_argument("--repetition-penalty", type=float, default=1.0, help="1.0 disables it")
+    parser.add_argument("--no-repeat-ngram-size", type=int, default=0, help="0 disables it")
     parser.add_argument("--verbose", action="store_true", help="also print generated token ids")
     args = parser.parse_args()
     run(args)

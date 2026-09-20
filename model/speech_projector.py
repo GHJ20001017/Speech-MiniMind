@@ -7,14 +7,16 @@ from torch import nn
 
 
 class SpeechProjector(nn.Module):
-    """Downsample Conformer states and project them into MiniMind's hidden size.
+    """Downsample Conformer states and project them into Qwen3-0.6B's hidden size.
 
     Input shape is ``[batch, acoustic_steps, acoustic_dim]``. The convolution
     reduces the number of speech tokens before they are prepended to text
     embeddings, which keeps the causal LM sequence length manageable.
+    ``llm_dim`` defaults to Qwen3-0.6B's 1024-dim hidden size; the trained value
+    is always passed explicitly from ``llm_hidden_size`` in the checkpoint.
     """
 
-    def __init__(self, acoustic_dim: int = 256, llm_dim: int = 768, stride: int = 4) -> None:
+    def __init__(self, acoustic_dim: int = 256, llm_dim: int = 1024, stride: int = 4) -> None:
         super().__init__()
         if stride < 1:
             raise ValueError("stride must be positive")

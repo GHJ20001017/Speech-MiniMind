@@ -1,4 +1,4 @@
-"""Train a minimal Speech-MiniMind projector bridge.
+"""Train the SpeechProjector bridge onto a Qwen3-0.6B backbone.
 
 The stage-1 input is a pre-split directory (downloaded from ModelScope, see
 the README dataset section)::
@@ -15,14 +15,23 @@ Each file holds rows::
 The split is fixed by the dataset, so training never re-splits.  The
 validation run combines ``dev.jsonl`` and ``test.jsonl``.
 
-Samples use MiniMind's native chat template, with the row's ``prompt`` rendered
-into the ``system`` turn and the spoken utterance occupying the ``user`` turn::
+Samples use Qwen3's non-thinking chat template, with the row's ``prompt``
+rendered into the ``system`` turn and the spoken utterance occupying the ``user``
+turn::
 
-    <|im_start|>system\n{prompt}<|im_end|>\n<|im_start|>user\n<|audio_start|>{语音}<|audio_end|><|im_end|>\n<|im_start|>assistant\n{answer}<|im_end|>
+    <|im_start|>system\n{prompt}<|im_end|>\n<|im_start|>user\n<|audio_start|>{语音}<|audio_end|><|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n{answer}<|im_end|>
 
-This matches ``train_speech_minimind.py`` exactly, so the projector checkpoint
-transfers to stage 2 without a layout mismatch. Only the ``{answer}<|im_end|>``
+The empty ``<think>\n\n</think>\n\n`` block is how Qwen3 disables thinking: it is
+already closed, so the answer starts immediately. Building the layout here the
+same way ``train_speech_qwen3.py`` does keeps the projector checkpoint
+transferable to stage 2 with no layout mismatch. Only the ``{answer}<|im_end|>``
 span contributes to the loss.
+
+Per-step logging: ``train/loss_step`` is the cross-rank, token-weighted batch loss
+(not rank 0's batch alone) and ``train/loss_ema`` smooths it with ``--loss-ema``;
+``train/lr`` records the learning rate in use.  ``--lr-schedule cosine`` (default)
+applies a linear warmup over ``--warmup-ratio`` of all steps followed by a cosine
+decay to ``--min-lr-ratio`` of ``--lr``; ``--lr-schedule none`` keeps it flat.
 """
 
 from __future__ import annotations
@@ -30,6 +39,7 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import math
 import sys
 from pathlib import Path
 
@@ -50,7 +60,7 @@ from dataset.speech_dataset import SpeechAugmentConfig, SpeechWaveformAugmenter
 from model.frozen_encoder import FrozenSpeechEncoder, build_frozen_encoder  # noqa: E402
 from model import ddp_utils  # noqa: E402
 from model.chat_format import encode_answer, encode_assistant_header, encode_prompt  # noqa: E402
-from model.minimind_adapter import forward_inputs_embeds, load_minimind, token_embeddings  # noqa: E402
+from model.qwen3_adapter import forward_inputs_embeds, load_qwen3, token_embeddings  # noqa: E402
 from model.speech_projector import SpeechProjector  # noqa: E402
 from scripts.analyze_audio import read_wav  # noqa: E402
 
@@ -178,11 +188,11 @@ def make_batch_embeddings(
 ):
     """Build chat-template embeddings with answer-only labels.
 
-    Layout per sample (MiniMind chat template, speech inside the ``user`` turn)::
+    Layout per sample (Qwen3 non-thinking chat template, speech inside the ``user`` turn)::
 
         <|im_start|>system\\n{prompt}<|im_end|>\\n<|im_start|>user\\n<|audio_start|>
         [speech tokens]
-        <|audio_end|><|im_end|>\\n<|im_start|>assistant\\n{answer}<|im_end|>
+        <|audio_end|><|im_end|>\\n<|im_start|>assistant\\n<think>\\n\\n</think>\\n\\n{answer}<|im_end|>
     """
     sequences: list[torch.Tensor] = []
     labels: list[torch.Tensor] = []
@@ -275,7 +285,12 @@ def load_or_encode_batch(encoder, waveforms, lengths, paths, cache_dir, device, 
     return batch_hidden, batch_lengths
 
 
-def run_epoch(args, encoder, projector, lm, tokenizer, loader, device, optimizer=None, cache_dir=None, sampler=None, epoch=0):
+def run_epoch(args, encoder, projector, lm, tokenizer, loader, device, optimizer=None, cache_dir=None, sampler=None, epoch=0, scheduler=None, loss_ema=None):
+    """Run one pass over ``loader``; returns ``(mean loss, loss_ema)``.
+
+    ``loss_ema`` is only maintained while training, so dev calls pass ``None`` and
+    ignore the second element of the result.
+    """
     training = optimizer is not None
     if sampler is not None:
         ddp_utils.set_epoch(sampler, epoch)
@@ -317,10 +332,27 @@ def run_epoch(args, encoder, projector, lm, tokenizer, loader, device, optimizer
             loss.backward()
             torch.nn.utils.clip_grad_norm_(projector.parameters(), 1.0)
             optimizer.step()
+            if scheduler is not None:
+                scheduler.step()
+            # Cross-rank, token-weighted step loss: averaging both (loss * tokens)
+            # and tokens over ranks and dividing gives the weighted mean, so every
+            # rank's batch counts instead of rank 0's alone.
+            supervised = int((labels[:, 1:] != -100).sum().item())
+            step_loss = (
+                ddp_utils.all_reduce_mean(loss.detach().item() * supervised)
+                / max(ddp_utils.all_reduce_mean(float(supervised)), 1e-9)
+            )
+            loss_ema = step_loss if loss_ema is None else (
+                (1.0 - args.loss_ema) * loss_ema + args.loss_ema * step_loss
+            )
             if args.wandb and ddp_utils.is_main():
-                wandb.log({"train/loss_step": loss.detach().item()})
+                wandb.log({
+                    "train/loss_step": step_loss,
+                    "train/loss_ema": loss_ema,
+                    "train/lr": optimizer.param_groups[0]["lr"],
+                })
         total_loss += loss.detach().item()
-    return ddp_utils.all_reduce_mean(total_loss / max(len(loader), 1))
+    return ddp_utils.all_reduce_mean(total_loss / max(len(loader), 1)), loss_ema
 
 
 def resolve_dataset(
@@ -385,8 +417,8 @@ def main() -> None:
                         help="FunASR model id/dir for --encoder-type paraformer (default ModelScope iic/...-online)")
     parser.add_argument("--hidden-cache", type=Path, default=None,
                         help="directory to cache per-utterance encoder hidden states across epochs (.pt, keyed by sha1(path))")
-    parser.add_argument("--minimind-model", type=Path, required=True, help="local Transformers-format MiniMind model directory")
-    parser.add_argument("--output", type=Path, default=Path("outputs/03_speech_minimind"))
+    parser.add_argument("--qwen3-model", type=Path, required=True, help="local Qwen3-0.6B model directory")
+    parser.add_argument("--output", type=Path, default=Path("outputs/03_speech_qwen3_projector"))
     parser.add_argument("--epochs", type=int, default=3)
     parser.add_argument("--batch-size", type=int, default=2)
     parser.add_argument("--lr", type=float, default=1e-4)
@@ -399,6 +431,15 @@ def main() -> None:
                         help="apply random waveform augmentation inside the training dataset")
     parser.add_argument("--augment-mel", action=argparse.BooleanOptionalAction, default=True,
                         help="apply SpecAugment masks after the encoder frontend")
+    parser.add_argument("--lr-schedule", choices=("none", "cosine"), default="cosine",
+                        help="cosine: linear warmup then cosine decay down to --min-lr-ratio; "
+                             "none: keep --lr flat for the whole run")
+    parser.add_argument("--warmup-ratio", type=float, default=0.03,
+                        help="fraction of all steps spent on linear warmup (cosine schedule)")
+    parser.add_argument("--min-lr-ratio", type=float, default=0.1,
+                        help="final lr as a fraction of --lr (cosine floor)")
+    parser.add_argument("--loss-ema", type=float, default=0.02,
+                        help="EMA weight for train/loss_ema (~35-step half-life); 0 disables smoothing")
     parser.add_argument("--wandb", action=argparse.BooleanOptionalAction, default=False, help="log metrics to Weights & Biases")
     parser.add_argument("--wandb-project", default="Speech-MiniMind")
     parser.add_argument("--wandb-name", default=None)
@@ -420,7 +461,7 @@ def main() -> None:
     )
     acoustic_dim = encoder.output_dim
 
-    lm, tokenizer = load_minimind(args.minimind_model, device)
+    lm, tokenizer = load_qwen3(args.qwen3_model, device)
     for parameter in lm.parameters():
         parameter.requires_grad_(False)
 
@@ -442,6 +483,25 @@ def main() -> None:
     train_loader = DataLoader(train_set, batch_size=args.batch_size, shuffle=(train_sampler is None), sampler=train_sampler, collate_fn=collate)
     dev_loader = DataLoader(dev_set, batch_size=args.batch_size, shuffle=False, sampler=dev_sampler, collate_fn=collate)
 
+    # ---- lr schedule ---- one step per optimizer step, identical on every rank
+    # (DistributedSampler pads, so all ranks run the same number of batches).
+    scheduler = None
+    total_steps = 0
+    warmup_steps = 0
+    if args.lr_schedule == "cosine":
+        total_steps = max(1, args.epochs * len(train_loader))
+        warmup_steps = max(1, int(args.warmup_ratio * total_steps))
+        floor = args.min_lr_ratio
+
+        def lr_scale(step: int) -> float:
+            """Linear warmup, then cosine decay to ``floor`` of the base lr."""
+            if step < warmup_steps:
+                return (step + 1) / warmup_steps
+            progress = min(1.0, (step - warmup_steps) / max(1, total_steps - warmup_steps))
+            return floor + (1.0 - floor) * 0.5 * (1.0 + math.cos(math.pi * progress))
+
+        scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_scale)
+
     if ddp_utils.is_main():
         args.output.mkdir(parents=True, exist_ok=True)
         (args.output / "config.json").write_text(
@@ -459,16 +519,24 @@ def main() -> None:
         print(f"data: {args.data}")
         print(f"train_set_rows: {len(train_set)}")
         print(f"dev_set_rows: {len(dev_set)}")
+        if scheduler is None:
+            print(f"lr_schedule: none (flat lr {args.lr:g})")
+        else:
+            print(f"lr_schedule: cosine  warmup_steps: {warmup_steps}  total_steps: {total_steps}  "
+                  f"min_lr_ratio: {args.min_lr_ratio:g} (lr floor {args.lr * args.min_lr_ratio:g})")
+        print(f"loss_ema: {args.loss_ema:g}")
 
     effective_cache = None if args.augment or args.augment_mel else args.hidden_cache
     if (args.augment or args.augment_mel) and args.hidden_cache and ddp_utils.is_main():
         print("augmentation enabled: disabling hidden-cache so each epoch gets fresh augmentation")
+    loss_ema = None
     for epoch in range(1, args.epochs + 1):
-        train_loss = run_epoch(args, encoder, projector, lm, tokenizer, train_loader, device, optimizer,
-                               cache_dir=effective_cache, sampler=train_sampler, epoch=epoch)
+        train_loss, loss_ema = run_epoch(args, encoder, projector, lm, tokenizer, train_loader, device, optimizer,
+                                         cache_dir=effective_cache, sampler=train_sampler, epoch=epoch,
+                                         scheduler=scheduler, loss_ema=loss_ema)
         with torch.no_grad():
-            dev_loss = run_epoch(args, encoder, projector, lm, tokenizer, dev_loader, device,
-                                 cache_dir=args.hidden_cache)
+            dev_loss, _ = run_epoch(args, encoder, projector, lm, tokenizer, dev_loader, device,
+                                    cache_dir=args.hidden_cache)
         if ddp_utils.is_main():
             torch.save({"projector": ddp_utils.unwrap(projector).state_dict(), "epoch": epoch, "llm_hidden_size": llm_dim}, args.output / f"projector_epoch_{epoch:03d}.pt")
             with (args.output / "metrics.csv").open("a", newline="", encoding="utf-8") as handle:

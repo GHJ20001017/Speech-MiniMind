@@ -2,7 +2,7 @@
 
 The stage-2 corpus (from the ModelScope dataset) mixes sources whose native
 rates differ (AISHELL=16kHz, moss_speech_qa TTS=24kHz, voiceassistant400k=22050Hz).
-``train_speech_minimind.py`` enforces 16kHz input, so this script rewrites the
+``train_speech_qwen3.py`` enforces 16kHz input, so this script rewrites the
 non-16kHz rows to resampled 16-bit PCM WAV copies under an output audio
 directory and repoints their audio field to the new absolute path (source files
 are left untouched; 16kHz rows are unchanged).

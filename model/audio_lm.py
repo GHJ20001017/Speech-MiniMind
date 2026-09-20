@@ -1,7 +1,7 @@
 """Audio-only LLM plumbing for Route B (discrete codebook, end-to-end).
 
 Route B models speech as a **flat sequence of discrete codebook tokens** using
-the same MiniMind decoder as Route A, so the LM needs three additions:
+the same Qwen3-0.6B decoder as Route A, so the LM needs three additions:
 
 1. an **extended vocabulary** - text tokens stay, audio tokens occupy a
    contiguous block above the text vocab;
@@ -29,15 +29,21 @@ from dataclasses import dataclass, field
 
 import torch
 
-# MiniMind-3 ships an omni-aware tokenizer that already defines these three
-# (ids 14/15/16 in the released checkpoint).  Reusing its names keeps our token
-# ids identical to MiniMind-O's, so codes read from its public ``sft_a2a`` set
-# mean the same thing on both sides.  A plain text tokenizer gets them appended
-# by :func:`register_audio_special_tokens` instead.
-AUDIO_BOS = "<|audio_start|>"
-AUDIO_EOS = "<|audio_end|>"
-AUDIO_PAD = "<|audio_pad|>"
-AUDIO_SPECIAL_TOKENS = (AUDIO_BOS, AUDIO_EOS, AUDIO_PAD)
+from model.chat_format import (
+    AUDIO_END as AUDIO_EOS,
+    AUDIO_PAD,
+    AUDIO_SPECIAL_TOKENS,
+    AUDIO_START as AUDIO_BOS,
+    ensure_audio_tokens,
+)
+
+# The marker strings are defined once in :mod:`model.chat_format` and re-exported
+# here under the Route-B names downstream call sites already import.  Qwen3-0.6B's
+# released tokenizer does *not* define them (it spells ``<|audio_start|>`` out as
+# six unrelated byte tokens), so :func:`register_audio_special_tokens` appends
+# them above the text vocab - at ids 151669/151670/151671 on Qwen3-0.6B, still
+# inside the 151936 embedding rows.  Reusing MiniMind-O's names keeps our audio
+# codes readable against its public ``sft_a2a`` set.
 
 @dataclass
 class AudioVocabSpec:
@@ -45,8 +51,10 @@ class AudioVocabSpec:
 
     ``audio_offset`` is the first audio-token id; codebook ``q`` owns the slice
     ``[audio_offset + q*codebook_size, audio_offset + (q+1)*codebook_size)``.
-    The three special tokens may sit below ``audio_offset`` (MiniMind-3 ships
-    them at ids 14/15/16) rather than after the last codebook.
+    On Qwen3-0.6B the three audio special tokens are *appended* to the released
+    text vocab (ids 151669/151670/151671), so they sit inside the text block,
+    below ``audio_offset = len(tokenizer) = 151672``, and the audio block starts
+    right above them.
     """
 
     text_vocab_size: int
@@ -63,11 +71,12 @@ class AudioVocabSpec:
 
     @property
     def total_vocab_size(self) -> int:
-        """Embedding rows needed.
+        """Embedding rows needed: the audio block, and at least the special tokens.
 
-        The special tokens may live *below* ``audio_offset`` (MiniMind-3 already
-        ships them) or be appended above the codebooks (plain text tokenizer), so
-        take the max of both layouts.
+        On Qwen3-0.6B the markers are appended to the text vocab, so they are
+        already covered by ``audio_offset`` and the audio block alone decides the
+        row count; the ``max`` keeps the invariant true for any layout where a
+        marker id could land after the block.
         """
         special_span = max(self.audio_bos_id, self.audio_eos_id, self.audio_pad_id) + 1
         return max(self.audio_offset + self.audio_vocab_size, special_span)
@@ -90,6 +99,20 @@ class AudioVocabSpec:
         return self.audio_offset <= token_id < self.audio_offset + self.audio_vocab_size
 
 
+def register_audio_special_tokens(tokenizer) -> None:
+    """Make sure the three audio special tokens exist in the tokenizer.
+
+    Qwen3-0.6B's released tokenizer does *not* ship them, so this appends
+    ``<|audio_start|>`` / ``<|audio_end|>`` / ``<|audio_pad|>`` above the text
+    vocab - on Qwen3-0.6B at ids 151669/151670/151671, still inside the 151936
+    embedding rows, so the markers alone never force a resize.  A tokenizer saved
+    by one of our own fine-tuned checkpoints already carries them, in which case
+    nothing is appended.  Delegates to :func:`model.chat_format.ensure_audio_tokens`,
+    the single definition of the markers shared with Route A.
+    """
+    ensure_audio_tokens(tokenizer)
+
+
 def build_vocab_spec(
     tokenizer,
     codebook_size: int,
@@ -97,47 +120,21 @@ def build_vocab_spec(
 ) -> AudioVocabSpec:
     """Reserve the audio block directly above the tokenizer's text vocabulary.
 
-    ``register_audio_special_tokens`` must run first: it either reuses the three
-    tokens the tokenizer already ships (MiniMind-3: ids 14/15/16) or appends them,
-    so ``len(tokenizer)`` is the final text size and the audio block starts right
-    after it.
+    Registers the markers through :func:`model.chat_format.ensure_audio_tokens`
+    (the same path Route A uses), so ``len(tokenizer)`` is the final text size -
+    151672 on Qwen3-0.6B - and the audio block starts right above it.
     """
+    ids, _ = ensure_audio_tokens(tokenizer)
     text_vocab_size = len(tokenizer)
-    audio_offset = text_vocab_size
-    audio_bos_id = tokenizer.convert_tokens_to_ids(AUDIO_BOS)
-    audio_eos_id = tokenizer.convert_tokens_to_ids(AUDIO_EOS)
-    audio_pad_id = tokenizer.convert_tokens_to_ids(AUDIO_PAD)
-    for name, token_id in ((AUDIO_BOS, audio_bos_id), (AUDIO_EOS, audio_eos_id),
-                           (AUDIO_PAD, audio_pad_id)):
-        if token_id is None or token_id < 0:
-            raise RuntimeError(
-                f"audio special token {name} is not registered; "
-                "call register_audio_special_tokens(tokenizer) first"
-            )
     return AudioVocabSpec(
         text_vocab_size=text_vocab_size,
         codebook_size=codebook_size,
         num_codebooks=num_codebooks,
-        audio_offset=audio_offset,
-        audio_bos_id=int(audio_bos_id),
-        audio_eos_id=int(audio_eos_id),
-        audio_pad_id=int(audio_pad_id),
+        audio_offset=text_vocab_size,
+        audio_bos_id=ids[AUDIO_BOS],
+        audio_eos_id=ids[AUDIO_EOS],
+        audio_pad_id=ids[AUDIO_PAD],
     )
-
-
-def register_audio_special_tokens(tokenizer) -> None:
-    """Make sure the three audio special tokens exist in the tokenizer.
-
-    MiniMind-3's tokenizer already defines them (``<|audio_start|>`` = 14,
-    ``<|audio_end|>`` = 15, ``<|audio_pad|>`` = 16), in which case this is a
-    no-op.  A plain text tokenizer gets them appended as additional special
-    tokens, which is why this must run *before* :func:`build_vocab_spec`.
-    """
-    vocab = tokenizer.get_vocab()
-    missing = [token for token in AUDIO_SPECIAL_TOKENS if token not in vocab]
-    if not missing:
-        return
-    tokenizer.add_special_tokens({"additional_special_tokens": missing})
 
 
 def extend_model_vocab(
@@ -148,10 +145,12 @@ def extend_model_vocab(
 ) -> AudioVocabSpec:
     """Resize the LM embeddings/head to fit the audio block and init new rows.
 
-    Text rows keep their pre-trained values; only the newly added rows (audio
-    codes + special tokens) are initialised, with a small normal distribution so
-    the first forward pass does not explode.  Returns the (possibly refreshed)
-    spec.
+    Text rows keep their pre-trained values; only the newly added rows are
+    initialised, with a small normal distribution so the first forward pass does
+    not explode.  On Qwen3-0.6B the audio block starts at ``len(tokenizer)`` =
+    151672, which is *below* the released table's 151936 rows, so its first
+    ``151936 - 151672`` rows keep the checkpoint's unused padding values and only
+    rows ``[151936:]`` get the fresh init.  Returns the (possibly refreshed) spec.
     """
     spec = AudioVocabSpec(
         text_vocab_size=spec.text_vocab_size,
