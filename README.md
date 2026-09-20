@@ -2,10 +2,6 @@
 
 > **项目定位**：Speech-to-Speech。给定一段语音输入，系统要"听懂"并用语音回答。这个仓库把目标拆成两条可独立推进的技术路线，最终殊途同归——让机器能听、能想、能说。
 
-从一段 WAV 开始，亲手构建一个中文 Speech LLM：WAV → FFT → Mel → Tiny Conformer + CTC → Speech Projector → Qwen3-0.6B（非思考模式）。
-
-目标：能看懂、能运行、能修改的整套教学流水线。
-
 ## 两条实现路线
 
 ### 路线 A：通用 LLM 前挂语音编码器 + 后接 TTS（级联式）
@@ -84,13 +80,6 @@ tar -xzf outputs/Tiny_Conformer/processed.tar.gz -C data/aishell1
 # 2) AISHELL-1 原始音频（约 15G，支持断点续传），下载并解压到 data/aishell1/data_aishell/
 python scripts/download_aishell1.py
 ```
-
-主仓库里跟 AISHELL-1 有关的两份数据分工如下（**都只是"整理好的文档"，不含任何音频字节**）：
-
-- **`processed.tar.gz`**：解压后是 `data/aishell1/processed/{train,dev,test}.csv`（表头 `path,text`）与 `vocab.txt`，供第 3/4 节的声学编码器训练与评估使用。CSV 的 `path` 指向 `data/aishell1/data_aishell/wav/...`。
-- **`aishell-1/aishell-1-{train,dev,test}.parquet`**：第 5 节 Projector 用的 stage-1 转写语料，六列（`wav` / `prompt` / `answer` / `source` / `task` / `lang`），`wav` 同样指向 `data/aishell1/data_aishell/wav/...`。
-
-下载后按第 2.2 节的目录布局把数据放到 `data/` 下，训练脚本即从这些路径读取。
 
 #### 2.1 数据集组成
 
@@ -211,8 +200,6 @@ python scripts/visualize_asr_webui.py \
 如果后续要换成开源的成熟声学编码器，**推荐用 FunASR 的 SenseVoice-Small**。它是离线非自回归模型，适合批量提取帧级 encoder hidden states。首次使用时安装依赖并下载模型：
 
 ```bash
-python -m pip install funasr modelscope
-
 # 默认可由 FunASR 自动下载；也可提前下载到本地目录
 python -c "from modelscope.hub.snapshot_download import snapshot_download; snapshot_download('iic/SenseVoiceSmall', local_dir='outputs/sensevoice-small')"
 ```
@@ -232,19 +219,11 @@ CUDA_VISIBLE_DEVICES=0,1,2,3 torchrun --nproc_per_node=4 trainer/train_speech_pr
   --wandb --wandb-name projector_qwen3_sensevoice
 ```
 
-语音两侧的 `<|audio_start|>` / `<|audio_end|>` 在 Qwen3 的 tokenizer 里**并不存在**——直接 tokenize 会被拆成 6 个互不相关的字节 token，因此由 `model/chat_format.py` 追加为 added special token：在 Qwen3-0.6B 上落在 151669/151670/151671，仍在 embedding 表的 151936 行之内，**无需扩表**。路线 B（`model/audio_lm.py`）复用同一对，两条路线对「音频在此」的信号因此一致。无论用哪个编码器后端，都冻结编码器和 Qwen3，只训练约 2.4M 参数的 `SpeechProjector`（输出维度对齐 Qwen3-0.6B 的 1024）。
-
-> Qwen3-0.6B 的 hidden size 是 **1024**，而 MiniMind-3 是 768，两者的 projector 形状不同：**旧的 `projector_epoch_*.pt` 不能复用**，必须按本节重训。同理，此前用 MiniMind 训出的 03/04 章 checkpoint 与新的 Qwen3 backbone 不兼容。
-
 训练过程（AISHELL-1，约 9.5k step）的 loss 曲线：
 
 | train/loss_step | dev/loss |
 |---|---|
 | ![语音投影器训练 loss](assets/03_speech_projector_train_loss.png) | ![语音投影器 dev loss](assets/03_speech_projector_dev_loss.png) |
-
-train loss 从约 8.5 收敛到约 0.5；dev loss 从约 0.96 稳定下降到约 0.64。
-
-> 每步记三个 key：`train/loss_step` 是**所有 rank** 的 batch 上的跨卡、按监督 token 加权平均（不是 rank 0 的 `--batch-size` 条），`train/loss_ema` 用 `--loss-ema`（默认 0.02）在它之上做指数平滑，`train/lr` 是当前学习率。学习率默认走 `--lr-schedule cosine`：前 `--warmup-ratio`（默认 0.03）线性 warmup，之后 cosine 衰减到 `--min-lr-ratio`（默认 0.1）倍（`1e-4 → 1e-5`）；`--lr-schedule none` 还原恒定 lr。这三个 key 与路线 A 第 8 节、路线 B 的 B0/B1 两个 trainer 完全一致（都在 `main` 里按**全部训练步数**算 warmup 长度）。
 
 ### 6. 统一 stage 2 音频采样率（`resample_stage2_mixed.py`）
 
@@ -276,8 +255,6 @@ CUDA_VISIBLE_DEVICES=0,1,2,3 torchrun --nproc_per_node=4 trainer/train_speech_qw
   --wandb --wandb-name speech_qwen3_sft
 ```
 
-> 命令假定 `speech-llm` 环境已激活（否则 `torchrun` 会落到 anaconda 的 python 上、报 `ModuleNotFoundError: No module named 'funasr'`）；未激活时把 `torchrun` 换成 `/gpu3/guhj/envs/speech-llm/bin/python -m torch.distributed.run` 即可。
-
 训练过程（stage 2 中文切分 91,490 行，4 卡约 5.7k step/epoch）的 loss 曲线：
 
 | train/loss_step（跨卡平均） | dev/loss |
@@ -286,24 +263,7 @@ CUDA_VISIBLE_DEVICES=0,1,2,3 torchrun --nproc_per_node=4 trainer/train_speech_qw
 
 train loss 从约 8 收敛到约 0.85；dev loss 稳定下降到约 0.58。
 
-每步会记三个 key：`train/loss_step` 是**所有 rank** 的 batch 上的跨卡平均（4 卡 × `--batch-size 4` 即 16 条样本，而不是 rank 0 的 4 条），`train/loss_ema` 用 `--loss-ema`（默认 0.02，半衰期约 35 步、等效窗口约 50 步）在它之上做指数平滑，`train/lr` 是当前学习率。**看趋势只看 `train/loss_ema`**：单批样本自身的 loss 波动很大——stage 2 语料逐条约 2.2~9.8，且与答案长度强反相关（8~40 字的短答案 6.8~9.8，185~396 字的长答案 2.2~3.9）；按 σ≈1.42 推算，4 条一批的均值标准差约 0.7、16 条约 0.36。所以几百步内均值横走通常只是监控噪声，只有平滑后仍然横走/上扬，或 grad norm 飙升、出现 NaN，才需要停下来看。
-
-学习率默认走 `--lr-schedule cosine`：前 `--warmup-ratio`（默认 0.03）线性 warmup，之后 cosine 衰减到 `--min-lr-ratio`（默认 0.1）倍，两个参数组按同一比例缩放（`--lr 2e-5`、`--projector-lr 5e-5` → 最终 2e-6 / 5e-6）。warmup 长度按**全部训练步数**（`--epochs` × 每 epoch 步数）算：4 卡 × `--batch-size 4` × 2 epoch ≈ 11.4k 步 → warmup 约 343 步。要还原恒定 lr 就用 `--lr-schedule none`。
-
 ### 9. 评估与测试指令微调模型（离线指标 / 推理 / WebUI）
-
-第 8 节只记录 `dev_loss`，它衡量文本 token 的 teacher-forcing 交叉熵，**不能替代生成质量评估**。例如同一批音频里既有短问答也有长解释，平均 loss 会把「回答准确」和「内容失配」混成一个数。
-
-另外注意，第 8 节用固定系统提示词「你是一个语音助手，根据用户的音频内容回答用户的问题」训练，**推理与评测必须使用同一个提示词**（`infer_speech_qwen3.py` / `evaluate_speech_qwen3.py` 的默认值即为此），否则 prompt 与训练不一致，生成质量会明显下降。
-
-第 8 节还会在 `--tune-projector` 时把 Projector 与 LLM 一起微调。因此推理时必须使用同一阶段的 projector：`outputs/04_speech_qwen3_sft/projector_epoch_XXX.pt`，而不是旧的 `outputs/03_speech_qwen3_projector/projector_epoch_005.pt`。混用阶段会让转写也明显变差。
-
-仓库提供三个入口：离线评测（`evaluate_speech_qwen3.py`）、单条 CLI 推理（`infer_speech_qwen3.py`）和网页互动平台（`visualize_speech_qwen3_webui.py`）。三者复用同一套推理管线：
-
-```text
-WAV ──▶ frozen 声学编码器(sensevoice/conformer/paraformer) ──▶ SpeechProjector(冻结)
-        ──▶ 语音前缀 embeddings ⊕ 指令文本 tokens ──▶ Qwen3-0.6B(微调后) ──▶ 回答文本
-```
 
 #### 问答示例
 
@@ -312,34 +272,6 @@ WAV ──▶ frozen 声学编码器(sensevoice/conformer/paraformer) ──▶ 
 | 1 | 简述商业秘密的构成要件 | “商业秘密的构成要件包括：(1)权利主体是自然人或法人。(2)权利客体是商业秘密。(3)权利内容是商业秘密的保密性。(4)权利内容具有排他性。(5)权利内容具有独占性。(6)权利内容具有时间上的限制性。(7)权利内容具有排他性。” |
 | 2 | 好莱坞选择东方文化背景时，为什么更偏重日本？ | “因为日本的建筑风格和中国建筑风格不一样，所以中国建筑风格的元素在日式建筑中会显得更加突出。” |
 | 3 | “目不知书”的含义是什么？ | “指不识字。 成语出处：无” |
-
-#### 离线生成评估
-
-`evaluate_speech_qwen3.py` 逐条生成答案，并按 `source / task / lang` 分层输出 exact match 与字符级（中文）或词级（英文）错误率。它读的是 stage 2 的行（`wav` + `answer`；每行没有 `instruction` 时自动回落到固定系统提示词），先用小型分层抽样确认配置，再跑到完整 dev：
-
-```bash
-# 全量 val split（生成式评估较慢；确认配置后再跑）
-python scripts/evaluate_speech_qwen3.py \
-  --data data/speech2text_corpus/splits/val.jsonl \
-  --encoder-type sensevoice --sensevoice-model outputs/sensevoice-small \
-  --projector-checkpoint outputs/04_speech_qwen3_sft/projector_epoch_003.pt \
-  --qwen3-model outputs/04_speech_qwen3_sft/model_epoch_003 \
-  --output outputs/04_speech_qwen3_sft/eval_stage2_full
-```
-
-输出 `predictions.csv`（逐条音频/提示词/参考/生成/错误率）、`group_metrics.csv`（按来源、任务、语言）和 `report.json`（总指标与配置）。别只看总错误率：长答案问答会淹没短问答的错误；至少要同时看 `moss_speech_qa`、`coig_*` / `firefly_*`、`voiceassistant_400k` 几组。
-
-#### CLI 推理
-
-```bash
-# full 全参微调模型 + SenseVoice 前端；projector 必须来自 04 阶段
-python scripts/infer_speech_qwen3.py \
-  --audio path/to/utterance.wav \
-  --encoder-type sensevoice \
-  --sensevoice-model outputs/sensevoice-small \
-  --projector-checkpoint outputs/04_speech_qwen3_sft/projector_epoch_003.pt \
-  --qwen3-model outputs/04_speech_qwen3_sft/model_epoch_003
-```
 
 #### WebUI 互动平台（FastAPI + WebSocket，双模式）
 
@@ -361,8 +293,6 @@ python scripts/visualize_speech_qwen3_webui.py \
 实际运行效果（上传一段语音，模型转写为中文文本）：
 
 ![Speech-MiniMind WebUI 互动平台演示](assets/04_speech_qwen3_demo.gif)
-
-> 本机（Mac/CPU）只会把 `outputs/` 留空、不做对待训练——测试平台需要真实 checkpoint 与 GPU。把上面命令在**训练过该模型的 GPU 机器**上执行即可，所有权重都从你传入的路径加载，仓库不额外下载任何东西。
 
 ## 路线 B：音频专属 LLM（离散 codebook 端到端）
 
@@ -387,16 +317,6 @@ WAV ──► 冻结 codec 编码器 ──► 离散 audio tokens ──► 音
 路线 B 的第一道闸门：冻结 codec 必须能把中文语音编成离散 token 再还原回「人能听懂」的波形，否则后面的音频 LM 训练没有意义。
 
 ```bash
-python scripts/eval_codec_reconstruction.py \
-  --data data/aishell1/processed --split dev --num 20 \
-  --codec-type mimi --device cuda:0 --output outputs/05_route_b_codec_check
-```
-
-输出重建失真 / STOI / PESQ / 往返 ASR CER 到 `outputs/05_route_b_codec_check/`。
-
-`--data` 支持三种输入，中英文与「回答音频域」都能用同一条命令跑：AISHELL 风格目录（读 `{split}.csv` 的 `path`/`text`）、项目 JSONL 清单（读 `audio` + 文本参照，或读 `answer_codes` + `answer_text`）、或直接指定单个清单文件。用 `--asr-language` 指定识别语言，评分单位随之从字符级 CER 切换为词级 WER：
-
-```bash
 # 英文数据集：重建 + 识别质量（WER）
 python scripts/eval_codec_reconstruction.py \
   --data data/voiceassistant400k_50k --split dev --num 20 \
@@ -410,17 +330,6 @@ python scripts/eval_codec_reconstruction.py \
   --output outputs/05_route_b_codec_check_s2s_en
 ```
 
-#### 实测结果（Mimi 8×2048，全量 dev 集）
-
-`--num 0` 表示不抽样、评整个 split。以下为在 95 上用 `--codec-type mimi` 跑完全量 dev 的结果：
-
-| 数据集 | 语言 / 评分单位 | 样本数 | `mel_mae` | 错误率 | `tokens_per_s` |
-|---|---|---|---|---|---|
-| `data/aishell1/processed`（dev） | zh / 字符级 CER | 14,326 | 2.5791 | **0.1498** | 12.6171 |
-| `data/voiceassistant400k_50k`（dev） | en / 词级 WER | 2,500 | **1.8593** | **0.1659** | 12.6545 |
-
-读法：**英文的重建失真更低**（`mel_mae` 1.86 vs 2.58），但中文的识别错误率反而更好（CER 0.150 < WER 0.166）——两者单位不同（字符 vs 词），不能直接比大小，只能各自与自己的阈值比。两边的 `tokens_per_s` 都稳定在 12.6，与 Mimi 的 12.5 Hz 标称帧率吻合，说明编解码长度对齐没有偏差。结论：**冻结 Mimi 8 码本在中英文上都可用，M0 闸门通过，无需切换 codec。**
-
 ### 2. 构建语音到语音数据（05）
 
 优先用 MiniMind-O 已经 token 化好的 `sft_a2a`（`--download` 会从 ModelScope 拉取）：
@@ -431,31 +340,17 @@ python scripts/prepare_speech_to_speech.py --download \
   --output data/route_b/s2s --device cuda:0
 ```
 
-输出 `data/route_b/s2s/{train,dev}.jsonl` + `codes/` 缓存。
-
-> 完整 `sft_a2a.parquet` 有 414024 行 / 5.7 GB，中文占约 34.65% 且偏向文件后段，用 `--limit` 抽小样本时可能一条中文都取不到（统计里会显示 `kept: 0`）；冒烟请用 `--file-name sft_a2a_mini.parquet`，或把 `--limit` 调大。读取按 row group 流式进行。
-
 ### 3. 构建纯音频语料与 token 缓存（05，可选 B0 前置）
 
-B0 只需要「一串串音频」，不需要问答配对。这一步把散落在各数据集里的音频汇总成一份清单，再用冻结 codec **一次性**编码成 `.npy` 离散 token——codec 编码比一次 LLM step 还贵，放进训练循环里每个 epoch 重跑是不可接受的，所以全部离线缓存。
+B0 使用 Emilia 中英文纯音频语料学习 codec token 的分布，不需要问答配对。先准备音频清单，再用冻结 Mimi 离线编码成 `.npy` 离散 token；训练时直接读取缓存，不重复运行 codec。
 
-#### 3.1 纯音频清单
+#### 3.1 Emilia 中英文音频清单
 
-95 上当前 B0 使用 `/gpu3/guhj/data/` 下的 Emilia 中英文音频，已整理到 `data/route_b/audio_lm_emilia/{train,dev,test}.jsonl`。全量保留中文 133,928 条、英文 77,667 条；按元数据时长，中文/英文约为 60.4%/39.6%。每种语言内部按时长近似划分 train/dev/test = 98%/1%/1%，按 `(lang, speaker)` 分组隔离，随机种子为 42。具体统计见该目录的 `metadata.json`。
-
-下面是旧语料的可选整理方式，**不是 Emilia 清单的生成命令**：
-
-```bash
-python scripts/prepare_audio_lm_corpus.py --data-root data --output data/route_b/audio_lm
-```
-
-脚本读取三类已有数据，只取其中的音频路径，输出 `data/route_b/audio_lm/{train,dev}.jsonl`：
-
-| 来源 | 读什么 | 语言 | 采样率 |
-|---|---|---|---|
-| AISHELL-1 | `data/aishell1/processed/{train,dev}.csv` 的 `path` 列 | zh | 16 kHz |
-| moss_speech_qa | `data/moss_speech_qa/{train,dev}.jsonl` 的 `audio`（问题是 Qwen3-TTS 合成音） | zh | 24 kHz |
-| voiceassistant400k_50k | 同上的 `audio`，**默认不引入**，需加 `--include-english` | en | 22.05 kHz |
+| 语料 | 音频条数 |
+|---|---:|
+| Emilia 中文 | 133,928 |
+| Emilia 英文 | 77,667 |
+| 合计 | 211,595 |
 
 #### 3.2 编码成离散 token 缓存（`cache_audio_tokens.py`）
 
@@ -469,19 +364,6 @@ HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 \
   --output data/route_b/audio_lm_emilia_codes \
   --codec-type mimi --codec-model "$MIMI_MODEL" \
   --device cuda:0 --batch-size 16
-```
-
-目录模式只编码 `train.jsonl` 和 `dev.jsonl`，不会编码 `test.jsonl`；这不影响 B0 训练。Mimi 只在编码阶段加载，B0 训练直接读取 token 缓存。
-
-脚本按 manifest 逐条读音频 → 按 batch 送进冻结 Mimi → 每条存一个 `.npy`，并把清单重写成指向缓存的版本：
-
-```text
-data/route_b/audio_lm_emilia_codes/
-├── codes/train/0000000.npy      # 每条音频一个 shard，int16，形状 (Q=8, T)
-├── codes/dev/0000000.npy
-├── train.jsonl                  # 重写后的清单：{"codes": "codes/train/0000000.npy", ...}
-├── dev.jsonl
-└── metadata.json                # codec 类型 / num_codebooks / codebook_size / sr / frame_rate
 ```
 
 ### 4. B0 音频 LM 预训练（05，可选）
@@ -501,19 +383,11 @@ CUDA_VISIBLE_DEVICES=6,7 \
   --wandb --wandb-name route_b_b0_emilia
 ```
 
-运行前需完成上一节的 train/dev 编码，并确认 GPU 6/7 和端口 29521 可用。`--batch-size 8` 尚未在这批 Emilia 音频上验证显存占用；长音频可加 `--grad-checkpointing` 或降低 batch size。新输出目录独立于旧 B0 checkpoint。
-
-> 换成 Qwen3-0.6B 后 text vocab 从 6400 变成 151672、hidden 从 768 变成 1024，因此**旧的 B0 checkpoint（`outputs/05_route_b_audio_lm/model_epoch_003`）与新的 backbone 不兼容**，需要按本节重跑 B0，再进入第 5 节。
-
 历史 B0 训练过程（非本次 Emilia 训练，约 23k step）的 loss 曲线：
 
 | train/loss_step | dev/loss |
 |---|---|
 | ![B0 音频 LM 训练 loss](assets/05_route_b_b0_train_loss.png) | ![B0 音频 LM dev loss](assets/05_route_b_b0_dev_loss.png) |
-
-train loss 从约 8.5 快速降到约 4.5（约 1k step 内），之后缓慢收敛到约 3.6；dev loss 从约 3.88 稳定降到约 3.68。
-
-> 与路线 A 的 03/04 一致：每步记跨卡（按监督 token 加权）的 `train/loss_step`、平滑后的 `train/loss_ema`（`--loss-ema` 默认 0.02）和 `train/lr`；学习率默认 warmup 3% 后 cosine 衰减到 10%（`2e-4 → 2e-5`），`--lr-schedule none` 可还原恒定 lr；loss 同样走 `model/chunked_loss.py`（显存说明见下一节，长音频 batch 可加 `--grad-checkpointing`）。
 
 ### 5. 语音到语音指令微调（06，B1/B2）
 
