@@ -33,8 +33,9 @@ Usage
 
 All weights come from the paths you pass; nothing is downloaded here.
 Open http://<host>:<port> (or https:// with --ssl-auto) in a browser to use it.
-When ``--tts-model`` is supplied, each final Qwen3 answer is normalized,
-synthesized by Qwen3-TTS, and returned as a WAV message for browser playback.
+When ``--tts-model`` is supplied, the answer is normalized and synthesized
+sentence-by-sentence while text generation continues; ordered WAV messages are
+queued for browser playback.
 """
 
 import argparse
@@ -42,6 +43,7 @@ import asyncio
 import base64
 import io
 import json
+import queue
 import re
 import shutil
 import subprocess
@@ -313,6 +315,46 @@ class SpeechEngine:
         return output.getvalue(), int(sample_rate)
 
 
+def split_sentence_chunks(text: str, max_chars: int = 100, final: bool = False) -> tuple[list[str], str]:
+    """Return completed speech chunks and the uncommitted cumulative-text tail.
+
+    Sentence punctuation is preferred; overlong fragments are bounded by
+    ``max_chars``.  ``final`` commits the remaining tail exactly once.
+    """
+    text = text or ""
+    chunks: list[str] = []
+    start = 0
+    punctuation = re.compile(r"[。！？!?；;：:]|[.!?](?=\s|$)")
+    while len(text) - start > max_chars:
+        limit = start + max_chars
+        match = punctuation.search(text, start, limit + 1)
+        if match:
+            end = match.end()
+        else:
+            end = text.rfind(" ", start, limit + 1)
+            if end <= start:
+                end = limit
+        chunk = text[start:end].strip()
+        if chunk:
+            chunks.append(chunk)
+        start = end
+    if final:
+        tail = text[start:].strip()
+        if tail:
+            chunks.append(tail)
+        return chunks, ""
+    # Commit punctuation-terminated sentences even when shorter than max_chars.
+    while start < len(text):
+        match = punctuation.search(text, start)
+        if not match or match.end() > len(text):
+            break
+        chunk = text[start:match.end()].strip()
+        if chunk:
+            chunks.append(chunk)
+        start = match.end()
+    return chunks, text[start:]
+
+
 # --------------------------------------------------------------------------- #
 # Per-connection session state.
 # --------------------------------------------------------------------------- #
@@ -327,6 +369,32 @@ class Session:
         self.mode: str | None = None           # "mic" | "upload" | None
         self.upload_expected = 0
         self.upload_chunks: list[bytes] = []
+        self._runs: set[threading.Event] = set()
+        self._tasks: set[asyncio.Task] = set()
+        self._cancel_queues: set[queue.Queue] = set()
+
+    def _cancel_runs(self) -> None:
+        for run in self._runs:
+            run.set()
+        for q in self._cancel_queues:
+            q.put(None)
+        for task in tuple(self._tasks):
+            task.cancel()
+
+    def _launch_run(self, ws, audio: np.ndarray, mic: bool = False) -> None:
+        self._cancel_runs()
+        task = asyncio.create_task(self._run(ws, audio))
+        self._tasks.add(task)
+        def finished(done: asyncio.Task) -> None:
+            self._tasks.discard(done)
+            try:
+                done.exception()
+            except (asyncio.CancelledError, Exception):
+                pass
+            if mic and self.mode == "mic" and not self._tasks and not done.cancelled():
+                notify = asyncio.create_task(ws.send_json({"type": "status", "value": "listening"}))
+                notify.add_done_callback(lambda t: None if t.cancelled() else t.exception())
+        task.add_done_callback(finished)
 
     def _apply_vad(self, payload: dict) -> None:
         for key in ("start_mult", "stop_mult", "silence_ms", "min_speech_ms"):
@@ -356,6 +424,7 @@ class Session:
             self.vad.reset()
             await ws.send_json({"type": "status", "value": "listening"})
         elif kind == "mic_stop":
+            self._cancel_runs()
             self.mode = None
             self.vad.reset()
             await ws.send_json({"type": "status", "value": "idle"})
@@ -367,6 +436,7 @@ class Session:
                 self.instruction = msg["instruction"].strip()
             await ws.send_json({"type": "info", "message": "开始接收音频…"})
         elif kind == "cancel":
+            self._cancel_runs()
             self.mode = None
             self.upload_chunks = self.upload_chunks[:0]
             self.vad.reset()
@@ -391,8 +461,10 @@ class Session:
                 await ws.send_json({"type": "status", "value": "idle"})
                 return
             await ws.send_json({"type": "audio", "duration": round(audio.size / SAMPLE_RATE, 2)})
-            await self._run(ws, audio)
+            self._launch_run(ws, audio)
         elif self.mode == "mic":
+            if self._tasks:
+                return
             pcm = np.frombuffer(data, dtype="<i2").astype(np.float32) / 32768.0
             for event, audio in self.vad.process(pcm):
                 if event == "start":
@@ -400,49 +472,111 @@ class Session:
                 elif event == "end" and audio is not None and audio.size:
                     await ws.send_json({"type": "audio",
                                         "duration": round(audio.size / SAMPLE_RATE, 2)})
-                    await self._run(ws, audio)
-                    if self.mode == "mic":
-                        await ws.send_json({"type": "status", "value": "listening"})
+                    self._launch_run(ws, audio, mic=True)
 
     async def _run(self, ws, audio: np.ndarray) -> None:
-        """Run one utterance and stream the answer back to the client."""
+        """Stream text and synthesize ordered sentence chunks concurrently."""
         await ws.send_json({"type": "status", "value": "generating"})
         loop = asyncio.get_running_loop()
-        queue: asyncio.Queue = asyncio.Queue()
+        events: asyncio.Queue = asyncio.Queue()
+        tts_queue: queue.Queue = queue.Queue()
+        cancelled = threading.Event()
+        self._runs.add(cancelled)
+        self._cancel_queues.add(tts_queue)
 
-        def worker() -> None:
+        def emit(kind, payload=""):
+            if cancelled.is_set() or loop.is_closed():
+                return
             try:
-                full_text = ""
-                for partial, complete in self.engine.stream(
-                    audio, self.instruction, self.temperature, self.max_new_tokens
-                ):
-                    full_text = complete
-                    loop.call_soon_threadsafe(queue.put_nowait, ("partial", complete))
-                if self.engine.tts_enabled and full_text:
-                    wav_bytes, sample_rate = self.engine.synthesize(full_text)
-                    payload = {
+                loop.call_soon_threadsafe(events.put_nowait, (kind, payload))
+            except RuntimeError:
+                pass
+
+        def tts_worker():
+            try:
+                while True:
+                    item = tts_queue.get()
+                    if item is None:
+                        break
+                    if cancelled.is_set():
+                        continue
+                    try:
+                        wav_bytes, sample_rate = self.engine.synthesize(item)
+                    except Exception as exc:  # keep final text despite one bad chunk
+                        emit("tts_error", str(exc))
+                        continue
+                    emit("speech_audio", {
                         "audio": base64.b64encode(wav_bytes).decode("ascii"),
                         "sample_rate": sample_rate,
-                    }
-                    loop.call_soon_threadsafe(queue.put_nowait, ("speech_audio", payload))
-                loop.call_soon_threadsafe(queue.put_nowait, ("done", ""))
-            except Exception as exc:  # noqa: BLE001
-                loop.call_soon_threadsafe(queue.put_nowait, ("error", str(exc)))
+                    })
+            finally:
+                emit("tts_drained")
 
-        threading.Thread(target=worker, daemon=True).start()
+        def producer():
+            full_text = ""
+            pending = ""
+            seen_text = ""
+            try:
+                for _partial, complete in self.engine.stream(
+                    audio, self.instruction, self.temperature, self.max_new_tokens
+                ):
+                    if cancelled.is_set():
+                        break
+                    full_text = complete or ""
+                    emit("partial", full_text)
+                    if self.engine.tts_enabled:
+                        if full_text.startswith(seen_text):
+                            pending += full_text[len(seen_text):]
+                        else:
+                            pending = full_text
+                        seen_text = full_text
+                        chunks, pending = split_sentence_chunks(pending)
+                        for chunk in chunks:
+                            clean = self.engine._tts_text(chunk)
+                            if clean and not cancelled.is_set():
+                                tts_queue.put(clean)
+                if self.engine.tts_enabled and not cancelled.is_set():
+                    chunks, pending = split_sentence_chunks(pending, final=True)
+                    for chunk in chunks:
+                        clean = self.engine._tts_text(chunk)
+                        if clean and not cancelled.is_set():
+                            tts_queue.put(clean)
+            except Exception as exc:  # final text remains whatever was observed
+                emit("error", str(exc))
+            finally:
+                tts_queue.put(None)
+                emit("producer_done", full_text)
+
+        threading.Thread(target=tts_worker, daemon=True).start()
+        threading.Thread(target=producer, daemon=True).start()
         full = ""
-        while True:
-            kind, payload = await queue.get()
-            if kind == "partial":
-                full = payload
-                await ws.send_json({"type": "partial", "text": payload})
-            elif kind == "speech_audio":
-                await ws.send_json({"type": "speech_audio", **payload})
-            elif kind == "error":
-                await ws.send_json({"type": "error", "message": payload})
-                break
-            else:
-                break
+        producer_done = False
+        tts_done = False
+        try:
+            while not (producer_done and tts_done):
+                kind, payload = await events.get()
+                if kind == "partial":
+                    full = payload
+                    await ws.send_json({"type": "partial", "text": payload})
+                elif kind == "speech_audio":
+                    await ws.send_json({"type": "speech_audio", **payload})
+                elif kind == "tts_error":
+                    await ws.send_json({"type": "tts_error", "message": payload})
+                elif kind == "error":
+                    await ws.send_json({"type": "error", "message": payload})
+                elif kind == "producer_done":
+                    full = payload
+                    producer_done = True
+                elif kind == "tts_drained":
+                    tts_done = True
+        except Exception:
+            cancelled.set()
+            raise
+        finally:
+            cancelled.set()
+            tts_queue.put(None)
+            self._runs.discard(cancelled)
+            self._cancel_queues.discard(tts_queue)
         await ws.send_json({"type": "final", "text": full})
 
 
@@ -508,6 +642,7 @@ PAGE_HTML = r"""<!DOCTYPE html>
     <div class="tab active" data-tab="upload">① 音频上传</div>
     <div class="tab" data-tab="mic">② 麦克风实时</div>
   </div>
+  <div class="row" style="margin-bottom:12px"><button id="speech-enable" class="ghost" hidden>🔊 点击启用语音播放</button></div>
 
   <!-- upload -->
   <div class="panel active" id="panel-upload">
@@ -625,7 +760,8 @@ function connectWS() {
   ws.binaryType = "arraybuffer";
   ws.onopen = () => { wsReady = true; $("ws-state").textContent = "已连接";
                       while (pending.length) ws.send(pending.shift()); };
-  ws.onclose = () => { wsReady = false; $("ws-state").textContent = "已断开，重连中…";
+  ws.onmessage = handleMessage;
+  ws.onclose = () => { wsReady = false; clearSpeechQueue(); $("ws-state").textContent = "已断开，重连中…";
                        setTimeout(connectWS, 1500); };
   ws.onerror = () => { $("ws-state").textContent = "连接错误"; };
 }
@@ -654,6 +790,7 @@ function drawWaveform(canvas, samples, color) {
 $("run-upload").addEventListener("click", async () => {
   const f = $("file").files[0];
   if (!f) { alert("请先选择一个音频文件"); return; }
+  clearSpeechQueue();
   $("run-upload").disabled = true;
   setStatus("up-dot", "generating", "处理中…");
   $("up-answer").innerHTML = '<span class="placeholder">⏳ 正在解码并生成…</span>';
@@ -714,6 +851,7 @@ $("mic-toggle").addEventListener("click", async () => {
 });
 
 async function startMic() {
+  clearSpeechQueue();
   try {
     micStream = await navigator.mediaDevices.getUserMedia({ audio: { channelCount: 1 } });
   } catch (e) { alert("无法访问麦克风：" + e.message + "\n（需 localhost 或 https）"); return; }
@@ -727,7 +865,7 @@ async function startMic() {
   procNode.onaudioprocess = (e) => {
     const input = e.inputBuffer.getChannelData(0);
     drawWaveform($("mic-canvas"), input, "#16a34a");
-    if (!sending) return;
+    if (!sending || speechPlaying) return;
     const res = resampler.process(new Float32Array(input));
     if (!res.length) return;
     if (wsReady) ws.send(floatTo16(res).buffer);
@@ -745,6 +883,7 @@ async function startMic() {
 }
 
 function stopMic() {
+  clearSpeechQueue();
   micOn = false; sending = false;
   wsSend({ type: "mic_stop" });
   if (procNode) { procNode.disconnect(); procNode.onaudioprocess = null; }
@@ -772,20 +911,52 @@ function setStatus(dotId, cls, text) {
   const d = $(dotId); d.className = "dot " + cls;
   $(dotId === "up-dot" ? "up-status" : "mic-status").textContent = text;
 }
-function playSpeechAudio(base64Audio) {
-  const bytes = atob(base64Audio);
+let speechQueue = [], speechPlaying = false, speechBlocked = false, speechGeneration = 0;
+function clearSpeechQueue() {
+  speechGeneration += 1; speechQueue = []; speechPlaying = false; speechBlocked = false;
+  const audio = window.currentSpeechAudio, url = window.currentSpeechUrl;
+  window.currentSpeechAudio = null; window.currentSpeechUrl = null;
+  if (audio) { audio.onended = null; audio.onerror = null; audio.pause(); }
+  if (url) URL.revokeObjectURL(url);
+  $("speech-enable").hidden = true;
+}
+function enqueueSpeechAudio(base64Audio) {
+  speechQueue.push(base64Audio); playNextSpeechAudio();
+}
+function playbackFailed(audio, url, item, generation) {
+  if (generation !== speechGeneration || audio !== window.currentSpeechAudio) return;
+  audio.onended = null; audio.onerror = null;
+  if (url) URL.revokeObjectURL(url);
+  window.currentSpeechAudio = null; window.currentSpeechUrl = null;
+  speechPlaying = false; speechBlocked = true; speechQueue.unshift(item);
+  $("speech-enable").hidden = false;
+}
+function playNextSpeechAudio() {
+  if (speechPlaying || speechBlocked || !speechQueue.length) return;
+  const item = speechQueue.shift(), generation = speechGeneration;
+  const bytes = atob(item);
   const buffer = new Uint8Array(bytes.length);
   for (let i = 0; i < bytes.length; i++) buffer[i] = bytes.charCodeAt(i);
-  if (window.currentSpeechAudio) window.currentSpeechAudio.pause();
-  if (window.currentSpeechUrl) URL.revokeObjectURL(window.currentSpeechUrl);
-  window.currentSpeechUrl = URL.createObjectURL(new Blob([buffer], { type: "audio/wav" }));
-  window.currentSpeechAudio = new Audio(window.currentSpeechUrl);
-  window.currentSpeechAudio.play().catch((e) => console.warn("语音播放被浏览器阻止：", e));
+  const url = URL.createObjectURL(new Blob([buffer], { type: "audio/wav" }));
+  const audio = new Audio(url);
+  window.currentSpeechUrl = url; window.currentSpeechAudio = audio; speechPlaying = true;
+  audio.onended = () => {
+    if (generation !== speechGeneration || audio !== window.currentSpeechAudio) return;
+    audio.onended = null; audio.onerror = null; URL.revokeObjectURL(url);
+    window.currentSpeechAudio = null; window.currentSpeechUrl = null;
+    speechPlaying = false; playNextSpeechAudio();
+  };
+  audio.onerror = () => playbackFailed(audio, url, item, generation);
+  audio.play().catch(() => playbackFailed(audio, url, item, generation));
 }
+$("speech-enable").addEventListener("click", () => {
+  speechBlocked = false; $("speech-enable").hidden = true; playNextSpeechAudio();
+});
 
-ws.onmessage = (ev) => {
+function handleMessage(ev) {
   const m = JSON.parse(ev.data);
   if (m.type === "status") {
+    if (m.value === "generating") clearSpeechQueue();
     const isUpload = m.value === "decoding" || (uploadTarget === "up" && m.value !== "listening");
     if (uploadTarget === "up") {
       if (m.value === "generating") setStatus("up-dot", "generating", "生成中…");
@@ -810,9 +981,13 @@ ws.onmessage = (ev) => {
       $("mic-answer").textContent = m.text || "（空回答）";
     }
   } else if (m.type === "speech_audio") {
-    playSpeechAudio(m.audio);
+    enqueueSpeechAudio(m.audio);
     const target = uploadTarget === "up" ? $("up-answer") : $("mic-answer");
     if (target.textContent) target.textContent += "\n🔊 正在播放语音回答";
+  } else if (m.type === "tts_error") {
+    const target = uploadTarget === "up" ? $("up-answer") : $("mic-answer");
+    const note = document.createElement("div"); note.className = "err";
+    note.textContent = "TTS: " + m.message; target.appendChild(note);
   } else if (m.type === "error") {
     if (uploadTarget === "up") { $("up-answer").innerHTML = '<span class="err">' + m.message + '</span>';
       setStatus("up-dot", "idle", "出错"); $("run-upload").disabled = false; uploadTarget = null; }
@@ -882,6 +1057,11 @@ def build_app(engine: SpeechEngine, vad_kwargs: dict, defaults: dict, host: str,
                 await ws.send_json({"type": "error", "message": str(exc)})
             except Exception:  # noqa: BLE001
                 pass
+        finally:
+            for run in session._runs:
+                run.set()
+            for task in tuple(session._tasks):
+                task.cancel()
 
     return app, uvicorn
 

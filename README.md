@@ -292,6 +292,8 @@ python scripts/visualize_speech_qwen3_webui.py \
 
 实际运行效果（上传一段语音，模型转写为中文文本）：
 
+![Speech-MiniMind 实际运行效果](assets/04_speech_qwen3_result.png)
+
 ![Speech-MiniMind WebUI 互动平台演示](assets/04_speech_qwen3_demo.gif)
 
 ## 路线 B：音频专属 LLM（离散 codebook 端到端）
@@ -352,6 +354,18 @@ B0 使用 Emilia 中英文纯音频语料学习 codec token 的分布，不需�
 | Emilia 英文 | 77,667 |
 | 合计 | 211,595 |
 
+从已解压的 Emilia JSON/MP3 文件构建清单（按语言和 speaker 隔离，按时长近似划分 98%/1%/1%）：
+
+```bash
+python scripts/prepare_emilia_audio_lm.py \
+  --zh-root /gpu3/guhj/data/emilia-zh-200h/extracted \
+  --en-root /gpu3/guhj/data/emilia-en-100h/extracted \
+  --output data/route_b/audio_lm_emilia \
+  --seed 42
+```
+
+输出 `train.jsonl`、`dev.jsonl`、`test.jsonl` 和 `metadata.json`。脚本拒绝覆盖已有输出目录；已有清单可直接用于下一步。重新生成的划分以新 `metadata.json` 为准，不保证与此前临时脚本生成的划分逐条一致。
+
 #### 3.2 编码成离散 token 缓存（`cache_audio_tokens.py`）
 
 将 `MIMI_MODEL` 替换为本地 Mimi 模型目录（包含 `config.json` 和权重），避免默认访问 Hugging Face：
@@ -383,7 +397,7 @@ CUDA_VISIBLE_DEVICES=6,7 \
   --wandb --wandb-name route_b_b0_emilia
 ```
 
-历史 B0 训练过程（非本次 Emilia 训练，约 23k step）的 loss 曲线：
+B0 训练过程的 loss 曲线：
 
 | train/loss_step | dev/loss |
 |---|---|
@@ -403,16 +417,6 @@ CUDA_VISIBLE_DEVICES=6,7 torchrun --nproc_per_node=2 \
   --lr-schedule cosine --warmup-ratio 0.03 --min-lr-ratio 0.1 --loss-ema 0.02 \
   --wandb --wandb-name route_b_s2s
 ```
-
-> 与第 8 节同理：每步记 `train/loss_step`（跨卡、按监督 token 加权的均值，不是 rank 0 的 4 条）、`train/loss_ema` 与 `train/lr`，学习率默认 warmup 3% 后 cosine 衰减到 10%（`1e-4 → 1e-5`）；`--lr-schedule none` 可还原恒定 lr。B1 的数据增强开关是 `--code-dropout`，默认 0（不增强）。`torchrun` 同样需要 `speech-llm` 已激活，否则换成 `/gpu3/guhj/envs/speech-llm/bin/python -m torch.distributed.run`。
-
-> **显存：`--loss-chunk` 与 `--grad-checkpointing`。** 路线 B 的输出词表是 151672（text）+ 8×2048（audio）= **168056 行**，而 `--max-length` 默认由帧上限推出：`(max_prompt_frames + max_answer_frames) × num_codebooks + 16 = (256+256)×8+16 = 4112` token/条，所以 `--batch-size 2` 最多就是 8224 token/卡。实测这份 s2s 清单（323,920 行，前 3000 行统计）的序列长度：p50=2224、p75=2416、p90=2648、p95=2864、p99=3352、最长 4112 token——**批内长度取最长样本**，所以 bs=2 的典型长度在 2400 上下。
->
-> 旧实现一次性把整条序列过 LM head：fp32 下 `(B, L, 168056)` 约 5.2 GiB，加上 `view(-1, vocab)` 触发的 `.contiguous()` 副本、`log_softmax` 的输出及其梯度一共 4 份 ≈ 21 GiB（L=4112、bs=2），是当时单笔最大的可省开销。现在 loss 统一走 `model/chunked_loss.py`：LM head 每次只算 `--loss-chunk`（默认 256）个位置并在反向重算，实测 loss 与梯度与旧路径完全一致（`delta<5e-7`，梯度逐元素最大差 `5e-8`，不同 chunk 大小结果相同），那份 21 GiB 降到几百 MB。同时默认设 `PYTORCH_ALLOC_CONF=expandable_segments:True` 消除碎片（环境里已有该变量则以你的设置为准）。
->
-> 但长序列上 bs=2 的瓶颈**不在 loss 而在 decoder**：fp32 权重下 SDPA 没有 flash kernel（flash-attn 只支持 fp16/bf16），`(B, heads, L, L)` 的注意力分数必须留给反向，按 L² 增长——bs=2 时每层约 2 GiB、28 层约 56 GiB。实测（bs=2、chunked loss、不含 AdamW 状态、A800-80GB）peak allocated：L=1024 → 15.7 GiB、L=2048 → 34.5 GiB、L=3072 → 60.4 GiB、L=4112 → **仍 OOM**（已到 77.6 GiB）；把 math backend 关掉只会 `RuntimeError: Invalid backend`，所以 fp32 下躲不开这一项。因此在默认帧上限（256/256）下 bs=2 必须加 `--grad-checkpointing`（逐层重算；实测 bs=2 × 4112 token 能跑完一个 epoch，5.4 s/step，不加则同一形状 OOM），或把 `--max-prompt-frames/--max-answer-frames` 降到各自 192 以下；只跑典型长度（≤2900 token，覆盖 p99）时 bs=2 不加也能过（实测 4 步 1.96 s/step）。`--grad-checkpointing` 用非重入式 checkpoint（`use_reentrant=False`），与 DDP、chunked loss 都会一并生效。
-
-不跑 B0 时可去掉 `--init-from`，直接用 Qwen3-0.6B 权重冷启动（此时 audio token 行与两个 marker 行都是新初始化的，收敛会更慢）。
 
 ### 6. 端到端推理（06）
 
