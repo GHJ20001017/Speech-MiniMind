@@ -41,7 +41,8 @@ def setup(backend: str = "nccl") -> None:
     """Initialise the process group (no-op when not launched via torchrun)."""
     if not is_distributed():
         return
-    torch.cuda.set_device(local_rank())
+    if backend == "nccl":
+        torch.cuda.set_device(local_rank())
     torch.distributed.init_process_group(backend=backend)
     torch.distributed.barrier()
 
@@ -63,10 +64,11 @@ def wrap(model: torch.nn.Module) -> torch.nn.Module:
     """Wrap the trainable model in DistributedDataParallel (no-op in single mode)."""
     if not is_distributed():
         return model
+    on_cuda = next(model.parameters()).is_cuda
     return torch.nn.parallel.DistributedDataParallel(
         model,
-        device_ids=[local_rank()],
-        output_device=local_rank(),
+        device_ids=[local_rank()] if on_cuda else None,
+        output_device=local_rank() if on_cuda else None,
         broadcast_buffers=False,
         find_unused_parameters=False,
     )
@@ -97,6 +99,7 @@ def all_reduce_mean(value: float) -> float:
     """Average a scalar across all ranks (no-op when not distributed)."""
     if not is_distributed():
         return value
-    tensor = torch.tensor([value], device=torch.cuda.current_device(), dtype=torch.float64)
+    reduce_device = device() if torch.distributed.get_backend() == "nccl" else torch.device("cpu")
+    tensor = torch.tensor([value], device=reduce_device, dtype=torch.float64)
     torch.distributed.all_reduce(tensor, op=torch.distributed.ReduceOp.SUM)
     return tensor.item() / world_size()

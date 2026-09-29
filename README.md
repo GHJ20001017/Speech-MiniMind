@@ -380,28 +380,81 @@ HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 \
   --device cuda:0 --batch-size 16
 ```
 
-### 4. B0 音频 LM 预训练（05，可选）
+### 4. 多任务音频预训练（05）
 
-在纯音频语料上先学 codec token 的分布，再用它初始化第 5 节：
+支持 `tts`、`audio_lm`（audio continuation）和 `s2a`，**每个阶段是一条独立命令**，通过 `--init-checkpoint` 从上一阶段权重热启动。文本使用 Qwen3 Thinker；音频使用独立 Talker，通过投影后的中间 Thinker 状态与 codec 历史融合。8 路 embedding/head 为共享基座加各路低秩 GELU adapter，embedding 按固定 8 路取均值，不与 Thinker 共用 decoder。
+
+音频协议对齐 [MiniMind-O 固定版本](https://github.com/jingyaogong/minimind-o/tree/f900448c608318c53314ebf8a947ab05cd8c038e)：输入/输出词表均为 `2112`，Mimi 原始码仍为 `0..2047`，PAD=`2049`，STOP=`2050`，保留 speaker ID=`2051` 但不实现 speaker conditioning。每路延迟 `q` 步；STOP 既是目标，也反馈到下一步输入，其他不活跃格为 PAD。S2A 首路音频目标位于 assistant 首文字后一位。Thinker 不接收音频，不支持此路线的 ASR、问题音频、参考音色或视觉输入。
+
+- TTS 监督输出音频及 STOP；continuation 只监督后缀音频及 STOP，不监督前缀；S2A 同时监督最后一个 assistant 的文字与音频，输入为 MiniMind-O conversation Parquet。
+- S2A 采样单位对齐 MiniMind-O `omni_dataset.py`（同固定版本）：**一个 conversation 行 = 一个样本**，每次读取随机选一个 assistant 轮（`len(dataset)` 计 conversation 数）。渲染后若 `长度 + 100 >= max_seq_len`，则从选中轮向前逐轮回退，直到装下为止；随后把渲染结果按 `max_seq_len`（默认 `512`，可用 `--max-seq-len` 覆盖）截断并补 PAD 到定长。以 20% 概率在无 system 前缀时插入随机 system prompt（固定 prompt 池），模板自带的空 thinking 块保留 20%。只有最终渲染的随机 system/thinking 决定用于文字与音频监督；回退长度试探与最终渲染各自抽样，与上游一致。文字监督从 assistant header 结束处开始，包含保留的 thinking 块；音频本体起点则在 assistant 内容开头的前 50 个候选位置搜索 `</think>\n\n`，搜索起点不越过 assistant 结束边界，历史中的 marker 不会移动起点；首路音频目标位于本体起点后一位。首轮仍超长时照常截断，即使没有 assistant 目标也保留样本（若整个 batch 都无监督，loss 层仍明确报错，避免空训练）。超长音频按定长窗口截断，STOP 装不下时一并丢弃，不报错。
+- `max_seq_len` 为 S2A 专属对话定长窗口（默认 512），与模型上下文上限（模型配置的 `max_position_embeddings`）是两个不同旋钮；后者对 S2A 仅用于批次上界检查。
+- 上述随机 assistant/system/thinking、截断补 PAD、onset 规则**仅适用于 S2A**；TTS 采样单位、按答案文本切分、无 tokenizer/padding 的语义保持不变。词表 `2112`、loss（文字 CE + 8 路音频 CE 均值，STOP 分子 ×10）与 history noise 行为对所有任务不变。
+- `--history-noise-prob` 默认 `0.05`，仅训练时生效：按**下一位置的监督标签**选择输入时间步；任一路音频有监督时，选中的时间步全部 8 格均匀替换为 `0..2111`（包括原来的 PAD/STOP）。文字用独立随机掩码，在下一位置有文字监督时均匀替换为文字词表 ID，保护已有 image marker；标签不变，验证不加噪。
+- 生成统一使用文字 temperature=`0.75` / top-p=`0.9`（重复惩罚为 1），音频 temperature=`0.2` / top-k=`50`，最后 3 个历史 token 逐次施加符号敏感的重复惩罚 `1.05`，重复出现会重复惩罚。首个 `>=2048` 的音频 token 记录该路停止，但仍继续采样并反馈，直到整体结束或预算上限；只解码各路首个 special 之前的完整公共帧。TTS、S2A teacher/joint 共用此策略，报告记录策略和 seed。请求超过上下文容量直接失败，不静默缩减预算。
+
+- loss 为文字有效 token 的平均 CE，加上 8 路音频各自平均 CE 的均值。音频 stop 位置 CE 乘 10，但分母仍是该路未加权的有效目标数。
+- `--task` 指定本次命令只训练哪一个任务；`--epochs` 是**该阶段**的完整数据遍历轮数。一次更新只累积本阶段的 batch，尾部不足累积步数时按实际 batch 数平均。
+- `--output` 是三个阶段共享的 run root，每个阶段写入自己的 `stage_{NN}_{task}/` 子目录；`--stage-index` 不指定时自动取 run root 中已有的最大阶段号加一（没有则为 1）。
+- `--init-checkpoint` 指向上一阶段的 `model_epoch_XXX` 目录，只加载权重和 tokenizer，**不加载** optimizer、scheduler、epoch 或 RNG 状态：本阶段重新建立 cosine schedule（含 warmup）和 loss EMA。Mimi 的 embedding/head 不会被重新初始化。
+- 第一个阶段用 `--qwen3-model` 从原始文本 Qwen 初始化；一旦 run root 下已有阶段目录，后续命令必须带 `--init-checkpoint`，否则报错退出（不会静默重新初始化音频流）。
+- TTS/audio continuation 默认保留完整音频和全文，不做帧数或文本截断；continuation 在整条录音上切分前后缀，两段合起来覆盖完整录音。batch 按实际最长序列 padding，仅检查模型自身的 `max_position_embeddings` 上限。`--max-frames`、`--max-length` 已弃用，即使传入也会警告并忽略，无需设置。
+- checkpoint 保存到 `stage_01_tts/model_epoch_001` 等分阶段目录。只支持从原始文本 Qwen 或本格式的音频 checkpoint 初始化，不支持旧音频 checkpoint 的自动转换。当前 checkpoint 为 format-v5，严格拒绝 format-v4 及更早版本，不提供兼容开关；新旧词表、反馈与采样协议不兼容，现有旧格式推理入口也不能直接加载新 checkpoint；以下第 5、6 节仍是旧 flat-token 路线。
+
+三条命令保留 `TTS → audio continuation → S2A` 顺序，依次执行并共用 `outputs/05_route_b_multitask_serial_v2_full_length`。执行前确认 GPU 6、7 和端口 29521 可用；重复运行同一阶段前须清理对应目录或换新的 run root / `--stage-index`，不要覆盖已有结果。
 
 ```bash
+cd /gpu3/guhj/Speech-MiniMind
+
+# 阶段 1：TTS，从文本 Qwen 主干起步；run root 需为空或不存在
 CUDA_VISIBLE_DEVICES=6,7 \
 /gpu3/guhj/envs/speech-llm/bin/python -m torch.distributed.run \
   --nproc_per_node=2 --master-port=29521 \
-  trainer/train_audio_lm_pretrain.py \
-  --data data/route_b/audio_lm_emilia_codes \
+  trainer/train_audio_multitask.py \
+  --data data/route_b/audio_lm_emilia_codes_24k \
   --qwen3-model /gpu3/guhj/models/Qwen3-0.6B \
-  --output outputs/05_route_b_audio_lm_emilia \
-  --epochs 3 --batch-size 8 \
-  --tune full --num-workers 4 \
-  --wandb --wandb-name route_b_b0_emilia
+  --output outputs/05_route_b_multitask_serial_v2_full_length \
+  --task tts \
+  --epochs 3 --batch-size 2 --grad-accum-steps 3 \
+  --lr 2e-5 --audio-lr 2e-4 \
+  --lr-schedule cosine --warmup-ratio 0.03 --min-lr-ratio 0.1 --loss-ema 0.02 \
+  --num-workers 4 --loss-chunk 256 \
+  --wandb --wandb-project Speech-MiniMind --wandb-name route_b_multitask_tts
+
+# 阶段 2：audio continuation，从阶段 1 最后一个 epoch 的权重热启动
+CUDA_VISIBLE_DEVICES=6,7 \
+/gpu3/guhj/envs/speech-llm/bin/python -m torch.distributed.run \
+  --nproc_per_node=2 --master-port=29521 \
+  trainer/train_audio_multitask.py \
+  --data data/route_b/audio_lm_emilia_codes_24k \
+  --init-checkpoint outputs/05_route_b_multitask_serial_v2_full_length/stage_01_tts/model_epoch_003 \
+  --output outputs/05_route_b_multitask_serial_v2_full_length \
+  --task audio_lm \
+  --epochs 3 --batch-size 2 --grad-accum-steps 3 \
+  --lr 2e-5 --audio-lr 2e-4 \
+  --lr-schedule cosine --warmup-ratio 0.03 --min-lr-ratio 0.1 --loss-ema 0.02 \
+  --num-workers 4 --loss-chunk 256 \
+  --wandb --wandb-project Speech-MiniMind --wandb-name route_b_multitask_audio_lm
+
+# 阶段 3：S2A（将 Parquet 路径替换为实际文件），从阶段 2 最后一个 epoch 的权重热启动
+CUDA_VISIBLE_DEVICES=6,7 \
+/gpu3/guhj/envs/speech-llm/bin/python -m torch.distributed.run \
+  --nproc_per_node=2 --master-port=29521 \
+  trainer/train_audio_multitask.py \
+  --data data/sft_a2a.parquet \
+  --init-checkpoint outputs/05_route_b_multitask_serial_v2_full_length/stage_02_audio_lm/model_epoch_003 \
+  --output outputs/05_route_b_multitask_serial_v2_full_length \
+  --task s2a \
+  --epochs 3 --batch-size 2 --grad-accum-steps 3 \
+  --lr 2e-5 --audio-lr 2e-4 \
+  --lr-schedule cosine --warmup-ratio 0.03 --min-lr-ratio 0.1 --loss-ema 0.02 \
+  --num-workers 4 --loss-chunk 256 \
+  --wandb --wandb-project Speech-MiniMind --wandb-name route_b_multitask_s2a
 ```
 
-B0 训练过程的 loss 曲线：
+完整长样本的显存需求尚未做 GPU 实测，示例先保留 `--batch-size 2 --grad-accum-steps 3`。若显存不足，可改为 `--batch-size 1 --grad-accum-steps 6`，双卡完整累积窗口仍为每次更新 12 条样本，但不保证与原配置数值等价；若单条样本仍无法容纳，需要进一步处理显存问题，不能通过恢复截断来规避。`--loss-chunk 256` 只控制 loss/head 分块，不限制输入长度，也不能消除主干的长序列显存开销。
 
-| train/loss_step | dev/loss |
-|---|---|
-| ![B0 音频 LM 训练 loss](assets/05_route_b_b0_train_loss.png) | ![B0 音频 LM dev loss](assets/05_route_b_b0_dev_loss.png) |
+该训练不再使用 `audio_offset + codebook * 2048 + code` 的全局音频 token ID；Mimi code 保持 `0..2047` 的局部编号，并按照所属 codebook 路由到对应的 embedding 和输出 head。
 
 ### 5. 语音到语音指令微调（06，B1/B2）
 
