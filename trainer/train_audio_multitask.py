@@ -1,10 +1,10 @@
-"""Qwen3 text-only Thinker and independent four-layer Mimi Talker training.
+"""S2A-only training with a Qwen3 text-only Thinker and independent Mimi Talker.
 
-S2A jointly supervises assistant text and delayed audio; TTS and audio continuation
-use the same dual-decoder architecture. Audio never enters the Thinker. ASR is
-not supported by this text-conditioned architecture. Each command creates a new
-stage; --init-checkpoint warm-starts only format-v5 weights and tokenizer, not
-optimizer/scheduler state. Shared-backbone checkpoints are rejected.
+S2A jointly supervises assistant text and delayed audio. Audio never enters the
+Thinker. Start directly from original Qwen3 weights, or optionally warm-start
+format-v5 weights and tokenizer via --init-checkpoint; optimizer/scheduler state
+is reset. No historical TTS stage is required. Shared-backbone checkpoints are
+rejected. General batch and checkpoint helpers remain available for inference.
 """
 
 from __future__ import annotations
@@ -43,7 +43,7 @@ from model.qwen3_talker import (Qwen3ThinkerTalker, AUDIO_STOP_ID, AUDIO_PAD_ID,
                                  AUDIO_SPEAKER_ID, AUDIO_INPUT_VOCAB_SIZE,
                                  AUDIO_OUTPUT_VOCAB_SIZE)
 
-TASKS = ("tts", "audio_lm", "s2a")
+TASKS = ("s2a",)
 S2A_SEMANTICS = {
     "conditioning": "full_prior_text_chat; no_question_audio_or_speaker_conditioning",
     "supervision": "last_assistant_text_including_template_terminator_and_audio_only",
@@ -217,7 +217,8 @@ def _head_logits(head, hidden):
     return head(hidden)
 
 
-def multitask_loss(model, hidden, text_targets, audio_targets, chunk_size, *, audio_hidden):
+def multitask_loss(model, hidden, text_targets, audio_targets, chunk_size, *, audio_hidden,
+                   return_components=False):
     """Text mean CE + mean of eight codebook means; stop has numerator weight 10."""
     h = hidden[:, :-1].reshape(-1, hidden.size(-1))
     if audio_hidden.shape != hidden.shape:
@@ -230,16 +231,21 @@ def multitask_loss(model, hidden, text_targets, audio_targets, chunk_size, *, au
     if not text_count + audio_count:
         raise ValueError("batch has no next-token supervision")
     total = torch.zeros((), device=hidden.device, dtype=torch.float32)
+    text_loss = torch.zeros_like(total)
+    audio_loss = torch.zeros_like(total)
     chunk = max(1, h.size(0)) if chunk_size <= 0 else chunk_size
     if text_count:
         selected = text != -100
         hs, targets = h[selected], text[selected]
         text_head = lm_head_module(model.thinker)
         for start in range(0, text_count, chunk):
-            total = total + F.cross_entropy(
+            component = F.cross_entropy(
                 _head_logits(text_head, hs[start:start + chunk]),
                 targets[start:start + chunk], reduction="sum",
             ) / text_count
+            total = total + component
+            if return_components:
+                text_loss = text_loss + component.detach()
     for codebook, head in enumerate(model.audio_streams.heads):
         selected = audio[:, codebook] != -1
         count = int(selected.sum())
@@ -249,12 +255,17 @@ def multitask_loss(model, hidden, text_targets, audio_targets, chunk_size, *, au
                 labels = targets[start:start + chunk]
                 ce = F.cross_entropy(_head_logits(head, hs[start:start + chunk]), labels, reduction="none")
                 weights = torch.where(labels == AUDIO_STOP_ID, AUDIO_STOP_WEIGHT, 1.0)
-                total = total + (ce * weights).sum() / count / NUM_CODEBOOKS
+                component = (ce * weights).sum() / count / NUM_CODEBOOKS
+                total = total + component
+                if return_components:
+                    audio_loss = audio_loss + component.detach()
         else:
             # Keep unused audio heads in the graph without adding supervision.
             for start in range(0, h.size(0), chunk):
                 logits = _head_logits(head, ah[start:start + chunk])
                 total = total + (logits * 0.0).sum()
+    if return_components:
+        return total, text_count + audio_count, {"text_loss": text_loss, "audio_loss": audio_loss}
     return total, text_count + audio_count
 
 
@@ -305,7 +316,8 @@ class MultitaskForward(torch.nn.Module):
         self.text_vocab_size = text_vocab_size
         self.image_token_id = image_token_id
 
-    def forward(self, inputs, text_targets, audio_targets, audio_inputs, attention):
+    def forward(self, inputs, text_targets, audio_targets, audio_inputs, attention, *,
+                return_components=False):
         if self.training and self.history_noise_prob:
             audio_inputs = perturb_audio_history(audio_inputs, audio_targets, self.history_noise_prob)
             if (text_targets[:, 1:] != -100).any():
@@ -314,7 +326,8 @@ class MultitaskForward(torch.nn.Module):
                                               self.image_token_id)
         streams = self.backbone.forward_streams(inputs, audio_inputs, attention_mask=attention)
         return multitask_loss(self.backbone, streams.text_hidden, text_targets, audio_targets,
-                              self.chunk_size, audio_hidden=streams.audio_hidden)
+                              self.chunk_size, audio_hidden=streams.audio_hidden,
+                              return_components=return_components)
 
 
 def make_loader(dataset, batch_size, device, train, sampler, num_workers):
@@ -323,18 +336,29 @@ def make_loader(dataset, batch_size, device, train, sampler, num_workers):
                       persistent_workers=False)
 
 
-def run_epoch(args, model, tokenizer, spec, loaders, device, optimizer=None, scheduler=None, epoch=0, loss_ema=None):
+def run_epoch(args, model, tokenizer, spec, loaders, device, optimizer=None, scheduler=None,
+              epoch=0, loss_ema=None, *, return_components=False):
+    """Optionally return (joint mean, EMA mapping, component means).
+
+    All metrics use equal microbatch means, then equal rank means, just like
+    the joint loss. EMA advances once per optimizer update, including the tail.
+    The default API retains the original scalar EMA and two-value result.
+    """
     training = optimizer is not None
     model.train(training)
     if len(loaders) != 1:
-        raise ValueError("run_epoch requires exactly one serial task stage")
+        raise ValueError("run_epoch requires exactly one task loader")
     task, loader = next(iter(loaders.items()))
     loader.dataset.set_epoch(epoch)
     ddp_utils.set_epoch(loader.sampler if hasattr(loader.sampler, "set_epoch") else None, epoch)
     steps = len(loader)
     if not steps:
         raise ValueError(f"{task} loader is empty")
-    total_loss = window_loss = 0.0
+    names = ("joint_loss", "text_loss", "audio_loss") if return_components else ("joint_loss",)
+    totals = dict.fromkeys(names, 0.0)
+    window = dict.fromkeys(names, 0.0)
+    emas = ({name: (loss_ema or {}).get(name) for name in names}
+            if return_components else {"joint_loss": loss_ema})
     accum = 0
     if training:
         optimizer.zero_grad(set_to_none=True)
@@ -342,9 +366,18 @@ def run_epoch(args, model, tokenizer, spec, loaders, device, optimizer=None, sch
         batch = tuple(tensor.to(device) for tensor in
                       build_multitask_batch(tokenizer, spec, samples, args.max_length))
         with torch.set_grad_enabled(training):
-            loss, _ = model(*batch)
+            if return_components:
+                loss, _, components = model(*batch, return_components=True)
+                values = {name: components[name].detach().item() for name in names[1:]}
+            else:
+                loss, _ = model(*batch)
+                values = {}
+            values["joint_loss"] = loss.detach().item()
+            for name in names:
+                totals[name] += values[name]
             if training:
-                window_loss += loss.detach().item()
+                for name in names:
+                    window[name] += values[name]
                 (loss / args.grad_accum_steps).backward()
                 accum += 1
                 if accum == args.grad_accum_steps or step == steps - 1:
@@ -356,24 +389,50 @@ def run_epoch(args, model, tokenizer, spec, loaders, device, optimizer=None, sch
                     torch.nn.utils.clip_grad_norm_([p for p in model.parameters() if p.requires_grad], args.grad_clip)
                     optimizer.step()
                     if scheduler is not None: scheduler.step()
-                    step_loss = ddp_utils.all_reduce_mean(window_loss / accum)
+                    # Every rank participates, regardless of W&B/main-rank status.
+                    means = {name: ddp_utils.all_reduce_mean(window[name] / accum) for name in names}
                     if args.loss_ema > 0:
-                        loss_ema = step_loss if loss_ema is None else (1.0 - args.loss_ema) * loss_ema + args.loss_ema * step_loss
+                        for name in names:
+                            emas[name] = (means[name] if emas[name] is None else
+                                          (1.0 - args.loss_ema) * emas[name] + args.loss_ema * means[name])
                     if args.wandb and ddp_utils.is_main():
                         loss_name = "joint_loss" if task == "s2a" else "audio_loss"
-                        wandb.log({
-                            f"train/{task}/{loss_name}_step": step_loss,
-                            f"train/{task}/{loss_name}_ema": loss_ema,
+                        metrics = {
+                            f"train/{task}/{loss_name}_step": means["joint_loss"],
+                            f"train/{task}/{loss_name}_ema": emas["joint_loss"],
                             "train/lr_backbone": optimizer.param_groups[0]["lr"],
                             "train/lr_audio": optimizer.param_groups[1]["lr"],
                             "task": task,
                             "epoch": epoch,
-                        })
+                        }
+                        if return_components and task == "s2a":
+                            for name in names[1:]:
+                                metrics[f"train/{task}/{name}_step"] = means[name]
+                                metrics[f"train/{task}/{name}_ema"] = emas[name]
+                        wandb.log(metrics)
                     optimizer.zero_grad(set_to_none=True)
                     accum = 0
-                    window_loss = 0.0
-        total_loss += loss.detach().item()
-    return ddp_utils.all_reduce_mean(total_loss / steps), loss_ema
+                    window = dict.fromkeys(names, 0.0)
+    means = {name: ddp_utils.all_reduce_mean(totals[name] / steps) for name in names}
+    if return_components:
+        return means["joint_loss"], emas, {name: means[name] for name in names[1:]}
+    return means["joint_loss"], emas["joint_loss"]
+
+
+def epoch_loss_metrics(task, train_loss, dev_loss, loss_ema, train_components, dev_components):
+    """W&B epoch payload; non-S2A tasks keep their historical audio metric."""
+    loss_name = "joint_loss" if task == "s2a" else "audio_loss"
+    metrics = {
+        f"train/{task}/{loss_name}": train_loss,
+        f"train/{task}/{loss_name}_ema": loss_ema["joint_loss"],
+        f"dev/{task}/{loss_name}": dev_loss,
+    }
+    if task == "s2a":
+        for name in ("text_loss", "audio_loss"):
+            metrics[f"train/{task}/{name}"] = train_components[name]
+            metrics[f"train/{task}/{name}_ema"] = loss_ema[name]
+            metrics[f"dev/{task}/{name}"] = dev_components[name]
+    return metrics
 
 
 def reject_audio_checkpoint(path):
@@ -447,7 +506,7 @@ def checkpoint_metadata(model=None):
         "num_codebooks": NUM_CODEBOOKS,
         "audio_stop_weight": AUDIO_STOP_WEIGHT,
         "loss_normalization": "text_mean_plus_sum_codebook_means_div_8; stop_weighted_numerator_only",
-        "stage_schedule": "serial stages, one command each; --init-checkpoint warm start; optimizer_scheduler_reset_per_stage",
+        "stage_schedule": "s2a_only; optional_format_v5_weight_warm_start; optimizer_scheduler_reset_per_run",
         "thinker_directory": "thinker",
         "talker_state": "talker.pt",
         "upstream_revision": "f900448c608318c53314ebf8a947ab05cd8c038e",
@@ -468,7 +527,7 @@ def parse_task(value: str) -> str:
     for task in TASKS:
         if value == task:
             return task
-    raise argparse.ArgumentTypeError(f"--task must be one of {TASKS}, got {value!r}")
+    raise argparse.ArgumentTypeError(f"this training entry supports only --task s2a, got {value!r}")
 
 
 STAGE_DIR_PATTERN = re.compile(r"^stage_(\d+)_([a-z0-9_]+)$")
@@ -580,13 +639,14 @@ def main():
     parser.add_argument("--bridge-layer", type=int, default=None,
                         help="zero-based intermediate Thinker block; default middle block")
     parser.add_argument("--data", type=Path, required=True,
-                        help="Emilia code-cache directory, or MiniMind-O .parquet (tts: answer-text split; s2a: first-user conversation split, 98/1/1)")
+                        help="MiniMind-O conversation .parquet (first-user conversation split, 98/1/1)")
     source = parser.add_mutually_exclusive_group(required=True)
     source.add_argument("--qwen3-model", type=Path, help="fresh training from a base Qwen3 directory")
     source.add_argument("--init-checkpoint", type=Path, help="saved stage epoch directory; load weights/tokenizer only, start a new schedule")
     parser.add_argument("--output", type=Path, default=Path("outputs/05_route_b_multitask"),
-                        help="run root shared by every stage; each command writes stage_{NN}_{task}/ inside it")
-    parser.add_argument("--task", type=parse_task, required=True, help=f"the single task this command trains, one of {TASKS}")
+                        help="run root; each command writes a new stage_{NN}_s2a/ directory inside it")
+    parser.add_argument("--task", type=parse_task, choices=TASKS, default="s2a",
+                        help="only S2A training is supported (default: s2a)")
     parser.add_argument("--stage-index", type=int, default=None,
                         help="stage number for the output directory prefix; defaults to one past the highest stage under --output")
     parser.add_argument("--epochs", type=int, default=3, help="full epochs for this stage")
@@ -623,9 +683,7 @@ def main():
         parser.error("limit and dev-limit must be nonnegative")
     if args.dev_limit is None:
         args.dev_limit = args.limit
-    if args.data.suffix.lower() == ".parquet" and args.task not in {"tts", "s2a"}:
-        parser.error("MiniMind-O T2A Parquet input supports --task tts or s2a only")
-    if args.task == "s2a" and args.data.suffix.lower() != ".parquet":
+    if args.data.suffix.lower() != ".parquet":
         parser.error("s2a requires conversation Parquet; Emilia JSONL conversations are unsupported")
     if args.grad_accum_steps < 1 or args.batch_size < 1:
         raise SystemExit("batch-size and grad-accum-steps must be positive")
@@ -650,12 +708,6 @@ def main():
     stage_dir = stage_directory(args.output, args.stage_index, task)
     if any(index == args.stage_index for index, _ in stages):
         raise SystemExit(f"stage_{args.stage_index:02d}_* already exists under {args.output}; pass a new --stage-index")
-    previous = [f"stage_{index:02d}_{name}" for index, name in stages if index < args.stage_index]
-    if previous and args.init_checkpoint is None:
-        raise SystemExit(
-            f"{args.output} already has {previous}; warm-start with "
-            f"--init-checkpoint {args.output}/{previous[-1]}/model_epoch_XXX or use a new --output"
-        )
     if args.init_checkpoint is not None:
         metadata = validate_init_checkpoint(args.init_checkpoint)
         settings = metadata["talker_config"]
@@ -712,11 +764,11 @@ def main():
     if ddp_utils.is_main():
         metadata = vars(args) | checkpoint_metadata(base)
         metadata["dataset"] = {
-            "format": "minimind_o_t2a_parquet" if args.data.suffix.lower() == ".parquet" else "emilia_jsonl",
+            "format": "minimind_o_t2a_parquet",
             "train_samples": len(train_set), "dev_samples": len(dev_set),
             "split_policy": getattr(train_set, "split_policy", "provided_train_dev_manifests"),
             "max_seq_len": getattr(train_set, "max_seq_len", None),
-            "s2a_semantics": S2A_SEMANTICS if task == "s2a" else None,
+            "s2a_semantics": S2A_SEMANTICS,
         }
         (stage_dir / "config.json").write_text(json.dumps(metadata, default=str, indent=2) + "\n")
         print(f"stage={args.stage_index:02d}_{task} train rows={len(train.dataset)} dev rows={len(dev.dataset)}; "
@@ -743,17 +795,19 @@ def main():
         scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_scale)
     loss_ema = None
     for epoch in range(1, args.epochs + 1):
-        train_loss, loss_ema = run_epoch(args, model, tokenizer, spec, {task: train}, device, optimizer, scheduler, epoch, loss_ema)
-        dev_loss = run_epoch(args, model, tokenizer, spec, {task: dev}, device, epoch=epoch)[0]
+        train_loss, loss_ema, train_components = run_epoch(
+            args, model, tokenizer, spec, {task: train}, device, optimizer, scheduler,
+            epoch, loss_ema, return_components=True)
+        dev_loss, _, dev_components = run_epoch(
+            args, model, tokenizer, spec, {task: dev}, device, epoch=epoch,
+            return_components=True)
         if ddp_utils.is_main():
             save_checkpoint(base, tokenizer, stage_dir / f"model_epoch_{epoch:03d}", task, epoch)
             print(f"stage={task} epoch={epoch:03d} train_loss={train_loss:.4f} dev_loss={dev_loss:.4f}")
             if args.wandb:
-                loss_name = "joint_loss" if task == "s2a" else "audio_loss"
                 wandb.log({
-                    f"train/{task}/{loss_name}": train_loss,
-                    f"train/{task}/{loss_name}_ema": loss_ema,
-                    f"dev/{task}/{loss_name}": dev_loss,
+                    **epoch_loss_metrics(task, train_loss, dev_loss, loss_ema,
+                                         train_components, dev_components),
                     "stage": args.stage_index,
                     "task": task,
                     "epoch": epoch,

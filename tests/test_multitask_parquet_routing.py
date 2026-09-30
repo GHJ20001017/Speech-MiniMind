@@ -30,9 +30,9 @@ def test_parquet_routing_uses_shared_adapter(monkeypatch):
 
 
 @pytest.mark.parametrize("extra, message", [
-    (["--task", "asr"], "TTS"),
-    (["--task", "tts", "--limit", "-1"], "nonnegative"),
-    (["--task", "tts", "--dev-limit", "-2"], "nonnegative"),
+    (["--task", "asr"], "only --task s2a"),
+    (["--task", "s2a", "--limit", "-1"], "nonnegative"),
+    (["--task", "s2a", "--dev-limit", "-2"], "nonnegative"),
 ])
 def test_invalid_parquet_cli_fails_before_model_loading(monkeypatch, capsys, extra, message):
     import sys
