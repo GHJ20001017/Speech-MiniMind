@@ -45,6 +45,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import copy
 import json
 import math
 import os
@@ -80,6 +81,64 @@ try:
     import wandb
 except ImportError:  # pragma: no cover - wandb optional
     wandb = None
+
+
+LORA_TARGETS = ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
+
+
+def configure_tuning(model, tune, r=16, alpha=32, dropout=0.05):
+    if tune == "lora":
+        if r <= 0 or alpha <= 0 or not 0 <= dropout < 1:
+            raise ValueError("LoRA requires r > 0, alpha > 0 and 0 <= dropout < 1")
+        from peft import LoraConfig, get_peft_model
+
+        return get_peft_model(model, LoraConfig(
+            r=r, lora_alpha=alpha, lora_dropout=dropout,
+            target_modules=LORA_TARGETS, task_type="CAUSAL_LM", bias="none",
+        ))
+    if tune not in ("full", "embed"):
+        raise ValueError(f"unknown tune mode: {tune}")
+    for name, parameter in model.named_parameters():
+        parameter.requires_grad_(tune == "full" or
+                                 name.startswith(("model.embed_tokens", "lm_head")))
+    return model
+
+
+def require_extended_vocab(model, spec):
+    """Reject a raw/text checkpoint before freezing randomly initialized rows."""
+    for table in (model.get_input_embeddings(), model.get_output_embeddings()):
+        if table is None or table.weight.shape[0] < spec.total_vocab_size:
+            raise ValueError("LoRA requires --init-from a B0 checkpoint with pretrained "
+                             "audio-extended embeddings and LM head")
+
+
+class SpeechToSpeechLoss(torch.nn.Module):
+    """DDP's forward must enclose decoder AND head/loss computation."""
+
+    def __init__(self, lm, chunk_size=256):
+        super().__init__()
+        self.lm = lm
+        self.chunk_size = chunk_size
+
+    def forward(self, input_ids, attention_mask, labels):
+        hidden = forward_hidden_states(self.lm, attention_mask, input_ids=input_ids)
+        return chunked_cross_entropy(lm_head_module(self.lm), hidden, labels,
+                                     chunk_size=self.chunk_size)
+
+
+def save_standalone(model, path):
+    """Export merged CPU weights without touching live adapters/optimizer state."""
+    if hasattr(model, "peft_config"):
+        # Seed deepcopy's memo with CPU tensors: do not duplicate a large model
+        # on the training GPU before moving it to CPU.
+        memo = {id(p): torch.nn.Parameter(p.detach().cpu().clone(),
+                                         requires_grad=p.requires_grad)
+                for p in model.parameters()}
+        memo.update({id(b): b.detach().cpu().clone() for b in model.buffers()})
+        exported = copy.deepcopy(model, memo).merge_and_unload(safe_merge=True)
+        exported.save_pretrained(path)
+    else:
+        model.save_pretrained(path)
 
 
 def collate(samples: list[AudioSample]) -> list[AudioSample]:
@@ -121,7 +180,6 @@ def run_epoch(args, model, tokenizer, spec, loader, device, optimizer=None,
     if sampler is not None:
         ddp_utils.set_epoch(sampler, epoch)
     model.train(training)
-    base_model = ddp_utils.unwrap(model)
     total_loss = 0.0
     total_tokens = 0.0
     steps = 0
@@ -137,18 +195,14 @@ def run_epoch(args, model, tokenizer, spec, loader, device, optimizer=None,
         attention_mask = attention_mask.to(device)
 
         with torch.set_grad_enabled(training):
-            # Decoder first, LM head second: the head is applied (and recomputed
-            # in backward) chunk by chunk, so the (B, L, 168k) logits never have
-            # to exist in full - see model/chunked_loss.py.
-            hidden = forward_hidden_states(
-                base_model, attention_mask=attention_mask, input_ids=input_ids
-            )
-            loss, supervised = chunked_cross_entropy(
-                lm_head_module(base_model), hidden, labels, chunk_size=args.loss_chunk,
-            )
+            loss, supervised = model(input_ids=input_ids, attention_mask=attention_mask,
+                                     labels=labels)
         if training:
             optimizer.zero_grad()
-            loss.backward()
+            # DDP averages gradients; scale local token means to the global
+            # token mean (including ranks with no supervised tokens).
+            mean_tokens = ddp_utils.all_reduce_mean(float(supervised))
+            (loss * (supervised / max(mean_tokens, 1e-9))).backward()
             torch.nn.utils.clip_grad_norm_(
                 [p for p in model.parameters() if p.requires_grad], args.grad_clip
             )
@@ -176,8 +230,8 @@ def run_epoch(args, model, tokenizer, spec, loader, device, optimizer=None,
         total_tokens += supervised
         steps += 1
 
-    mean_loss = total_loss / max(total_tokens, 1)
-    return ddp_utils.all_reduce_mean(mean_loss), loss_ema
+    return (ddp_utils.all_reduce_mean(total_loss) /
+            max(ddp_utils.all_reduce_mean(total_tokens), 1e-9)), loss_ema
 
 
 @torch.no_grad()
@@ -192,14 +246,22 @@ def token_accuracy(model, tokenizer, spec, loader, device, args) -> float:
             max_length=args.max_length,
             max_answer_frames=args.max_answer_frames,
         )
-        logits = model(input_ids=input_ids.to(device),
-                       attention_mask=attention_mask.to(device)).logits
-        predictions = logits[:, :-1].argmax(dim=-1)
-        targets = labels[:, 1:].to(device)
-        mask = targets != -100
-        correct += (predictions[mask] == targets[mask]).sum().item()
-        total += mask.sum().item()
-    return ddp_utils.all_reduce_mean(correct / max(total, 1))
+        lm = ddp_utils.unwrap(model).lm
+        hidden = forward_hidden_states(lm, attention_mask.to(device),
+                                       input_ids=input_ids.to(device))
+        hidden = hidden[:, :-1].reshape(-1, hidden.size(-1))
+        targets = labels[:, 1:].to(device).reshape(-1)
+        # Accuracy also bounds vocabulary-sized allocations, even if loss
+        # chunking was explicitly disabled for an experiment.
+        chunk = args.loss_chunk if args.loss_chunk > 0 else 256
+        for start in range(0, targets.numel(), chunk):
+            target = targets[start:start + chunk]
+            prediction = lm_head_module(lm)(hidden[start:start + chunk]).argmax(-1)
+            mask = target != -100
+            correct += (prediction[mask] == target[mask]).sum().item()
+            total += mask.sum().item()
+    return ddp_utils.all_reduce_mean(correct) / max(ddp_utils.all_reduce_mean(total), 1e-9)
+
 
 
 def main() -> None:
@@ -225,7 +287,10 @@ def main() -> None:
     parser.add_argument("--max-prompt-frames", type=int, default=256)
     parser.add_argument("--code-dropout", type=float, default=0.0,
                         help="randomly corrupt this fraction of prompt frames (robustness)")
-    parser.add_argument("--tune", choices=("full", "embed"), default="full")
+    parser.add_argument("--tune", choices=("full", "embed", "lora"), default="full")
+    parser.add_argument("--lora-r", "--lora-rank", type=int, default=16)
+    parser.add_argument("--lora-alpha", type=int, default=32)
+    parser.add_argument("--lora-dropout", type=float, default=0.05)
     parser.add_argument("--num-workers", type=int, default=4)
     parser.add_argument("--grad-clip", type=float, default=1.0)
     parser.add_argument("--grad-checkpointing", action=argparse.BooleanOptionalAction, default=False,
@@ -272,20 +337,23 @@ def main() -> None:
     if source is None:
         raise SystemExit("pass --init-from (B0 checkpoint) or --qwen3-model (raw Qwen3-0.6B)")
 
-    model, tokenizer = load_qwen3(source, device)
+    if args.tune == "lora" and args.init_from is None:
+        parser.error("--tune lora requires --init-from a pretrained B0 checkpoint")
+    model, tokenizer = load_qwen3(source, device, prepare_for_speech=args.tune != "lora")
+    original_tokenizer_size = len(tokenizer)
     register_audio_special_tokens(tokenizer)
+    if args.tune == "lora" and len(tokenizer) != original_tokenizer_size:
+        parser.error("B0 tokenizer must already contain the audio special tokens")
     spec = build_vocab_spec(tokenizer, args.codebook_size, args.num_codebooks)
-    spec = extend_model_vocab(model, tokenizer, spec)
+    if args.tune == "lora":
+        require_extended_vocab(model, spec)
+    else:
+        spec = extend_model_vocab(model, tokenizer, spec)
     print(f"vocab: text={spec.text_vocab_size} audio={spec.audio_vocab_size} "
           f"total={spec.total_vocab_size}")
 
-    for parameter in model.parameters():
-        parameter.requires_grad_(True)
-    if args.tune == "embed":
-        for name, parameter in model.named_parameters():
-            parameter.requires_grad_(
-                name.startswith("model.embed_tokens") or name.startswith("lm_head")
-            )
+    model = configure_tuning(model, args.tune, args.lora_r,
+                             args.lora_alpha, args.lora_dropout)
 
     if args.grad_checkpointing:
         # The decoder's own activations, not the loss, are what decides the longest
@@ -299,7 +367,7 @@ def main() -> None:
         model.config.use_cache = False
 
     base_model = ddp_utils.unwrap(model)
-    model = ddp_utils.wrap(model)
+    model = ddp_utils.wrap(SpeechToSpeechLoss(model, args.loss_chunk))
     optimizer = torch.optim.AdamW(
         [p for p in model.parameters() if p.requires_grad], lr=args.lr
     )
@@ -390,7 +458,7 @@ def main() -> None:
             dev_loss, _ = run_epoch(args, model, tokenizer, spec, dev_loader, device)
             dev_acc = token_accuracy(model, tokenizer, spec, dev_loader, device, args)
         if ddp_utils.is_main():
-            base_model.save_pretrained(args.output / f"model_epoch_{epoch:03d}")
+            save_standalone(base_model, args.output / f"model_epoch_{epoch:03d}")
             tokenizer.save_pretrained(args.output / f"model_epoch_{epoch:03d}")
             with (args.output / "metrics.csv").open("a", newline="", encoding="utf-8") as handle:
                 csv.DictWriter(

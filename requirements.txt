@@ -9,3 +9,4 @@ soundfile>=0.12
 qwen-tts
 pyarrow>=14
 modelscope
+peft

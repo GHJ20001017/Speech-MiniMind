@@ -13,7 +13,7 @@ Input manifests (any split produced upstream):
 Output layout::
 
     <output>/codes/<split>/<index>[_p|_a].npy
-    <output>/{train,dev}.jsonl                 # rewritten, code-path rows
+    <output>/{train,dev,test}.jsonl                 # rewritten, code-path rows
     <output>/metadata.json                     # codec + counts (for cache keys)
 
 Usage::
@@ -45,10 +45,13 @@ sys.path.insert(0, str(ROOT))
 from model.audio_codec import build_frozen_audio_codec  # noqa: E402
 
 
+INPUT_SAMPLE_RATE = 24000
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--data", type=Path, required=True,
-                        help="dir with {train,dev}.jsonl, or a single JSONL")
+                        help="dir with {train,dev,test}.jsonl, or a single JSONL")
     parser.add_argument("--dev-file", type=Path, default=None,
                         help="dev JSONL when --data is a single file")
     parser.add_argument("--output", type=Path, required=True)
@@ -67,6 +70,7 @@ def parse_args() -> argparse.Namespace:
 
 
 def read_audio(path: Path) -> tuple[np.ndarray, int] | None:
+    """Load mono float32 audio and resample to 24 kHz before batch padding."""
     try:
         import soundfile as sf
     except ImportError as error:  # pragma: no cover - environment dependent
@@ -81,7 +85,15 @@ def read_audio(path: Path) -> tuple[np.ndarray, int] | None:
         waveform = waveform.mean(axis=1)
     if waveform.size == 0:
         return None
-    return waveform.astype(np.float32), int(rate)
+    if rate != INPUT_SAMPLE_RATE:
+        try:
+            import soxr
+        except ImportError as error:
+            raise SystemExit("soxr is required for resampling. Run: python -m pip install soxr") from error
+        waveform = soxr.resample(waveform, rate, INPUT_SAMPLE_RATE, quality="HQ")
+    if waveform.size == 0:
+        return None
+    return waveform.astype(np.float32), INPUT_SAMPLE_RATE
 
 
 def resolve(manifest: Path, value: str) -> Path:
@@ -110,12 +122,12 @@ def flush_batch(codec, batch: list[dict], code_dir: Path, counters: dict) -> set
     """
     if not batch:
         return set()
+    if any(item["rate"] != INPUT_SAMPLE_RATE for item in batch):
+        raise ValueError("All waveforms must be resampled to 24000 Hz before batching")
     waveforms = [torch.from_numpy(item["waveform"]) for item in batch]
     lengths = torch.tensor([w.numel() for w in waveforms], dtype=torch.long)
     padded = torch.nn.utils.rnn.pad_sequence(waveforms, batch_first=True)
-    rates = {item["rate"] for item in batch}
-    rate = rates.pop() if len(rates) == 1 else 16000
-    codes, code_lengths = codec.encode(padded, lengths, rate)
+    codes, code_lengths = codec.encode(padded, lengths, INPUT_SAMPLE_RATE)
     written: set[str] = set()
     for item, code, length in zip(batch, codes, code_lengths.tolist()):
         if length <= 0:
@@ -139,6 +151,17 @@ def process_split(
     if args.limit:
         rows = rows[: args.limit]
     code_dir = output / "codes" / split
+    legacy_shards: set[str] = set()
+    if code_dir.exists() and next(code_dir.glob("*.npy"), None) is not None:
+        metadata_path = output / "metadata.json"
+        metadata = json.loads(metadata_path.read_text()) if metadata_path.exists() else {}
+        if metadata.get("input_sample_rate") != INPUT_SAMPLE_RATE:
+            if not args.overwrite or args.limit:
+                raise ValueError(
+                    "Existing cache has no verified 24000 Hz input preprocessing. "
+                    "Use a new output directory or rebuild fully with --overwrite and no --limit."
+                )
+            legacy_shards = {path.name for path in code_dir.glob("*.npy")}
     code_dir.mkdir(parents=True, exist_ok=True)
 
     def rel_path(key: str) -> str:
@@ -182,7 +205,8 @@ def process_split(
             pieces[field] = rel_path(key)
 
         if len(batch) >= args.batch_size:
-            flush_batch(codec, batch, code_dir, counters)
+            written = flush_batch(codec, batch, code_dir, counters)
+            legacy_shards.difference_update(f"{key}.npy" for key in written)
             print(f"[{split}] {index + 1}/{len(rows)} encoded={counters['encoded']} "
                   f"elapsed={time.time() - started:.0f}s", flush=True)
 
@@ -205,7 +229,13 @@ def process_split(
             mapped["codes"] = pieces["audio"]
         out_rows.append(mapped)
 
-    flush_batch(codec, batch, code_dir, counters)
+    written = flush_batch(codec, batch, code_dir, counters)
+    legacy_shards.difference_update(f"{key}.npy" for key in written)
+    if legacy_shards:
+        raise ValueError(
+            f"{len(legacy_shards)} legacy shards were not rebuilt; "
+            "cannot certify this cache as 24000 Hz. Use a new output directory."
+        )
 
     # Drop rows whose referenced shard never got written (encode returned a zero
     # length); otherwise the manifest would point at a missing .npy.
@@ -240,7 +270,7 @@ def main() -> None:
 
     args.output.mkdir(parents=True, exist_ok=True)
     if args.data.is_dir():
-        pairs = [(args.data / "train.jsonl", "train"), (args.data / "dev.jsonl", "dev")]
+        pairs = [(args.data / f"{split}.jsonl", split) for split in ("train", "dev", "test")]
     else:
         if not args.dev_file:
             raise SystemExit("For a single-file --data, pass --dev-file")
@@ -248,6 +278,8 @@ def main() -> None:
 
     for manifest, split in pairs:
         if not manifest.exists():
+            if next((args.output / "codes" / split).glob("*.npy"), None) is not None:
+                raise ValueError(f"Cannot certify existing {split} cache: manifest missing: {manifest}")
             print(f"[{split}] manifest missing, skipped: {manifest}")
             continue
         process_split(args, codec, manifest, split, args.output)
@@ -260,6 +292,7 @@ def main() -> None:
                 "codec_model": args.codec_model,
                 "num_codebooks": codec.num_codebooks,
                 "codebook_size": codec.codebook_size,
+                "input_sample_rate": INPUT_SAMPLE_RATE,
                 "sample_rate": codec.sample_rate,
                 "frame_rate_hz": codec.frame_rate_hz,
                 "audio_offset_note": "LM vocab offset = len(tokenizer); see model/audio_lm.py",

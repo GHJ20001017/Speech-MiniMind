@@ -308,7 +308,7 @@ WAV ──► 冻结 codec 编码器 ──► 离散 audio tokens ──► 音
 
 与路线 A 的三点关键差异：
 
-- **必须扩词表**：把 `codebook_size × num_codebooks` 个音频 token 追加到 Qwen3 的文本词表之后（`ensure_audio_tokens` 之后 text vocab = 151672），再训练 `embed_tokens` / `lm_head` 的新增行（LoRA 覆盖不到，因此路线 B 默认 `--tune full`）。
+- **必须扩词表**：把 `codebook_size × num_codebooks` 个音频 token 追加到 Qwen3 的文本词表之后（`ensure_audio_tokens` 之后 text vocab = 151672）。B0 用 `--tune full` 学习新增的 `embed_tokens` / `lm_head` 权重；从已训练的 B0 checkpoint 继续做 S2S 时，可以冻结这些权重，只训练 LoRA。
 - **输入输出同为离散 token**：序列是 `[BOS] <|audio_start|> 输入语音 <|audio_end|> <|audio_start|> 输出语音 <|audio_end|> [EOS]`，损失只算输出语音段。
 - **不复用路线 A 的连续前缀**：两条路线共享数据与训练骨架，但序列布局独立。
 
@@ -366,17 +366,23 @@ CUDA_VISIBLE_DEVICES=6,7 HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 \
 
 ### 4. 语音到语音指令微调（06，B1/B2）
 
-只监督回答语音段（prompt / 输入音频 / padding 全部 `-100`）：
+从已训练的 B0 checkpoint 继续做 **LoRA 微调**，冻结音频 embedding、LM head 和主干原始权重，只监督回答语音段（prompt / 输入音频 / padding 全部 `-100`）。LoRA 覆盖 Attention 的 Q/K/V/O 与 MLP 的 gate/up/down 投影。
+
+下面是在 95 服务器项目目录下执行的完整命令；直接指定 `speech-llm` 环境，输出单独放在 `06_route_b_s2s_lora`，避免覆盖已有全参训练结果：
 
 ```bash
-CUDA_VISIBLE_DEVICES=6,7 torchrun --nproc_per_node=2 \
+cd /gpu3/guhj/Speech-MiniMind
+CUDA_VISIBLE_DEVICES=6,7 \
+/gpu3/guhj/envs/speech-llm/bin/python -m torch.distributed.run \
+  --nproc_per_node=2 --master-port=29522 \
   trainer/train_speech_to_speech.py \
   --data data/route_b/s2s \
   --init-from outputs/05_route_b_audio_lm_emilia/model_epoch_003 \
-  --output outputs/06_route_b_s2s --epochs 3 --batch-size 2 \
-  --tune full --num-workers 4 --grad-checkpointing \
+  --output outputs/06_route_b_s2s_lora --epochs 3 --batch-size 2 \
+  --tune lora --lora-r 16 --lora-alpha 32 --lora-dropout 0.05 \
+  --lr 1e-4 --num-workers 4 --grad-checkpointing --loss-chunk 256 \
   --lr-schedule cosine --warmup-ratio 0.03 --min-lr-ratio 0.1 --loss-ema 0.02 \
-  --wandb --wandb-name route_b_s2s
+  --wandb --wandb-name route_b_s2s_lora
 ```
 
 ### 5. 端到端推理（06）
@@ -384,7 +390,7 @@ CUDA_VISIBLE_DEVICES=6,7 torchrun --nproc_per_node=2 \
 ```bash
 python scripts/infer_speech_to_speech.py \
   --audio examples/disgusted_to_happy.wav \
-  --model outputs/06_route_b_s2s/model_epoch_003 \
+  --model outputs/06_route_b_s2s_lora/model_epoch_003 \
   --codec-type mimi --device cuda:0 --output outputs/route_b_answer.wav
 ```
 
