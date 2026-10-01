@@ -296,23 +296,35 @@ python scripts/visualize_speech_qwen3_webui.py \
 
 ![Speech-MiniMind WebUI 互动平台演示](assets/04_speech_qwen3_demo.gif)
 
-## 路线 B：音频专属 LLM（离散 codebook 端到端）
+## 路线 B：Thinker–Talker 文本与语音联合生成
 
-路线 A 把语音变成**连续**向量再交给通用 LLM，输出**文本**；路线 B 则把语音量化成**离散 codebook token**，让 LLM 直接在 token 序列上建模并生成，再由解码器还原波形：
+路线 A 把输入语音编码成**连续向量**交给 LLM，主要学习语音理解与文本输出；当前路线 B 则以**文字对话为输入**，通过 **Qwen3-0.6B Thinker + 独立 Talker** 同时学习回答文本和语音。Thinker 负责文本建模，Talker 根据 Thinker 的中间层语义表示和音频历史，生成离散 Mimi codebook token，再由冻结的 Mimi 解码器还原波形。
 
 ```text
-WAV ──► 冻结 codec 编码器 ──► 离散 audio tokens ──► 音频专属 LLM（Qwen3-0.6B）
-                                                    │
-                              WAV ◄── 冻结 codec 解码器 ◄── 生成的 audio tokens
+文字对话 ──► Qwen3-0.6B Thinker ──► 文本头 ──► 回答文本
+                       │
+                  中间层 hidden state
+                       │
+                    语义投影
+                       │
+                       ▼
+                  加权相加融合 ◄── 音频投影 ◄── 8 路音频历史 embedding
+                       │
+                       ▼
+                 独立 4 层 Talker
+                       │
+                  8 路音频输出头
+                       │
+                       ▼
+                Mimi 离散音频码 ──► 冻结 Mimi 解码器 ──► WAV
 ```
 
-与路线 A 的三点关键差异：
+当前架构的关键点：
 
-- **必须扩词表**：把 `codebook_size × num_codebooks` 个音频 token 追加到 Qwen3 的文本词表之后（`ensure_audio_tokens` 之后 text vocab = 151672）。B0 用 `--tune full` 学习新增的 `embed_tokens` / `lm_head` 权重；从已训练的 B0 checkpoint 继续做 S2S 时，可以冻结这些权重，只训练 LoRA。
-- **输入输出同为离散 token**：序列是 `[BOS] <|audio_start|> 输入语音 <|audio_end|> <|audio_start|> 输出语音 <|audio_end|> [EOS]`，损失只算输出语音段。
-- **不复用路线 A 的连续前缀**：两条路线共享数据与训练骨架，但序列布局独立。
-
-完整教学文档见 [docs/05_audio_native_llm.md](docs/05_audio_native_llm.md)。
+- **文本与音频分开建模**：Thinker 只接收文字；Talker 使用独立的 decoder、音频 embedding 和输出 head。音频码不追加到 Qwen3 的文本词表，而是按 8 个 codebook 分路处理，原始码范围为 `0..2047`。
+- **传递语义向量，而不是文本头选出的索引**：Thinker 的中间层 hidden state 经投影，与音频历史的投影向量加权相加，直接作为 Talker 的输入。Talker 不需要等待整段回答文本生成完毕。
+- **文字和语音联合监督**：S2A 使用文字对话及回答音频码，监督选中 assistant 的文字与音频；音频采用 8 路延迟排列和 next-token 预测。总 loss 为文本 CE 加 8 路音频 CE 的均值，Thinker 与 Talker 全参数训练，音频 loss 也能通过语义连接回传到 Thinker。
+- **直接从 Qwen3 开始训练**：独立 Talker 默认复制 Thinker 最后 4 层的初始权重，之后不共享参数；无需先训练 TTS 或 audio continuation。Mimi 保持冻结，训练读取预编码音频码。当前 S2A 不接收问题音频，不等同于语音到语音模型。
 
 ### 1. 确认 codec 重建质量（05，M0 闸门）
 
