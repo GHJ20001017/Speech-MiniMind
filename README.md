@@ -128,6 +128,8 @@ data/
 
 ### 3. 训练中文声学编码器（02，Tiny Conformer + CTC）
 
+![Tiny Conformer 声学编码器结构](assets/VoxBase-encoder.png)
+
 #### 非流式（离线整句识别）
 
 ```bash
