@@ -1,4 +1,6 @@
-![VoxBase-S2S](assets/VoxBase-S2S.png)
+<p align="center">
+  <img src="assets/VoxBase-S2S.png" alt="VoxBase-S2S">
+</p>
 
 ## 项目定位
 
@@ -12,7 +14,7 @@
 
 ### 路线 A：基于文本中间表示的级联架构
 
-<div align="left">
+<div align="center">
   <img src="assets/VoxBase-S2S-route-A.png" alt="VoxBase-S2S 路线 A 架构图" width="600" />
 </div>
 
@@ -26,7 +28,7 @@
 
 ### 路线 B：基于离散语音 Token 的端到端架构
 
-<div align="left">
+<div align="center">
   <img src="assets/speech-minimind-cropped.png" alt="路线 B：基于离散语音 Token 的端到端架构" width="600" />
 </div>
 
@@ -94,7 +96,9 @@ Stage 2 使用 AISHELL-1 之外的自然问答和指令数据，用于第 8 节�
 
 ### 训练VoxBase-encoder（Tiny Conformer + CTC）
 
-![Tiny Conformer 声学编码器结构](assets/VoxBase-encoder.png)
+<p align="center">
+  <img src="assets/VoxBase-encoder.png" alt="Tiny Conformer 声学编码器结构" width="600">
+</p>
 
 > **图示说明**：上图展示了非流式 Conformer 声学编码器的整体结构。非流式模式以完整语音片段为输入，处理当前帧时可以利用前后文，包括未来的声学特征，因此卷积和注意力模块能够在更完整的上下文中提取信息。流式模式则需要边接收音频边进行识别，当前时刻只能访问已经到达的历史特征和有限的当前特征，不能直接使用未来信息。为满足实时性，流式版本通常需要在卷积、注意力等模块中引入因果约束、分块计算或缓存机制，这会对模型结构、上下文范围和识别延迟产生一定影响。
 
@@ -117,7 +121,7 @@ CUDA_VISIBLE_DEVICES=0,1,2,3 torchrun --nproc_per_node=4 trainer/train_conformer
 下面给出训练过程中的CTC loss 曲线（仅供参考）：
 
 | train/ctc_loss_step | dev/ctc_loss |
-|---|---|
+|:---:|:---:|
 | ![流式编码器训练 CTC loss](assets/02_streaming_train_loss.jpg) | ![流式编码器 dev CTC loss](assets/02_streaming_dev_loss.jpg) |
 
 
@@ -140,7 +144,9 @@ python scripts/visualize_asr_webui.py \
   --audio path/to/long.wav
 ```
 
-![评估声学编码器演示](assets/02_acoustic_encoder_demo.gif)
+<p align="center">
+  <img src="assets/02_acoustic_encoder_demo.gif" alt="评估声学编码器演示">
+</p>
 
 > **关于本套编码器的泛化性声明**：VoxBase-encoder只在**中文 AISHELL-1**（16kHz 平稳播音、整句 2–6s）上训练，且**模型参数量较小**（约 Tiny 规模），因此对**训练分布外的输入难以有较好的泛化性能**——例如带口音/方言、语速异常、嘈杂或更长的音频，识别效果会明显下降甚至出现乱码。这属于预期行为，并非代码 bug；如果你需要更通用、更强的声学编码，**建议用开源的成熟编码器**（如 FunASR 的 Paraformer-zh-streaming、Whisper/OpenAI、语音自监督前端 wav2vec 2.0 / HuBERT 等）来达到更好的效果，本项目的编码器更多用于教学演示与完整流水线打通。
 
@@ -173,7 +179,7 @@ CUDA_VISIBLE_DEVICES=0,1,2,3 torchrun --nproc_per_node=4 trainer/train_speech_pr
 下面给出训练过程中的loss 曲线（仅供参考）：
 
 | train/loss_step | dev/loss |
-|---|---|
+|:---:|:---:|
 | ![语音投影器训练 loss](assets/03_speech_projector_train_loss.png) | ![语音投影器 dev loss](assets/03_speech_projector_dev_loss.png) |
 
 ### 指令微调VoxBase-S2S
@@ -196,7 +202,7 @@ CUDA_VISIBLE_DEVICES=0,1,2,3 torchrun --nproc_per_node=4 trainer/train_speech_qw
 下面给出训练过程中的loss 曲线（仅供参考）：
 
 | train/loss_step（跨卡平均） | dev/loss |
-|---|---|
+|:---:|:---:|
 | ![指令微调语音 LLM 训练 loss](assets/04_speech_qwen3_train_loss.png) | ![指令微调语音 LLM dev loss](assets/04_speech_qwen3_dev_loss.png) |
 
 ### 模型效果与交互体验
@@ -209,9 +215,9 @@ CUDA_VISIBLE_DEVICES=0,1,2,3 torchrun --nproc_per_node=4 trainer/train_speech_qw
 | 2 | 好莱坞选择东方文化背景时，为什么更偏重日本？ | “因为日本的建筑风格和中国建筑风格不一样，所以中国建筑风格的元素在日式建筑中会显得更加突出。” |
 | 3 | “目不知书”的含义是什么？ | “指不识字。 成语出处：无” |
 
-#### Gradio 互动平台（语音识别 / 音频问答）
+#### Gradio 互动平台
 
-界面可选择两种模式：**语音识别**将音频转写为文字；**音频问答**根据音频内容生成回答，并通过 Qwen3-TTS 分句合成、按顺序流式播放。
+在 Gradio 界面选择「音频问答」模式，根据音频内容生成回答，并通过 Qwen3-TTS 分句合成、按顺序流式播放。
 
 ```bash
 # 同时启用语音识别、音频问答与流式语音回答
@@ -227,7 +233,9 @@ python scripts/visualize_asr_webui.py \
   --host 0.0.0.0 --port 7861 --ssl-auto
 ```
 
-![Speech-MiniMind WebUI 互动平台演示](assets/04_speech_qwen3_demo.gif)
+<p align="center">
+  <img src="assets/04_speech_qwen3_demo.gif" alt="Speech-MiniMind WebUI 互动平台演示">
+</p>
 
 ## 路线 B：基于离散语音 Token 的端到端架构
 
@@ -245,9 +253,15 @@ python scripts/prepare_speech_to_speech.py --download \
   --output data/route_b/s2s --device cuda:0
 ```
 
-### 3. S2A 训练（05）
+### 训练语音生成能力
 
-采用 **Qwen3 Thinker + 独立 Talker**，本训练入口仅支持 S2A：根据文字对话同时学习生成回答文本和语音，无需先训练 TTS 或 audio continuation。直接从原始 Qwen3 初始化，使用 MiniMind-O conversation Parquet，默认按 512 token 截断并补齐；W&B 分别记录 joint、文本和音频 loss。
+该阶段以文本问题作为输入，以文本答案及其对应的语音作为训练目标，让模型学习在生成回答内容的同时生成相应的语音。如下图所示，Thinker 负责理解问题并生成文本回答，Talker 则结合 Thinker 的隐藏表示，自回归预测离散语音 Token，再由冻结的音频解码器将其还原为可播放的波形。通过文本与语音的联合训练，模型学习回答内容与语音表达之间的对应关系，从而不仅能用文字作答，也能将答案“说”出来。
+
+<p align="center">
+  <img src="assets/speech-generation-training.png" alt="语音生成能力训练架构" width="400">
+</p>
+
+用以下命令开始训练语音生成能力：
 
 ```bash
 cd /gpu3/guhj/Speech-MiniMind
