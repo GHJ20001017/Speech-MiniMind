@@ -8,19 +8,23 @@
 
 ## 项目介绍
 
-之所以同时实现这两条路线，是希望从不同技术路径探索 Speech-to-Speech：路线 A 更易复用成熟的文本 LLM 与 TTS，便于快速搭建和教学验证；但由于中间经过了文本这一层，生成的音频难以准确保留原始语音中的语气和情绪。路线 B 则尽量保留语音信息，探索端到端音频建模的可能性。通过并行推进，可以直观比较两种方案在实现成本、语音信息保留和系统能力上的差异。
+之所以同时实现这两条路线，是希望从不同技术路径探索 Speech-to-Speech：路线 A 更易复用成熟的文本 LLM 与 TTS；但由于中间经过了文本这一层，生成的音频难以准确保留原始语音中的语气和情绪。路线 B 则尽量保留语音信息，探索端到端音频建模的可能性。通过并行推进，可以直观比较两种方案在实现成本、语音信息保留和系统能力上的差异。如果你还不了解音频，可以先阅读 [docs/](docs/) 中的分章教程，从语音基础入门，逐步了解音频特征、声学编码器与语音大模型的实现。
 
-### 路线 A：通用 LLM 前挂语音编码器 + 后接 TTS（级联式）
+### 路线 A：基于文本中间表示的级联架构
 
-```
-语音输入 ──► 声学编码器(→ Projector) ──► 通用LLM(Qwen3-0.6B) ──► 文本回答 ──► TTS ──► 语音输出
-```
+<div align="center" style="display: flex !important; justify-content: center !important; width: 100%; text-align: center;">
+  <img src="assets/VoxBase-S2S-route-A.png" alt="VoxBase-S2S 路线 A 架构图" width="600" style="display: inline-block !important; float: none !important; margin: 0 auto !important; width: 600px; max-width: 100%; height: auto;" />
+</div>
 
-- 先训练**声学编码器**（Tiny Conformer + CTC / Paraformer）把语音变成帧级特征，再接入通用 LLM。
-- LLM 负责理解与推理，输出**文本**；文本经**TTS**合成语音回答。
-- 优点：复用成熟 LLM 与 TTS，文本能力强、可控性好；缺点是语音信息在"量化到文本"这一步有损，级联误差累积。
+> **图示说明**：为兼顾模型的泛化能力与训练、部署成本，并更好地支持微调数据集所覆盖的问答任务，本路线未采用 MiniMind 模型作为语言骨干，而是选用参数量较小、具备预训练语言能力的 **Qwen3-0.6B**。
+>
+> 图中输出汉字与橙色方块逐一对应的画法**仅用于示意**，不代表 Qwen3 的实际分词结果；实际 Token 与汉字并不一定一一对应。
 
-### 路线 B：音频专属 LLM（离散 codebook 端到端）
+- **语音接入**：通过声学编码器提取输入语音的连续特征，再由 **Projector（投影模块）** 将其映射到通用 LLM 的嵌入空间，与文本提示一起输入模型，无需先将语音转写为文字。声学编码器既可采用本项目训练的 VoxBase-encoder，也可复用预训练的语音编码器。
+- **回复生成**：LLM 根据语音特征和文本提示理解用户意图，生成文本回复，再由 **TTS（语音合成）** 将回复转换为语音。
+- **优势与局限**：这条路线可复用成熟 LLM 的语言理解与生成能力，以及现有 TTS 的语音合成能力，模块相对独立，便于替换和调试；但仅通过文本将回复传递给 TTS 时，难以完整传递细粒度的语气、韵律和情绪信息，前序模块的错误也可能影响最终的语音回答。
+
+### 路线 B：基于离散语音 Token 的端到端架构
 
 ```
 语音输入 ──► 量化编码器(codebook) ──► 音频专属LLM(Qwen3-0.6B) ──► 解码器 ──► 语音输出
@@ -36,17 +40,6 @@
 ```text
 00 语音基础 → 01 Mel 频谱 → 02 声学编码器（Tiny Conformer + CTC，含流式版） → 03 接入 Qwen3-0.6B → 04 指令微调语音 LLM
 ```
-
-分章教学文档见 [`docs/`](docs/)：
-
-| 章节 | 内容 | 文档 |
-|---|---|---|
-| 00 语音基础 | WAV、波形、FFT、STFT | [docs/00_audio_basics.md](docs/00_audio_basics.md) |
-| 01 Mel 频谱 | 功率谱、Mel 滤波器组、log-Mel | [docs/01_mel_spectrogram.md](docs/01_mel_spectrogram.md) |
-| 02 声学编码器 | Tiny Conformer、AISHELL-1、CTC；流式 Conformer（因果分块版） | [docs/02_acoustic_encoder.md](docs/02_acoustic_encoder.md) |
-| 03 接入 Qwen3-0.6B | Speech Projector、语音前缀 | [docs/03_speech_qwen3.md](docs/03_speech_qwen3.md) |
-| 04 指令微调语音 LLM | 合并指令数据、LoRA 微调 Qwen3-0.6B | 见下方第 7/8 节 |
-| 05 音频专属 LLM | 离散 codebook、冻结 codec、音频 LM 预训练与语音到语音微调（路线 B） | [docs/05_audio_native_llm.md](docs/05_audio_native_llm.md) |
 
 ## 路线 A：级联式 Speech LLM 端到端实现（教学主线）
 
