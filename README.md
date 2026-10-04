@@ -36,9 +36,7 @@
 - **回复生成**：Thinker 负责语义建模与文本回复生成，独立的 **Talker（语音生成模块）** 结合 Thinker 的中间层隐藏状态和已生成的音频历史，自回归预测多码本的离散语音 Token，再由 **Audio Decoder（音频解码器）** 将其还原为语音波形。与路线 A 不同，语音生成不再仅依赖最终的文本回复，而是直接利用模型内部的语义表示。
 - **优势与局限**：这条路线将语义建模与语音生成更紧密地结合，为联合学习回复内容、韵律和表达方式提供了空间，但并不意味着语音信息能够无损保留。相比独立串接 LLM 与 TTS，联合训练对文本与语音配对数据、音文对齐和多码本生成的稳定性提出了更高要求，训练与调试也更复杂。
 
-## 路线 A：级联式 Speech LLM 端到端实现（教学主线）
-
-下面从环境准备到最终微调，把**路线 A** 完整走一遍：编码器 → Projector → 指令微调语音 LLM →（文本回答，可接 TTS 输出语音）。
+## 路线 A：基于文本中间表示的级联架构
 
 ### 环境安装
 
@@ -48,20 +46,14 @@ conda activate speech-llm
 python -m pip install -r requirements.txt
 ```
 
-### 1. 语音分析（00/01）
-
-对示例音频生成波形、频谱、STFT 动画：
+### 音频入门：从可视化认识语音（如已熟悉音频，可跳过）
 
 ```bash
 python scripts/analyze_audio.py examples/disgusted_to_happy.wav \
   --plot outputs/example.png --stft-plot outputs/stft.png --stft-gif outputs/stft_process.gif
 ```
 
-### 2. 数据集
-
-本项目后续训练用到的数据集都统一放在 **ModelScope** 上：编码器用的 manifest、stage-1 转写语料与编码器权重都在主仓库；只有体量最大的 AISHELL-1 **原始音频**因为太大，改用 `scripts/download_aishell1.py` 从 ModelScope 镜像下载。
-
-- 主仓库（AISHELL-1 `processed` manifest/vocab、stage-1 转写语料、编码器权重）：<https://www.modelscope.cn/models/ghjghj1017/Tiny_Conformer>
+### 数据集
 
 ```bash
 python -m pip install modelscope
@@ -73,19 +65,24 @@ tar -xzf outputs/Tiny_Conformer/processed.tar.gz -C data/aishell1
 
 # 2) AISHELL-1 原始音频（约 15G，支持断点续传），下载并解压到 data/aishell1/data_aishell/
 python scripts/download_aishell1.py
+
+# 3) Stage 2 已整理数据：COIG-CQIA、COIG 人类价值观、COIG 翻译、Firefly
+#    下载到 data/speech2text_corpus/，包含 stage2_no_aishell.jsonl 及音频目录
+python scripts/download_stage2_data.py
+
+# 完成第 2 节的 stage 2 清单下载与切分后执行
+python scripts/resample_stage2_mixed.py --data data/speech2text_corpus/splits --splits train,val,test --sr 16000
 ```
 
-#### 2.1 数据集组成
+#### 数据集组成
 
-**stage 1** —— 只含 AISHELL-1，指令固定为「请转写为中文」，答案就是转写文本。按 AISHELL-1 **官方划分**拆成 `train` / `dev` / `test`，训练时不再切分。声学编码器（第 3/4 节）读 `data/aishell1/processed/` 的 CSV，Speech Projector（第 5 节）读 `data/speech2text_corpus/stage1_aishell/` 的 JSONL；两者记录的是同一批音频，只是格式不同。
+**Stage 1：语音转写数据**
 
-| 划分 | 行数 | 用途 |
-|---|---:|---|
-| train | 120098 | 第 3/4 节声学编码器（`processed/train.csv`）、第 5 节 Speech Projector（`stage1_aishell/train.jsonl`） |
-| dev | 14326 | 编码器开发集；Projector 与 test 合并为验证集 |
-| test | 7176 | 编码器测试集；Projector 与 dev 合并为验证集 |
+Stage 1 仅使用 AISHELL-1。所有样本都采用固定指令「请转写为中文」，目标答案为对应的转写文本，并沿用 AISHELL-1 的官方 `train` / `dev` / `test` 划分，不再额外切分。VoxBase-encoder 读取 `data/aishell1/processed/` 下的 CSV，Speech Projector（第 5 节）读取 `data/speech2text_corpus/stage1_aishell/` 下的 JSONL。两者使用的是同一批音频，只是存储格式不同。
 
-**stage 2** —— AISHELL-1 之外的全部自然问答 / 指令数据，统一为同一行格式，用于第 8 节指令微调 Speech LLM。每行仍带 `prompt`，但**训练第 8 节时只读取 `wav` 与 `answer`**（`prompt` 供 TTS 合成问题音频用，不再作为文本输入），统一配固定系统提示词「你是一个语音助手，根据用户的音频内容回答用户的问题」。由以下来源筛选、去重、统一格式后合成：
+**Stage 2：语音问答与指令数据**
+
+Stage 2 使用 AISHELL-1 之外的自然问答和指令数据，用于第 8 节的指令微调。不同来源的数据经过筛选、去重和格式整理后，统一组织为逐行样本。每条样本包含 `prompt`、`wav` 和 `answer` 等字段；其中 `prompt` 仅用于通过 TTS 合成问题音频，训练第 8 节时实际读取的是 `wav` 和 `answer`，不会将 `prompt` 作为文本输入。所有样本使用固定系统提示词：「你是一个语音助手，根据用户的音频内容回答用户的问题」。
 
 | 来源 | 保留内容 | 语言 | 音频 |
 |---|---|---|---|
@@ -94,51 +91,21 @@ python scripts/download_aishell1.py
 | COIG-CQIA | 仅高质量子集 | zh | 文本，需 TTS |
 | COIG 翻译指令 | 仅高质量中文子集 | zh | 文本，需 TTS |
 | moss_speech_qa | 仅首轮问答 | zh | 已合成音频 |
-| VoiceAssistant-400K | 全部保留 | en | 原始音频 |
 
-#### 2.2 本地目录布局
-
-下载后把数据放到 `data/` 下，训练脚本按下列路径读取：
-
-```text
-data/
-├── aishell1/
-│   ├── data_aishell/            # 原始音频（wav/、transcript/、resource_aishell/），download_aishell1.py 下载
-│   └── processed/               # 第 3/4 节编码器读取，来自 ModelScope 的 processed.tar.gz
-│       ├── train.csv            # 表头 path,text
-│       ├── dev.csv
-│       ├── test.csv
-│       └── vocab.txt            # 字符词表，首行 <blank>，其后每行一个汉字
-└── speech2text_corpus/
-    ├── stage1_aishell/          # 第 5 节 Projector 读取，由 aishell-1/*.parquet 转出
-    │   ├── train.jsonl          # AISHELL-1 官方 train 划分
-    │   ├── dev.jsonl
-    │   └── test.jsonl
-    └── splits/                  # 第 8 节 Speech LLM 读取（stage 2，按来源分层切分）
-        ├── train.jsonl
-        ├── val.jsonl
-        └── test.jsonl
-```
-
-### 3. 训练中文声学编码器（02，Tiny Conformer + CTC）
+### 训练VoxBase-encoder（Tiny Conformer + CTC）
 
 ![Tiny Conformer 声学编码器结构](assets/VoxBase-encoder.png)
 
-#### 非流式（离线整句识别）
+> **图示说明**：上图展示了非流式 Conformer 声学编码器的整体结构。非流式模式以完整语音片段为输入，处理当前帧时可以利用前后文，包括未来的声学特征，因此卷积和注意力模块能够在更完整的上下文中提取信息。流式模式则需要边接收音频边进行识别，当前时刻只能访问已经到达的历史特征和有限的当前特征，不能直接使用未来信息。为满足实时性，流式版本通常需要在卷积、注意力等模块中引入因果约束、分块计算或缓存机制，这会对模型结构、上下文范围和识别延迟产生一定影响。
+
+#### 非流式训练
 
 ```bash
 CUDA_VISIBLE_DEVICES=0,1,2,3 torchrun --nproc_per_node=4 trainer/train_conformer_ctc.py \
   --data data/aishell1/processed --epochs 20 --batch-size 32 --lr 2e-4
 ```
 
-输出到 `outputs/02_acoustic_encoder/`：`metrics.csv`、`loss_curve.png`、逐 epoch checkpoint、`tiny_conformer_ctc.pt`。
-
-#### 流式（chunk-based 因果版）
-
-同一编码器任务的流式实现，用于边听边出的实时场景：
-
-+ **模型**：`model/conformer_streaming.py`（因果下采样、因果卷积、分块因果注意力 + 左上下文缓存）、`model/ctc_streaming.py`（流式 CTC 封装）
-+ **训练**：
+#### 流式训练
 
 ```bash
 CUDA_VISIBLE_DEVICES=0,1,2,3 torchrun --nproc_per_node=4 trainer/train_conformer_streaming_ctc.py \
@@ -147,49 +114,37 @@ CUDA_VISIBLE_DEVICES=0,1,2,3 torchrun --nproc_per_node=4 trainer/train_conformer
 ```
 
 
-训练过程（AISHELL-1，约 37k step）的 CTC loss 曲线：
+下面给出训练过程中的CTC loss 曲线（仅供参考）：
 
 | train/ctc_loss_step | dev/ctc_loss |
 |---|---|
 | ![流式编码器训练 CTC loss](assets/02_streaming_train_loss.jpg) | ![流式编码器 dev CTC loss](assets/02_streaming_dev_loss.jpg) |
 
-train loss 从约 7 收敛到约 0.5；dev loss 从约 3.0 稳定下降到约 0.9。
 
-### 4. 评估声学编码器（02）
+### 评估VoxBase-encoder
 
 ```bash
 # 一键报告：dev/test CER、checkpoint 对比、样例、RTF
 python scripts/evaluate_conformer_report.py \
   --data data/aishell1/processed --output outputs/02_acoustic_encoder --split both
-
-# 单 checkpoint 评估
-python scripts/evaluate_conformer_ctc.py \
-  --data data/aishell1/processed \
-  --checkpoint outputs/02_acoustic_encoder/checkpoint_epoch_020.pt --split dev
 ```
-
-同目录还有 `scripts/plot_training_metrics.py` 可绘制训练曲线。
 
 ### WebUI 流式 vs 非流式演示
 
-运行 `scripts/visualize_asr_webui.py`（Gradio）可视化 02 章声学编码器，左右对比非流式（整句）与流式（增量）识别效果：
+在 Gradio 中选择「ASR 转写（Conformer）」，并排查看非流式整句结果与因果流式增量结果。上传或录制完整音频后点击「开始」：
 
 ```bash
-python -m pip install gradio   # 首次需要
-
 python scripts/visualize_asr_webui.py \
   --checkpoint outputs/02_acoustic_encoder/tiny_conformer_ctc.pt \
   --stream-checkpoint outputs/02_streaming_acoustic_encoder/tiny_streaming_conformer_ctc.pt \
   --audio path/to/long.wav
 ```
 
-> 两侧模型 checkpoints **不可互换**（下采样与卷积结构不同）：非流式用 `outputs/02_acoustic_encoder/` 训练的权重，流式侧需显式传入 `--stream-checkpoint` 才会启用。只演示一侧时省略对应参数即可（`pip install gradio` 首次安装）。启动后访问 `http://0.0.0.0:7860`。
-
 ![评估声学编码器演示](assets/02_acoustic_encoder_demo.gif)
 
-> **关于本套编码器的泛化性声明**：我们的 Tiny Conformer + CTC 编码器只在**中文 AISHELL-1**（16kHz 平稳播音、整句 2–6s）上训练，且**模型参数量较小**（约 Tiny 规模），因此对**训练分布外的输入难以有较好的泛化性能**——例如带口音/方言、语速异常、嘈杂或更长的音频，识别效果会明显下降甚至出现乱码。这属于预期行为，并非代码 bug；如果你需要更通用、更强的声学编码，**建议用开源的成熟编码器**（如 FunASR 的 Paraformer-zh-streaming、Whisper/OpenAI、语音自监督前端 wav2vec 2.0 / HuBERT 等）来达到更好的效果，本项目的编码器更多用于教学演示与完整流水线打通。
+> **关于本套编码器的泛化性声明**：VoxBase-encoder只在**中文 AISHELL-1**（16kHz 平稳播音、整句 2–6s）上训练，且**模型参数量较小**（约 Tiny 规模），因此对**训练分布外的输入难以有较好的泛化性能**——例如带口音/方言、语速异常、嘈杂或更长的音频，识别效果会明显下降甚至出现乱码。这属于预期行为，并非代码 bug；如果你需要更通用、更强的声学编码，**建议用开源的成熟编码器**（如 FunASR 的 Paraformer-zh-streaming、Whisper/OpenAI、语音自监督前端 wav2vec 2.0 / HuBERT 等）来达到更好的效果，本项目的编码器更多用于教学演示与完整流水线打通。
 
-我们训练好的 02 章「Tiny Conformer + CTC」编码器权重（**流式**与**非流式**）会发布在 ModelScope 仓库：<https://www.modelscope.cn/models/ghjghj1017/Tiny_Conformer>。你可以直接下载使用，省去本地重新训练。
+训练好的VoxBase-encoder权重（流式与非流式）会发布在 ModelScope 仓库：https://www.modelscope.cn/models/ghjghj1017/Tiny_Conformer。
 
 ### 换用成熟开源编码器（推荐 FunASR / SenseVoice-Small）
 
@@ -200,9 +155,9 @@ python scripts/visualize_asr_webui.py \
 python -c "from modelscope.hub.snapshot_download import snapshot_download; snapshot_download('iic/SenseVoiceSmall', local_dir='outputs/sensevoice-small')"
 ```
 
-### 5. 训练语音投影器连接 Qwen3-0.6B（03，Speech Projector）
+### 训练Projector
 
-使用 **SenseVoice-Small 作为冻结编码器**。`train_speech_projector.py` 读第 2 节下载的 stage-1 目录 `data/speech2text_corpus/stage1_aishell/`（内含 `train.jsonl` / `dev.jsonl` / `test.jsonl`，每行 `{"wav": "...", "prompt": "请转写为中文", "answer": "..."}`），因此先确认第 2 节的数据集已放好，再准备 [Qwen3-0.6B](https://huggingface.co/Qwen/Qwen3-0.6B) 权重（本项目在 95 上放在 `/gpu3/guhj/models/Qwen3-0.6B`）：
+使用 **SenseVoice-Small 作为冻结编码器**。
 
 ```bash
 CUDA_VISIBLE_DEVICES=0,1,2,3 torchrun --nproc_per_node=4 trainer/train_speech_projector.py \
@@ -215,28 +170,15 @@ CUDA_VISIBLE_DEVICES=0,1,2,3 torchrun --nproc_per_node=4 trainer/train_speech_pr
   --wandb --wandb-name projector_qwen3_sensevoice
 ```
 
-训练过程（AISHELL-1，约 9.5k step）的 loss 曲线：
+下面给出训练过程中的loss 曲线（仅供参考）：
 
 | train/loss_step | dev/loss |
 |---|---|
 | ![语音投影器训练 loss](assets/03_speech_projector_train_loss.png) | ![语音投影器 dev loss](assets/03_speech_projector_dev_loss.png) |
 
-### 6. 统一 stage 2 音频采样率（`resample_stage2_mixed.py`）
+### 指令微调VoxBase-S2S
 
-第 2 节下载的 stage 2 切分音频采样率仍不一致（moss_speech_qa 与合成语音的 Qwen3-TTS=24kHz、VoiceAssistant-400K=22050Hz，AISHELL-1=16kHz），而 `train_speech_qwen3.py` 强制 16kHz 输入。用 `resample_stage2_mixed.py` 统一到 16kHz：
-
-```bash
-# 第 2 节下载的 stage 2 三份清单
-python scripts/resample_stage2_mixed.py --data data/speech2text_corpus/splits --splits train,val,test --sr 16000
-```
-
-### 8. 指令微调语音 LLM（04，真正的 Speech-MiniMind）
-
-在第 5 节的 Projector 桥接基础上，**微调整个 Qwen3-0.6B**（LoRA 或全参），并以较小学习率同步训练 Projector，让它变成能听语音、生成回答的完整 Speech LLM。
-
-> 0.6B 全参微调对学习率比 64M 模型敏感得多：`--tune full` 建议用脚本默认的 `--lr 2e-5`，`--tune lora` 用默认的 `--lr 2e-4`。LoRA 覆盖不到 `embed_tokens`，两个 audio marker 的 embedding 行会一直保持初始化值；需要它们一起学就用 `--tune full`。
-
-数据侧把第 2 节下载的 stage 2 切分和第 6 节的重采样做完即可：
+在预训练 Projector 的基础上，以下配置对 **Qwen3-0.6B 进行全参数微调**，并以独立学习率同步训练 Projector，使模型能够理解语音输入并生成文本回答。完成「数据集」部分的 Stage 2 数据准备与重采样后，即可开始训练：
 
 ```bash
 # Projector 与 Qwen3 一起训练；--projector-lr 是 Projector 的独立小学习率
@@ -251,17 +193,15 @@ CUDA_VISIBLE_DEVICES=0,1,2,3 torchrun --nproc_per_node=4 trainer/train_speech_qw
   --wandb --wandb-name speech_qwen3_sft
 ```
 
-训练过程（stage 2 中文切分 91,490 行，4 卡约 5.7k step/epoch）的 loss 曲线：
+下面给出训练过程中的loss 曲线（仅供参考）：
 
 | train/loss_step（跨卡平均） | dev/loss |
 |---|---|
 | ![指令微调语音 LLM 训练 loss](assets/04_speech_qwen3_train_loss.png) | ![指令微调语音 LLM dev loss](assets/04_speech_qwen3_dev_loss.png) |
 
-train loss 从约 8 收敛到约 0.85；dev loss 稳定下降到约 0.58。
+### 模型效果与交互体验
 
-### 9. 评估与测试指令微调模型（离线指标 / 推理 / WebUI）
-
-#### 问答示例
+#### 语音问答效果示例
 
 | # | 问题 | speech-minimind |
 | --- | --- | --- |
@@ -269,13 +209,14 @@ train loss 从约 8 收敛到约 0.85；dev loss 稳定下降到约 0.58。
 | 2 | 好莱坞选择东方文化背景时，为什么更偏重日本？ | “因为日本的建筑风格和中国建筑风格不一样，所以中国建筑风格的元素在日式建筑中会显得更加突出。” |
 | 3 | “目不知书”的含义是什么？ | “指不识字。 成语出处：无” |
 
-#### WebUI 互动平台（FastAPI + WebSocket，双模式）
+#### Gradio 互动平台（语音识别 / 音频问答）
+
+界面可选择两种模式：**语音识别**将音频转写为文字；**音频问答**根据音频内容生成回答，并通过 Qwen3-TTS 分句合成、按顺序流式播放。
 
 ```bash
-python -m pip install fastapi uvicorn soundfile qwen-tts   # 首次需要
-
-# 局域网访问 + 麦克风 + Qwen3 文本回答转语音
-python scripts/visualize_speech_qwen3_webui.py \
+# 同时启用语音识别、音频问答与流式语音回答
+python scripts/visualize_asr_webui.py \
+  --checkpoint outputs/02_acoustic_encoder/tiny_conformer_ctc.pt \
   --encoder-type sensevoice \
   --sensevoice-model outputs/sensevoice-small \
   --projector-checkpoint outputs/04_speech_qwen3_sft/projector_epoch_003.pt \
@@ -286,65 +227,19 @@ python scripts/visualize_speech_qwen3_webui.py \
   --host 0.0.0.0 --port 7861 --ssl-auto
 ```
 
-实际运行效果（上传一段语音，模型转写为中文文本）：
-
-![Speech-MiniMind 实际运行效果](assets/04_speech_qwen3_result.png)
-
 ![Speech-MiniMind WebUI 互动平台演示](assets/04_speech_qwen3_demo.gif)
 
-## 路线 B：Thinker–Talker 文本与语音联合生成
+## 路线 B：基于离散语音 Token 的端到端架构
 
-路线 A 把输入语音编码成**连续向量**交给 LLM，主要学习语音理解与文本输出；当前路线 B 则以**文字对话为输入**，通过 **Qwen3-0.6B Thinker + 独立 Talker** 同时学习回答文本和语音。Thinker 负责文本建模，Talker 根据 Thinker 的中间层语义表示和音频历史，生成离散 Mimi codebook token，再由冻结的 Mimi 解码器还原波形。
+### 构建训练数据
 
-```text
-文字对话 ──► Qwen3-0.6B Thinker ──► 文本头 ──► 回答文本
-                       │
-                  中间层 hidden state
-                       │
-                    语义投影
-                       │
-                       ▼
-                  加权相加融合 ◄── 音频投影 ◄── 8 路音频历史 embedding
-                       │
-                       ▼
-                 独立 4 层 Talker
-                       │
-                  8 路音频输出头
-                       │
-                       ▼
-                Mimi 离散音频码 ──► 冻结 Mimi 解码器 ──► WAV
-```
-
-当前架构的关键点：
-
-- **文本与音频分开建模**：Thinker 只接收文字；Talker 使用独立的 decoder、音频 embedding 和输出 head。音频码不追加到 Qwen3 的文本词表，而是按 8 个 codebook 分路处理，原始码范围为 `0..2047`。
-- **传递语义向量，而不是文本头选出的索引**：Thinker 的中间层 hidden state 经投影，与音频历史的投影向量加权相加，直接作为 Talker 的输入。Talker 不需要等待整段回答文本生成完毕。
-- **文字和语音联合监督**：S2A 使用文字对话及回答音频码，监督选中 assistant 的文字与音频；音频采用 8 路延迟排列和 next-token 预测。总 loss 为文本 CE 加 8 路音频 CE 的均值，Thinker 与 Talker 全参数训练，音频 loss 也能通过语义连接回传到 Thinker。
-- **直接从 Qwen3 开始训练**：独立 Talker 默认复制 Thinker 最后 4 层的初始权重，之后不共享参数；无需先训练 TTS 或 audio continuation。Mimi 保持冻结，训练读取预编码音频码。当前 S2A 不接收问题音频，不等同于语音到语音模型。
-
-### 1. 确认 codec 重建质量（05，M0 闸门）
-
-路线 B 的第一道闸门：冻结 codec 必须能把中文语音编成离散 token 再还原回「人能听懂」的波形，否则后面的音频 LM 训练没有意义。
+从 ModelScope 下载 MiniMind-O 已经 token 化好的 `sft_t2a.parquet` 和 `sft_a2a.parquet`，分别用于 S2A 训练和语音到语音数据准备：
 
 ```bash
-# 英文数据集：重建 + 识别质量（WER）
-python scripts/eval_codec_reconstruction.py \
-  --data data/voiceassistant400k_50k --split dev --num 20 \
-  --asr-language en --codec-type mimi --device cuda:0 \
-  --output outputs/05_route_b_codec_check_en
+# 下载 S2A 训练数据
+python -c "from modelscope.hub.snapshot_download import dataset_snapshot_download; dataset_snapshot_download('gongjy/minimind-o_dataset', local_dir='data/minimind_o', allow_patterns=['sft_t2a.parquet'])"
 
-# sft_a2a 回答音频域：只有 code 没有波形，直接解码后算往返错误率（zh/en 都行）
-python scripts/eval_codec_reconstruction.py \
-  --data data/route_b/s2s --split dev --num 50 \
-  --asr-language en --codec-type mimi --device cuda:0 \
-  --output outputs/05_route_b_codec_check_s2s_en
-```
-
-### 2. 构建语音到语音数据（05）
-
-优先用 MiniMind-O 已经 token 化好的 `sft_a2a`（`--download` 会从 ModelScope 拉取）：
-
-```bash
+# 下载并准备语音到语音数据
 python scripts/prepare_speech_to_speech.py --download \
   --file-name sft_a2a.parquet --lang zh \
   --output data/route_b/s2s --device cuda:0

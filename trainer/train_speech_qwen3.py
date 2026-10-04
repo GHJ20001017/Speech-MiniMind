@@ -4,7 +4,7 @@ Pipeline:
 
     audio ──> TinyConformer.encoder (frozen) ──> SpeechProjector
                 ──> speech prefix embeddings
-                ──concat──> Qwen3-0.6B (LoRA or full fine-tuned) ──> answer text
+                ──concat──> Qwen3-0.6B (full fine-tuned) ──> answer text
 
 The acoustic encoder is always frozen. The SpeechProjector is frozen by default
 and can optionally be fine-tuned with ``--tune-projector`` when the Qwen3
@@ -44,9 +44,7 @@ over ``--warmup-ratio`` of all steps followed by a cosine decay to
 
 Note on the audio markers: ``<|audio_start|>`` / ``<|audio_end|>`` are appended
 to Qwen3's tokenizer by ``model/chat_format.py`` and get a neutral initial
-embedding. LoRA adapters do not cover ``embed_tokens``, so under ``--tune lora``
-those two rows stay at that initial value for the whole run; ``--tune full``
-trains them with everything else.
+embedding. Full fine-tuning trains those rows with everything else.
 
 Memory: the loss goes through ``model/chunked_loss.py`` - the LM head is applied
 ``--loss-chunk`` positions at a time and recomputed in the backward pass, instead
@@ -54,8 +52,7 @@ of materialising the full ``(batch, length, 151672)`` logits four times over.
 That one-shot loss is the largest single allocation in a ``--tune full`` run
 (~10 GiB at ``--batch-size 4`` and ``--max-length 2048``).
 
-Requires: peft (``pip install peft``) for ``--tune lora``, plus the same
-torch/transformers as the rest of the project.
+Requires: the same torch/transformers as the rest of the project.
 """
 
 from __future__ import annotations
@@ -100,10 +97,7 @@ from model.speech_projector import SpeechProjector  # noqa: E402
 
 SAMPLE_RATE = 16000
 
-# Full fine-tuning a 0.6B model needs a far smaller step than LoRA does; spending
-# the wrong one either diverges (full) or barely moves (lora). Resolved from
-# --tune when --lr is not given.
-DEFAULT_LR = {"lora": 2e-4, "full": 2e-5}
+DEFAULT_LR = 2e-5
 
 try:
     import wandb
@@ -164,9 +158,8 @@ def make_sft_batch(
             : max_length - prefix.numel() - speech.size(0)
         ]
 
-        # `model` may be a PeftModel (optionally DDP-wrapped); token_embeddings
-        # unwraps both to reach the base LM's embedding table. The projector
-        # keeps its own dtype, so the speech block is cast at the handoff.
+        # token_embeddings unwraps DDP to reach the LM's embedding table.
+        # The projector keeps its own dtype, so cast at the handoff.
         prefix_embeds = token_embeddings(model, prefix).unsqueeze(0)  # [1, P, H]
         suffix_embeds = token_embeddings(model, suffix).unsqueeze(0)  # [1, Q, H]
 
@@ -253,42 +246,6 @@ def run_epoch(args, encoder, projector, lm, tokenizer, loader, device, optimizer
     return ddp_utils.all_reduce_mean(total_loss / max(steps, 1)), loss_ema
 
 
-def add_lora(
-    model,
-    r: int,
-    alpha: int,
-    dropout: float,
-    target_modules: list[str] | None = None,
-):
-    """Apply LoRA low-rank adapters to Qwen3's attention projections in place.
-
-    Uses peft. Raises if peft is missing. Note that LoRA does not touch
-    ``embed_tokens``, so the audio marker rows keep their initial value.
-    """
-    try:
-        from peft import LoraConfig, get_peft_model
-
-        targets = target_modules or ["q_proj", "k_proj", "v_proj", "o_proj"]
-        config = LoraConfig(
-            r=r,
-            lora_alpha=alpha,
-            lora_dropout=dropout,
-            target_modules=targets,
-            task_type="CAUSAL_LM",
-        )
-        peft_model = get_peft_model(model, config)
-        trainable = sum(p.numel() for p in peft_model.parameters() if p.requires_grad)
-        print(
-            f"peft: trainable={trainable:,} "
-            f"({100 * trainable / sum(p.numel() for p in peft_model.parameters()):.2f}%)"
-        )
-        return peft_model
-    except ImportError:
-        raise SystemExit(
-            "peft not installed. Run: pip install peft  (needed for LoRA SFT)"
-        )
-
-
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--data", type=Path, required=True,
@@ -313,26 +270,20 @@ def main() -> None:
                         choices=("auto", "bfloat16", "float16", "float32"),
                         help="backbone dtype. 'auto' is transformers' default: float32 master "
                              "weights even for a bfloat16 checkpoint, i.e. the safest thing to "
-                             "full fine-tune at 2x backbone memory; 'bfloat16'/'float16' halve "
-                             "that when the backbone stays frozen. Speech embeddings are cast "
+                             "full fine-tune at 2x backbone memory; 'bfloat16'/'float16' use "
+                             "lower-precision weights. Speech embeddings are cast "
                              "to the backbone dtype either way")
-    parser.add_argument("--tune", choices=("lora", "full"), default="lora",
-                        help="lora: LoRA adapters only (~0.5%% trainable, needs peft); "
-                             "full: full-parameter LLM fine-tune (all LLM weights trainable)")
+    parser.add_argument("--tune", choices=("full",), default="full",
+                        help="full-parameter LLM fine-tune (retained for command compatibility)")
     parser.add_argument("--output", type=Path, default=Path("outputs/04_speech_qwen3_sft"))
     parser.add_argument("--epochs", type=int, default=2)
     parser.add_argument("--batch-size", type=int, default=2)
     parser.add_argument("--num-workers", type=int, default=0,
                         help="DataLoader workers for parallel audio loading/augmentation")
-    parser.add_argument("--lr", type=float, default=None,
-                        help="LLM learning rate (default: 2e-4 for --tune lora, 2e-5 for --tune full)")
+    parser.add_argument("--lr", type=float, default=DEFAULT_LR,
+                        help="LLM learning rate (default: 2e-5)")
     parser.add_argument("--max-length", type=int, default=2048)
     parser.add_argument("--max-speech-tokens", type=int, default=512)
-    parser.add_argument("--lora-r", type=int, default=8)
-    parser.add_argument("--lora-alpha", type=int, default=16)
-    parser.add_argument("--lora-dropout", type=float, default=0.05)
-    parser.add_argument("--lora-targets", default="q_proj,k_proj,v_proj,o_proj",
-                        help="comma-separated module name substrings to LoRA")
     parser.add_argument("--grad-clip", type=float, default=1.0)
     parser.add_argument("--lr-schedule", choices=("none", "cosine"), default="cosine",
                         help="cosine: linear warmup then cosine decay down to --min-lr-ratio; "
@@ -361,8 +312,6 @@ def main() -> None:
     parser.add_argument("--wandb-project", default="Speech-MiniMind")
     parser.add_argument("--wandb-name", default=None)
     args = parser.parse_args()
-    if args.lr is None:
-        args.lr = DEFAULT_LR[args.tune]
 
     torch.manual_seed(args.seed)
     ddp_utils.setup()
@@ -381,12 +330,10 @@ def main() -> None:
     )
     acoustic_dim = encoder.output_dim
 
-    # ---- load Qwen3 + prepare fine-tuning (lora or full) ----
+    # ---- load Qwen3 for full fine-tuning ----
     lm, tokenizer = load_qwen3(
         args.qwen3_model, device, dtype=None if args.llm_dtype == "auto" else args.llm_dtype
     )
-    for p in lm.parameters():
-        p.requires_grad_(False)
 
     proj_ckpt = torch.load(args.projector_checkpoint, map_location=device, weights_only=False)
     llm_dim = int(proj_ckpt.get("llm_hidden_size", lm.config.hidden_size))
@@ -407,18 +354,9 @@ def main() -> None:
     if args.tune_projector:
         projector = ddp_utils.wrap(projector)
 
-    if args.tune == "lora":
-        lm = add_lora(
-            lm,
-            r=args.lora_r,
-            alpha=args.lora_alpha,
-            dropout=args.lora_dropout,
-            target_modules=[m for m in args.lora_targets.split(",") if m],
-        )
-    else:  # full: unfreeze every LLM parameter (frontend stays frozen)
-        for p in lm.parameters():
-            p.requires_grad_(True)
-        print("full fine-tune: all Qwen3 parameters trainable")
+    for p in lm.parameters():
+        p.requires_grad_(True)
+    print("full fine-tune: all Qwen3 parameters trainable")
 
     base_lm = ddp_utils.unwrap(lm)
     lm = ddp_utils.wrap(lm)
@@ -511,10 +449,10 @@ def main() -> None:
 
         scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_scale)
 
-    # save config + initial model/adapter reference (rank 0 only)
+    # save config + initial model reference (rank 0 only)
     if ddp_utils.is_main():
         args.output.mkdir(parents=True, exist_ok=True)
-        base_name = "qwen3_base_lora" if args.tune == "lora" else "qwen3_base"
+        base_name = "qwen3_base"
         base_lm.save_pretrained(args.output / base_name)
         tokenizer.save_pretrained(args.output / base_name)
         (args.output / "config.json").write_text(
@@ -553,14 +491,9 @@ def main() -> None:
                 args, encoder, projector, lm, tokenizer, dev_loader, device,
             )
         if ddp_utils.is_main():
-            if args.tune == "full":
-                # full: save whole model + tokenizer (safetensors / bin)
-                base_lm.save_pretrained(args.output / f"model_epoch_{epoch:03d}")
-                tokenizer.save_pretrained(args.output / f"model_epoch_{epoch:03d}")
-                ckpt_tag = f"model_epoch_{epoch:03d}"
-            else:
-                base_lm.save_pretrained(args.output / f"lora_epoch_{epoch:03d}")
-                ckpt_tag = f"lora_epoch_{epoch:03d}"
+            ckpt_tag = f"model_epoch_{epoch:03d}"
+            base_lm.save_pretrained(args.output / ckpt_tag)
+            tokenizer.save_pretrained(args.output / ckpt_tag)
             if args.tune_projector:
                 projector_path = args.output / f"projector_epoch_{epoch:03d}.pt"
                 torch.save({
