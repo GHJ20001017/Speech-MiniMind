@@ -12,8 +12,8 @@
 
 ### 路线 A：基于文本中间表示的级联架构
 
-<div align="center" style="display: flex !important; justify-content: center !important; width: 100%; text-align: center;">
-  <img src="assets/VoxBase-S2S-route-A.png" alt="VoxBase-S2S 路线 A 架构图" width="600" style="display: inline-block !important; float: none !important; margin: 0 auto !important; width: 600px; max-width: 100%; height: auto;" />
+<div align="left">
+  <img src="assets/VoxBase-S2S-route-A.png" alt="VoxBase-S2S 路线 A 架构图" width="600" />
 </div>
 
 > **图示说明**：为兼顾模型的泛化能力与训练、部署成本，并更好地支持微调数据集所覆盖的问答任务，本路线未采用 MiniMind 模型作为语言骨干，而是选用参数量较小、具备预训练语言能力的 **Qwen3-0.6B**。
@@ -26,20 +26,15 @@
 
 ### 路线 B：基于离散语音 Token 的端到端架构
 
-```
-语音输入 ──► 量化编码器(codebook) ──► 音频专属LLM(Qwen3-0.6B) ──► 解码器 ──► 语音输出
-```
+<div align="left">
+  <img src="assets/speech-minimind-cropped.png" alt="路线 B：基于离散语音 Token 的端到端架构" width="600" />
+</div>
 
-- 语音**直接**经过量化编码器生成**codebook**（离散 token 序列），全程音频时域。
-- 由**音频专属的 LLM**（同样是 Qwen3-0.6B）在 token 序列上建模、理解并生成。
-- 生成的 codebook 再经**解码器**还原为波形，端到端输出语音。
-- 优点：语音信息无文本有损，更接近"听"的本质；缺点是需专用数据与更大的训练成本。
+> **图示说明**：图中结构仅用于概括路线 B 的整体流程，各模块的具体设计与实现细节将在后续展开说明。
 
-> 两条路线共享同一份**语音理解**基础，可并行演进、互为对照。以下文档先按**路线 A** 搭建教学主线。
-
-```text
-00 语音基础 → 01 Mel 频谱 → 02 声学编码器（Tiny Conformer + CTC，含流式版） → 03 接入 Qwen3-0.6B → 04 指令微调语音 LLM
-```
+- **语音接入**：在图示的整体设计中，输入语音先由 **Audio Encoder（音频编码器）** 提取特征，再经 **Projector（投影模块）** 映射到 **Qwen3-0.6B Thinker** 的嵌入空间，与文本输入一起参与语义理解，无需先将语音转写为文字。
+- **回复生成**：Thinker 负责语义建模与文本回复生成，独立的 **Talker（语音生成模块）** 结合 Thinker 的中间层隐藏状态和已生成的音频历史，自回归预测多码本的离散语音 Token，再由 **Audio Decoder（音频解码器）** 将其还原为语音波形。与路线 A 不同，语音生成不再仅依赖最终的文本回复，而是直接利用模型内部的语义表示。
+- **优势与局限**：这条路线将语义建模与语音生成更紧密地结合，为联合学习回复内容、韵律和表达方式提供了空间，但并不意味着语音信息能够无损保留。相比独立串接 LLM 与 TTS，联合训练对文本与语音配对数据、音文对齐和多码本生成的稳定性提出了更高要求，训练与调试也更复杂。
 
 ## 路线 A：级联式 Speech LLM 端到端实现（教学主线）
 
