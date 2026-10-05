@@ -257,7 +257,7 @@ python scripts/prepare_speech_to_speech.py --download \
 
 左图：该阶段以文本问题作为输入，以文本答案及其对应的语音作为训练目标，让模型学习在生成回答内容的同时生成相应的语音。Thinker 负责理解问题并生成文本回答，Talker 则结合 Thinker 的隐藏表示，自回归预测离散语音 Token，最后由冻结的音频解码器将其还原为可播放的波形。通过文本与语音的联合训练，模型学习回答内容与语音表达之间的对应关系，从而不仅能用文字作答，也能将答案“说”出来。
 
-右图：在文本生成部分，我们仍然遵循 Qwen3-0.6B 的结构，通过 next-token prediction 逐步生成文本答案。在音频生成部分，我们为离散 codebook 初始化对应的 Embedding 层。由于 Mini 音频编码器包含 8 个 codebook，因此音频侧设置了 8 个 Adapter；同时提取文本侧中间层的语义特征，与音频侧特征相加后送入 Talker，用于建模音频信息。随后，通过一个共享的线性层和 8 个 Adapter，分别预测每个 codebook 的 logits，最后将生成的离散语音 Token 送入 Mini 的解码器，重建得到音频。
+右图：在文本生成部分，我们仍然遵循 Qwen3-0.6B 的结构，通过 next-token prediction 逐步生成文本答案。在音频生成部分，我们为离散 codebook 初始化对应的 Embedding 层。由于 Mini 音频编码器包含 8 个 codebook，因此音频侧设置了 8 个 Adapter；同时提取文本侧中间层的语义特征，与音频侧特征相加后送入 Talker，用于建模音频信息。这里采用了延迟预测（delayed prediction）机制，对不同 codebook 的预测时刻进行错开：在预测下一个 codebook 的 index 时，可以利用前一个 codebook 已生成的离散语音信息，以及前一个 token 的语义特征，从而让后续 codebook 的预测建立在已有的音频和文本上下文之上。随后，通过一个共享的线性层和 8 个 Adapter，分别预测每个 codebook 的 logits，最后将生成的离散语音 Token 送入 Mini 的解码器，重建得到音频。
 
 <p align="center">
   <img src="assets/speech-generation-training-combined.png" alt="语音生成能力训练架构" width="800">
