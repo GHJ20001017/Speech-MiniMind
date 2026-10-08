@@ -1,11 +1,10 @@
-"""Gradio ASR transcription and speech Qwen3 question-answering with sentence TTS.
+"""Gradio ASR transcription and speech Qwen3 question-answering with full-answer TTS.
 
 ASR uses the original independent offline/causal Conformer checkpoints. QA uses
 an acoustic encoder + projector + tuned Qwen3 and Qwen3-TTS CustomVoice. Record
 or upload a complete utterance, then press Run: this is NOT continuous mic/VAD.
-Text is incremental; audio is emitted as ordered, non-repeated sentence WAVs.
-First audio waits for the first sentence AND its full TTS synthesis. Generation
-can continue in the background during TTS; there is no codec-token streaming.
+Text is incremental; the complete answer is synthesized once after generation
+finishes and returned as a single non-streaming WAV for playback.
 
 Run --help for all model/TLS options. Requires gradio>=4.44. Microphone access
 requires localhost or trusted HTTPS. --ssl-auto creates a self-signed certificate
@@ -32,7 +31,7 @@ from scripts.speech_webui_helpers import (  # noqa: E402
 FRAME_MS, HOP_MS, N_MELS, BLANK = 25, 10, 80, 0
 FPS = 1000 // HOP_MS
 ASR_MODE = "ASR 转写（Conformer）"
-QA_MODE = "语音问答 + 流式语音（Qwen3）"
+QA_MODE = "语音问答 + 完整语音（Qwen3）"
 
 
 def greedy_collapse(token_ids, id_to_char):
@@ -220,8 +219,8 @@ def build_demo(args, runner):
             "# ASR 转写 / 语音问答\n"
             "录音结束或上传后点击开始。ASR 使用真实 Conformer CTC；问答使用语音 Qwen3，"
             "**不是把问答结果当作转写**。\n\n"
-            "语音按句生成并依次播放：首包需等待首句文本及该句 TTS 合成，非音频 token 级流式。"
-            "长句会分段；浏览器若限制自动播放，请手动点击播放器。停止不会中断正在运行的 TTS 内核。"
+            "文字逐步显示；完整回答生成后一次性合成语音，合成完成后再播放，不再按句流式播放。"
+            "等待时间可能更长；浏览器若限制自动播放，请手动点击播放器。停止不会中断正在运行的 TTS 内核。"
         )
         mode = gr.Radio([ASR_MODE, QA_MODE], value=QA_MODE if runner.engine else ASR_MODE, label="模式")
         audio = gr.Audio(sources=["upload", "microphone"], type="filepath",
@@ -237,7 +236,7 @@ def build_demo(args, runner):
             offline = gr.Textbox(label="非流式 Conformer 转写", interactive=False)
             streaming = gr.Textbox(label="因果 Conformer 增量转写", interactive=False)
         answer = gr.Textbox(label="Qwen3 回答（增量文本）", interactive=False)
-        speech = gr.Audio(label="回答语音（按句流式）", streaming=True, autoplay=True, format="wav")
+        speech = gr.Audio(label="回答语音（完整音频）", streaming=False, autoplay=True, format="wav")
         status = gr.Textbox(label="状态", interactive=False)
         start.click(run, [audio, mode, instruction, temperature, tokens],
                     [offline, streaming, answer, speech, status], concurrency_limit=None,

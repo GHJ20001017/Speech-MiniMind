@@ -1,8 +1,8 @@
-"""Reusable speech inference and sentence audio streaming (no web framework).
+"""Reusable speech inference with incremental text and complete answer audio.
 
-TTS emits a complete WAV per sentence, not audio-codec-token streaming. First
-sound waits for a text sentence and its synthesis. Cancellation stops generation
-between tokens; an in-flight encoder/TTS kernel must finish before cleanup.
+TTS synthesizes the full answer once after text generation finishes. Cancellation
+stops generation between tokens; an in-flight encoder/TTS kernel must finish
+before cleanup.
 """
 from __future__ import annotations
 
@@ -215,53 +215,44 @@ class SpeechEngine:
 
 
 def stream_answer(engine, audio, instruction, temperature, max_new_tokens, cancelled=None):
-    """Yield (cumulative text, NEW WAV or None, status), never replay old WAVs.
+    """Stream text, then synthesize and emit the complete answer audio once.
 
-    Text generation runs in the engine's worker during sentence synthesis. TTS
-    failures retain the full answer and are reported without retrying chunks.
-    Closing this generator closes the engine and joins its generation worker.
+    Close/join text generation before TTS. Cancellation discards in-flight audio;
+    synthesis failures preserve the answer without retrying.
     """
     if not engine.tts_enabled:
         raise ValueError("语音问答模式需要 --tts-model（Qwen3-TTS CustomVoice）")
-    previous, tail = "", ""
-    failures = []
+    previous = ""
     cancelled = cancelled if cancelled is not None else threading.Event()
     source = engine.stream(audio, instruction, temperature, max_new_tokens, cancelled)
-
-    def speak(chunks, text):
-        for chunk in chunks:
-            if cancelled.is_set():
-                return
-            if not engine._tts_text(chunk):
-                continue
-            try:
-                wav, _ = engine.synthesize(chunk)
-            except Exception as exc:
-                failures.append(str(exc))
-                yield text, None, f"语音合成失败（文本保留）: {exc}"
-            else:
-                if not cancelled.is_set():
-                    yield text, wav, "播放句子音频中…"
-
     try:
         for text in source:
             if cancelled.is_set():
                 break
-            if not text.startswith(previous):
-                raise ValueError("模型流式文本发生回写，已停止以避免重复朗读")
-            tail += text[len(previous):]
             previous = text
             yield text, None, "生成回答中…"
-            chunks, tail = split_sentence_chunks(tail)
-            yield from speak(chunks, text)
-        chunks, _ = split_sentence_chunks(tail, final=True)
-        yield from speak(chunks, previous)
-        status = "已停止" if cancelled.is_set() else ("完成" if previous.strip() else "模型返回空回答")
-        if failures:
-            status += f"；{len(failures)} 个语音片段失败: " + "; ".join(failures)
-        yield previous, None, status
     finally:
         source.close()
+    if cancelled.is_set():
+        yield previous, None, "已停止"
+        return
+    if not previous.strip():
+        yield previous, None, "模型返回空回答"
+        return
+    yield previous, None, "正在合成完整语音，请稍候…"
+    if cancelled.is_set():
+        yield previous, None, "已停止"
+        return
+    try:
+        wav, _ = engine.synthesize(previous)
+    except Exception as exc:
+        status = "已停止" if cancelled.is_set() else f"语音合成失败（文本保留）: {exc}"
+        yield previous, None, status
+    else:
+        if cancelled.is_set():
+            yield previous, None, "已停止"
+        else:
+            yield previous, wav, "完成"
 
 
 def resolve_ssl(args):

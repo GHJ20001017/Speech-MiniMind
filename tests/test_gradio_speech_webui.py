@@ -31,34 +31,45 @@ class FakeEngine:
     tts_enabled = True
     _tts_text = staticmethod(lambda text: text.strip())
 
-    def __init__(self, fail=False):
+    def __init__(self, fail=False, answers=None, stream_fail=False):
         self.spoken = []
         self.closed = False
         self.fail = fail
+        self.stream_fail = stream_fail
+        self.answers = (["第一句。", "第一句。第二句", "第一句。第二句"]
+                        if answers is None else answers)
 
     def stream(self, *_):
         try:
-            yield "第一句。"
-            # Consumer must synthesize before asking for more text.
-            assert self.spoken == ["第一句。"]
-            yield "第一句。第二句"
-            yield "第一句。第二句"  # final duplicate from some streamers
+            for answer in self.answers:
+                assert not self.spoken  # Text generation must finish before TTS.
+                yield answer
+            assert not self.spoken
+            if self.stream_fail:
+                raise RuntimeError("text generation failure")
         finally:
             self.closed = True
 
     def synthesize(self, text):
+        assert self.closed  # The source must also be closed before TTS starts.
         self.spoken.append(text)
-        if self.fail and text == "第二句":
+        if self.fail:
             raise RuntimeError("synthetic failure")
         return wav_bytes([len(self.spoken)]), 16000
 
 
-def test_sentence_order_no_replay_and_final_tail():
+def test_incremental_text_then_single_complete_answer_audio():
     engine = FakeEngine()
-    rows = list(helpers.stream_answer(engine, np.ones(3), "", 0, 32))
-    assert engine.spoken == ["第一句。", "第二句"]
-    assert [r[1] for r in rows if r[1]] == [wav_bytes([1]), wav_bytes([2])]
-    assert rows[-1] == ("第一句。第二句", None, "完成")
+    source = helpers.stream_answer(engine, np.ones(3), "", 0, 32)
+    first = next(source)
+    assert first[0] == "第一句。" and first[1] is None
+    assert not engine.closed and not engine.spoken
+    rows = [first, *source]
+    assert engine.spoken == ["第一句。第二句"]
+    assert all(row[1] is None for row in rows[:-1])
+    assert any(row[0] == "第一句。第二句" for row in rows[:-1])
+    assert [r[1] for r in rows if r[1] is not None] == [wav_bytes([1])]
+    assert rows[-1] == ("第一句。第二句", wav_bytes([1]), "完成")
     assert engine.closed
 
 
@@ -67,9 +78,21 @@ def test_tts_error_keeps_text_and_is_not_retried():
     rows = list(helpers.stream_answer(engine, np.ones(3), "", 0, 32))
     assert rows[-1][0] == "第一句。第二句"
     assert "synthetic failure" in rows[-1][2]
-    assert len([r for r in rows if r[1]]) == 1
-    assert engine.spoken == ["第一句。", "第二句"]
+    assert all(r[1] is None for r in rows)
+    assert engine.spoken == ["第一句。第二句"]
     assert engine.closed
+
+
+def test_text_generation_error_keeps_text_without_synthesis(monkeypatch):
+    patch_audio(monkeypatch)
+    engine = FakeEngine(stream_fail=True)
+    runner = WebUIRunner(engine=engine)
+    rows = list(runner.run("input.wav", QA_MODE, "", 0, 32, "error"))
+    assert rows[-1][2] == "第一句。第二句"
+    assert "text generation failure" in rows[-1][4]
+    assert all(r[3] is None for r in rows)
+    assert not engine.spoken and engine.closed
+    assert not runner._sessions and not runner._inference_lock.locked()
 
 
 def test_close_and_cooperative_cancel_never_emit_stale_audio():
@@ -89,9 +112,49 @@ def test_close_and_cooperative_cancel_never_emit_stale_audio():
 
     engine.synthesize = synthesize
     rows = list(helpers.stream_answer(engine, np.ones(3), "", 0, 32, cancelled))
-    assert not any(r[1] for r in rows)
-    assert rows[-1][2] == "已停止" and engine.closed
-    assert engine.spoken == ["第一句。"]
+    assert all(r[1] is None for r in rows)
+    assert rows[-1] == ("第一句。第二句", None, "已停止")
+    assert engine.closed
+    assert engine.spoken == ["第一句。第二句"]
+
+
+def test_cancel_after_text_source_closes_skips_tts():
+    cancelled = threading.Event()
+
+    class CancelOnCloseEngine(FakeEngine):
+        def stream(self, *args):
+            try:
+                yield from super().stream(*args)
+            finally:
+                cancelled.set()
+
+    engine = CancelOnCloseEngine()
+    rows = list(helpers.stream_answer(engine, np.ones(3), "", 0, 32, cancelled))
+    assert rows[-1] == ("第一句。第二句", None, "已停止")
+    assert all(r[1] is None for r in rows)
+    assert engine.closed and not engine.spoken
+
+
+def test_cancel_during_text_generation_skips_tts():
+    engine = FakeEngine()
+    cancelled = threading.Event()
+    source = helpers.stream_answer(engine, np.ones(3), "", 0, 32, cancelled)
+    first = next(source)
+    cancelled.set()
+    rows = [first, *source]
+    assert rows[-1] == (first[0], None, "已停止")
+    assert all(r[1] is None for r in rows)
+    assert engine.closed and not engine.spoken
+
+
+@pytest.mark.parametrize("answers", [[], [""], ["   \n\t"]])
+def test_blank_answer_never_synthesizes(answers):
+    engine = FakeEngine(answers=answers)
+    rows = list(helpers.stream_answer(engine, np.ones(3), "", 0, 32))
+    assert not rows[-1][0].strip()
+    assert rows[-1][2] == "模型返回空回答"
+    assert all(r[1] is None for r in rows)
+    assert engine.closed and not engine.spoken
 
 
 def test_splitter_and_ctc_boundaries():
@@ -145,15 +208,23 @@ def test_asr_routing_and_request_local_state(monkeypatch):
     assert "语音问答需要" in list(runner.run("in", QA_MODE, "", 0, 32, "two"))[-1][-1]
 
 
-def test_qa_routing_and_exception_preserves_answer(monkeypatch):
+@pytest.mark.parametrize("fail", [False, True])
+def test_qa_routing_and_exception_preserves_answer(monkeypatch, fail):
     patch_audio(monkeypatch)
-    engine = FakeEngine()
+    engine = FakeEngine(fail=fail)
     runner = WebUIRunner(engine=engine)
     rows = list(runner.run("input.wav", QA_MODE, "", 0, 32, "one"))
     assert rows[-1][2] == "第一句。第二句"
-    assert len([r for r in rows if r[3]]) == 2
+    assert engine.spoken == ["第一句。第二句"] and engine.closed
+    assert all(r[3] is None for r in rows[:-1])
+    if fail:
+        assert rows[-1][3] is None
+        assert "synthetic failure" in rows[-1][-1]
+    else:
+        assert rows[-1][3] == wav_bytes([1])
+        assert rows[-1][-1] == "完成"
     assert all(not r[0] and not r[1] for r in rows)
-    assert not runner._sessions
+    assert not runner._sessions and not runner._inference_lock.locked()
 
 
 def test_concurrent_waiter_cancels_without_affecting_other_session(monkeypatch):
@@ -280,7 +351,8 @@ def test_gradio_wiring_and_cli_model_options(monkeypatch):
         "--tts-model", "tts", "--tts-speaker", "Serena", "--ssl-auto",
     ])
     build_demo(args, WebUIRunner(engine=FakeEngine()))
-    audio = next(c for c in components if c.kwargs.get("streaming"))
+    audio = next(c for c in components if c.kwargs.get("label") == "回答语音（完整音频）")
+    assert audio.kwargs["streaming"] is False
     assert audio.kwargs["autoplay"] is True
     assert calls[0][1]["concurrency_limit"] is None
     assert calls[0][0][0].__annotations__["request"] is fake.Request

@@ -145,7 +145,7 @@ python scripts/visualize_asr_webui.py \
 ```
 
 <p align="center">
-  <img src="assets/02_acoustic_encoder_demo.gif" alt="评估声学编码器演示">
+  <img src="assets/02_acoustic_encoder_demo.png" alt="评估声学编码器演示">
 </p>
 
 > **关于本套编码器的泛化性声明**：VoxBase-encoder只在**中文 AISHELL-1**（16kHz 平稳播音、整句 2–6s）上训练，且**模型参数量较小**（约 Tiny 规模），因此对**训练分布外的输入难以有较好的泛化性能**——例如带口音/方言、语速异常、嘈杂或更长的音频，识别效果会明显下降甚至出现乱码。这属于预期行为，并非代码 bug；如果你需要更通用、更强的声学编码，**建议用开源的成熟编码器**（如 FunASR 的 Paraformer-zh-streaming、Whisper/OpenAI、语音自监督前端 wav2vec 2.0 / HuBERT 等）来达到更好的效果，本项目的编码器更多用于教学演示与完整流水线打通。
@@ -234,7 +234,7 @@ python scripts/visualize_asr_webui.py \
 ```
 
 <p align="center">
-  <img src="assets/04_speech_qwen3_demo.gif" alt="Speech-MiniMind WebUI 互动平台演示">
+  <img src="assets/04_speech_qwen3_demo.png" alt="Speech-MiniMind WebUI 互动平台演示">
 </p>
 
 ## 路线 B：基于离散语音 Token 的端到端架构
@@ -282,6 +282,45 @@ CUDA_VISIBLE_DEVICES=6,7 HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 \
   --num-workers 0 --seed 7 --limit 0 --dev-limit 0 \
   --wandb --wandb-project Speech-MiniMind --wandb-name s2a_thinker_talker_loss_metrics
 ```
+
+下面给出训练过程中的loss 曲线（仅供参考）：
+
+| 文本损失 | 音频损失 |
+|:---:|:---:|
+| ![文本损失](assets/s2a_text_loss.png) | ![音频损失](assets/s2a_audio_loss.png) |
+
+#### 文本与语音联合生成示例
+
+<table>
+  <tr>
+    <td width="50%" valign="top">
+      <strong>自我介绍</strong>
+
+https://github.com/user-attachments/assets/1277488c-e93e-40f4-b8c0-79299478d5ed
+
+    </td>
+    <td width="50%" valign="top">
+      <strong>天空为什么是蓝色的</strong>
+
+https://github.com/user-attachments/assets/f310d43f-a765-4744-824b-b676f3e5e6ff
+
+    </td>
+  </tr>
+  <tr>
+    <td width="50%" valign="top">
+      <strong>煮鸡蛋需要多久</strong>
+
+https://github.com/user-attachments/assets/52598b38-2ae2-49ce-9636-1ebc05096d65
+
+    </td>
+    <td width="50%" valign="top">
+      <strong>学习鼓励</strong>
+
+https://github.com/user-attachments/assets/49ec5adb-d76f-4730-aba0-483b1b7fb48d
+
+    </td>
+  </tr>
+</table>
 
 ### 4. 语音到语音指令微调（06，B1/B2）
 
