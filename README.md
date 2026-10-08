@@ -292,34 +292,34 @@ CUDA_VISIBLE_DEVICES=6,7 HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 \
 #### 文本与语音联合生成示例
 
 <table>
-  <tr>
-    <td width="50%" valign="top">
-      <strong>自我介绍</strong>
+<tr>
+<td width="50%" valign="top">
+<strong>自我介绍</strong>
 
 https://github.com/user-attachments/assets/1277488c-e93e-40f4-b8c0-79299478d5ed
 
-    </td>
-    <td width="50%" valign="top">
-      <strong>天空为什么是蓝色的</strong>
+</td>
+<td width="50%" valign="top">
+<strong>天空为什么是蓝色的</strong>
 
 https://github.com/user-attachments/assets/f310d43f-a765-4744-824b-b676f3e5e6ff
 
-    </td>
-  </tr>
-  <tr>
-    <td width="50%" valign="top">
-      <strong>煮鸡蛋需要多久</strong>
+</td>
+</tr>
+<tr>
+<td width="50%" valign="top">
+<strong>煮鸡蛋需要多久</strong>
 
 https://github.com/user-attachments/assets/52598b38-2ae2-49ce-9636-1ebc05096d65
 
-    </td>
-    <td width="50%" valign="top">
-      <strong>学习鼓励</strong>
+</td>
+<td width="50%" valign="top">
+<strong>学习鼓励</strong>
 
 https://github.com/user-attachments/assets/49ec5adb-d76f-4730-aba0-483b1b7fb48d
 
-    </td>
-  </tr>
+</td>
+</tr>
 </table>
 
 ### 4. 语音到语音指令微调（06，B1/B2）
