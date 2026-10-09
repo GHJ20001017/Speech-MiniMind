@@ -241,16 +241,10 @@ python scripts/visualize_asr_webui.py \
 
 ### 构建训练数据
 
-从 ModelScope 下载 MiniMind-O 已经 token 化好的 `sft_t2a.parquet` 和 `sft_a2a.parquet`，分别用于 S2A 训练和语音到语音数据准备：
+从 ModelScope 一次下载 MiniMind-O 原始 parquet：`sft_t2a.parquet` 用于 S2A，`sft_a2a.parquet` 直接用于下面两阶段语音输入训练。
 
 ```bash
-# 下载 S2A 训练数据
-python -c "from modelscope.hub.snapshot_download import dataset_snapshot_download; dataset_snapshot_download('gongjy/minimind-o_dataset', local_dir='data/minimind_o', allow_patterns=['sft_t2a.parquet'])"
-
-# 下载并准备语音到语音数据
-python scripts/prepare_speech_to_speech.py --download \
-  --file-name sft_a2a.parquet --lang zh \
-  --output data/route_b/s2s --device cuda:0
+python -c "from modelscope.hub.snapshot_download import dataset_snapshot_download; dataset_snapshot_download('gongjy/minimind-o_dataset', local_dir='data/minimind_o', allow_patterns=['sft_t2a.parquet', 'sft_a2a.parquet'])"
 ```
 
 ### 训练语音生成能力
@@ -322,56 +316,52 @@ https://github.com/user-attachments/assets/49ec5adb-d76f-4730-aba0-483b1b7fb48d
 </tr>
 </table>
 
-### 4. 语音到语音指令微调（06，B1/B2）
+### 4. Thinker–Talker 语音输入对齐训练
 
-从已训练的 B0 checkpoint 继续做 **LoRA 微调**，冻结音频 embedding、LM head 和主干原始权重，只监督回答语音段（prompt / 输入音频 / padding 全部 `-100`）。LoRA 覆盖 Attention 的 Q/K/V/O 与 MLP 的 gate/up/down 投影。
+在完整 S2A epoch006 权重上新增语音输入前端：**问题波形 → 冻结 SenseVoice-Small → 可训练投影器 → Thinker**，由文本回答和 Talker 的 Mimi 码共同监督。先仅训练投影器（`audio_proj`），再联合微调 Thinker、Talker 和投影器（`all`）；SenseVoice 始终冻结。
 
-下面是在 95 服务器项目目录下执行的完整命令；直接指定 `speech-llm` 环境，输出单独放在 `06_route_b_s2s_lora`，避免覆盖已有全参训练结果：
+第一阶段：对齐输入投影器。
 
 ```bash
-cd /gpu3/guhj/Speech-MiniMind
-CUDA_VISIBLE_DEVICES=6,7 \
-/gpu3/guhj/envs/speech-llm/bin/python -m torch.distributed.run \
-  --nproc_per_node=2 --master-port=29522 \
-  trainer/train_speech_to_speech.py \
-  --data data/route_b/s2s \
-  --init-from outputs/05_route_b_audio_lm_emilia/model_epoch_003 \
-  --output outputs/06_route_b_s2s_lora --epochs 3 --batch-size 2 \
-  --tune lora --lora-r 16 --lora-alpha 32 --lora-dropout 0.05 \
-  --lr 1e-4 --num-workers 4 --grad-checkpointing --loss-chunk 256 \
-  --lr-schedule cosine --warmup-ratio 0.03 --min-lr-ratio 0.1 --loss-ema 0.02 \
-  --wandb --wandb-name route_b_s2s_lora
+CUDA_VISIBLE_DEVICES=6,7 torchrun --standalone --nproc_per_node=2 trainer/train_thinker_talker_s2s.py \
+  --data data/minimind_o/sft_a2a.parquet \
+  --init-checkpoint outputs/s2a_thinker_talker_aligned_bs8/stage_01_s2a/model_epoch_006 \
+  --encoder /path/to/SenseVoiceSmall --tuning audio_proj \
+  --output outputs/s2s_audio_proj \
+  --epochs 1 --batch-size 8 --gradient-accumulation-steps 4 --lr 1e-4 --max-seq-len 2048 \
+  --wandb --wandb-project Speech-MiniMind --wandb-name s2s_audio_proj
 ```
 
-### 5. 端到端推理（06）
+第二阶段从已对齐权重继续联合微调；若第一阶段训练轮数改变，请对应修改 `model_epoch_001`：
 
 ```bash
-python scripts/infer_speech_to_speech.py \
+CUDA_VISIBLE_DEVICES=6,7 torchrun --standalone --nproc_per_node=2 trainer/train_thinker_talker_s2s.py \
+  --data data/minimind_o/sft_a2a.parquet \
+  --init-checkpoint outputs/s2s_audio_proj/model_epoch_001 \
+  --encoder /path/to/SenseVoiceSmall --tuning all \
+  --output outputs/s2s_all \
+  --epochs 3 --batch-size 8 --gradient-accumulation-steps 4 --lr 2e-5 --max-seq-len 2048 \
+  --wandb --wandb-project Speech-MiniMind --wandb-name s2s_all
+```
+
+### 5. 真实语音到语音推理
+
+完整路径为 **问题波形 → 冻结 SenseVoice → 连续特征投影 → Thinker 回答文本 / Talker 回答 Mimi 码 → 冻结 Mimi 解码波形**，不是 ASR 文本级联或外部 TTS。必须先训练新前端；S2A epoch006 不能直接作为可理解语音的模型使用。
+
+```bash
+python scripts/infer_thinker_talker_s2s.py \
   --audio examples/disgusted_to_happy.wav \
-  --model outputs/06_route_b_s2s_lora/model_epoch_003 \
-  --codec-type mimi --device cuda:0 --output outputs/route_b_answer.wav
+  --checkpoint outputs/s2s_all/model_epoch_003 \
+  --encoder /path/to/SenseVoiceSmall --mimi-model /path/to/mimi \
+  --device cuda:0 --max-new-frames 500 --max-text-tokens 512 \
+  --output outputs/s2s_answer
 ```
 
-> codec 为冻结的预训练模型（Mimi 8×2048、12.5 Hz、24 kHz；EnCodec 24 kHz 作对照），仓库不训练 codec。第一阶段的 s2s 数据主要来自 MiniMind-O `sft_a2a` 与自建 TTS 合成配对，**音色单一、无真实噪声**，属于教学闭环的已知局限，不能当作真实场景泛化结论。
 
+## 😊 鸣谢
 
-## 目录结构
+- [MiniMind-O](https://github.com/jingyaogong/minimind-o)
 
-```text
-Speech-MiniMind/
-├── docs/        # 分章教学文档
-├── assets/      # README 插图（训练曲线等）
-├── examples/    # 示例音频
-├── model/       # Conformer、CTC、流式版、Projector、Qwen3 适配（qwen3_adapter.py）、chat 模板（chat_format.py）、音频 codec / 音频 LM（路线 B）
-├── dataset/     # Dataset 与训练时随机音频增强（含路线 B 的 token 数据集）
-├── trainer/     # 各阶段训练脚本
-├── scripts/     # 数据准备 / 下载 / 评估 / 推理 / WebUI
-├── data/        # 本地数据，不提交
-├── outputs/     # 图表、日志、checkpoint，不提交
-├── requirements.txt
-└── README.md
-```
+## ⚖️ 开源协议
 
-## 开源说明
-
-数据集遵循 AISHELL-1 原始许可；`data/`、`outputs/`、`.pt`、压缩包不提交仓库。正式发布前会补充代码许可证与数据集引用。
+本项目采用 Apache License 2.0 开源协议。

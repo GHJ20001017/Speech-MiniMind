@@ -189,28 +189,30 @@ def synthesize_s2a(model, tokenizer, messages, max_frames: int, device):
     }
 
 
-@torch.inference_mode()
-def synthesize_s2a_joint(model, tokenizer, history, max_frames: int, device,
-                         max_text_tokens: int = 512):
-    """Jointly autoregress text and delayed Mimi codes without answer leakage."""
-    if max_frames < 1 or max_text_tokens < 1:
-        raise ValueError("max_frames and max_text_tokens must be positive")
+def joint_prompt(tokenizer, history, *, strip_empty_thinking=False):
+    """Deterministic answer-free prefix and assistant terminator."""
     if (not isinstance(history, list) or not history
             or any(not isinstance(item, dict)
                    or item.get("role") not in {"system", "user", "assistant"}
                    or not isinstance(item.get("content"), str) for item in history)
             or history[-1]["role"] == "assistant"):
         raise ValueError("joint history must contain text messages and omit the final assistant answer")
-    prefix = list(tokenizer.apply_chat_template(
-        history, tokenize=True, add_generation_prompt=True
-    ))
-    # Render only an empty assistant: its template-owned thinking scaffold is
-    # deterministic and contains no reference answer tokens. Retain it rather
-    # than applying training's random empty-thinking removal.
-    empty = list(tokenizer.apply_chat_template(
-        history + [{"role": "assistant", "content": ""}],
-        tokenize=True, add_generation_prompt=False,
-    ))
+    def render(messages, generation):
+        if not strip_empty_thinking:
+            return list(tokenizer.apply_chat_template(
+                messages, tokenize=True, add_generation_prompt=generation))
+        # Transform the entire rendered history, not just the final scaffold.
+        # Retokenize before computing boundaries: token offsets need not shift
+        # by a constant when whitespace merges across a removed think block.
+        text = tokenizer.apply_chat_template(
+            messages, tokenize=False, add_generation_prompt=generation)
+        text = text.replace("<think>\n\n</think>\n\n", "")
+        return list(tokenizer(text, add_special_tokens=False)["input_ids"])
+
+    prefix = render(history, True)
+    # Reference-answer-free scaffold; S2S training can strip empty thinking,
+    # while all existing inference/S2A callers retain deterministic behavior.
+    empty = render(history + [{"role": "assistant", "content": ""}], False)
     if not prefix or len(empty) <= len(prefix) or empty[:len(prefix)] != prefix:
         raise ValueError("joint chat template generation prefix is not a prefix of empty assistant turn")
     trailer = empty[len(prefix):]
@@ -228,6 +230,19 @@ def synthesize_s2a_joint(model, tokenizer, history, max_frames: int, device,
     if not trailer:
         raise ValueError("chat template assistant trailer is empty")
 
+    return prefix, trailer
+
+
+@torch.inference_mode()
+def synthesize_s2a_joint(model, tokenizer, history, max_frames: int, device,
+                         max_text_tokens: int = 512, speech_inputs=None,
+                         pad_stopped_streams=False):
+    """Jointly autoregress text and delayed Mimi codes without answer leakage."""
+    if max_frames < 1 or max_text_tokens < 1:
+        raise ValueError("max_frames and max_text_tokens must be positive")
+    prefix, trailer = joint_prompt(tokenizer, history)
+    im_end = trailer[0]
+
     delay = max(AUDIO_CODEBOOK_DELAYS)
     max_steps = max(max_text_tokens + len(trailer), max_frames + delay + 2)
     context_limit = int(model.config.max_position_embeddings)
@@ -237,7 +252,8 @@ def synthesize_s2a_joint(model, tokenizer, history, max_frames: int, device,
     audio_inputs = torch.full((1, len(prefix), NUM_CODEBOOKS), AUDIO_PAD_ID, dtype=torch.long, device=device)
     attention = torch.ones_like(inputs)
     out = model.forward_streams(
-        inputs, audio_inputs, attention_mask=attention, use_cache=True
+        inputs, audio_inputs, attention_mask=attention, use_cache=True,
+        **(speech_inputs or {})
     )
     past = out.past_key_values
     text_hidden, audio_hidden = out.text_hidden, out.audio_hidden
@@ -282,7 +298,7 @@ def synthesize_s2a_joint(model, tokenizer, history, max_frames: int, device,
             # Step zero predicts only the first answer token. The first audio
             # code is predicted one step later, from that token's hidden state.
             frame = step - 1 - AUDIO_CODEBOOK_DELAYS[q]
-            if frame < 0:
+            if frame < 0 or (pad_stopped_streams and stopped[q]):
                 sampled[q].append(AUDIO_PAD_ID)
                 continue
             predicted = sample_audio(head(current_audio)[0], sampled[q])

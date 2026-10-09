@@ -185,7 +185,6 @@ class SenseVoiceFrozenEncoder(FrozenSpeechEncoder):
     ) -> None:
         try:
             from funasr import AutoModel
-            from funasr.frontends.wav_frontend import WavFrontend
         except ImportError as error:  # pragma: no cover - environment dependent
             raise ImportError(
                 "SenseVoiceFrozenEncoder requires 'funasr'. "
@@ -199,23 +198,20 @@ class SenseVoiceFrozenEncoder(FrozenSpeechEncoder):
             disable_update=True,
         )
         self._encoder = self._auto.model.encoder
-        self._encoder.to(self._device).eval()
+        self._encoder.to(self._device).float().eval()
         for parameter in self._encoder.parameters():
             parameter.requires_grad_(False)
         self._engine = self._encoder
         self.output_dim = int(self._encoder.output_size())
         self.output_frame_shift_ms = 60.0
 
-        self._frontend = WavFrontend(
-            fs=16000,
-            window="hamming",
-            n_mels=80,
-            frame_length=25,
-            frame_shift=10,
-            lfr_m=7,
-            lfr_n=6,
-            dither=0.0 if disable_dither else 1.0,
-        )
+        self._frontend = self._auto.kwargs["frontend"]
+        if disable_dither and hasattr(self._frontend, "dither"):
+            self._frontend.dither = 0.0
+
+    def train(self, mode=True):
+        self._encoder.eval()
+        return self
 
     @torch.no_grad()
     def encode(
@@ -230,7 +226,8 @@ class SenseVoiceFrozenEncoder(FrozenSpeechEncoder):
                 f"SenseVoice frontend expects 16 kHz waveforms, got {sample_rate} Hz. "
                 "Resample before calling encode."
             )
-        waveforms = waveforms.to(self._device)
+        self._encoder.eval()
+        waveforms = waveforms.to(self._device).float()
         lengths = lengths.to(self._device)
         # WavFrontend handles the per-utterance fbank extraction internally,
         # then pads the result so SenseVoice's encoder sees one real batch.
@@ -240,7 +237,10 @@ class SenseVoiceFrozenEncoder(FrozenSpeechEncoder):
         )
         features = features.to(self._device)
         feature_lengths = feature_lengths.to(self._device)
-        if feature_augment:
+        if callable(feature_augment):
+            for i, size in enumerate(feature_lengths):
+                feature_augment(features[i, :int(size)])
+        elif feature_augment:
             features = augment_mel_features(features)
         hidden, hidden_lengths = self._encoder(features, feature_lengths)
         return hidden, hidden_lengths

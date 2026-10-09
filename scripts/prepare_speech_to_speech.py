@@ -1,31 +1,7 @@
-"""Build a Route-B speech-to-speech manifest from a MiniMind-O ``sft_a2a`` parquet.
+"""Prepare SenseVoice waveform inputs and existing assistant Mimi codes from sft_a2a.
 
-MiniMind-O publishes its audio-to-audio SFT set as ``sft_a2a.parquet`` on
-ModelScope (``gongjy/minimind-o_dataset``).  Each row already carries the
-tokenised answer audio, so we only need to:
-
-1. read the parquet (``conversations`` / ``question_audios`` / ``answer_audios``),
-2. turn the flattened answer tokens back into a ``(8, T)`` Mimi code array,
-3. encode the *question* audio bytes with the same frozen Mimi codec, and
-4. write both as ``.npy`` shards plus a JSONL manifest the trainer reads.
-
-Manifest rows also carry the assistant ``answer_text`` so the M0 reconstruction
-gate can score round-trip CER/WER on the answer-audio domain without re-reading
-the parquet.
-
-Tokens in ``answer_audios`` are stored flat as 8 codes per frame, with a
-per-layer stop token (``>= codebook_size``) terminating each layer; those are
-truncated here because the trainer appends ``<|audio_end|>`` itself.
-
-Usage::
-
-    # download once (needs `modelscope`), then convert
-    python scripts/prepare_speech_to_speech.py --download --output data/route_b/s2s
-    python scripts/prepare_speech_to_speech.py \
-        --parquet /path/to/sft_a2a.parquet --output data/route_b/s2s --lang zh
-
-The script is CPU-capable but the question-audio encoding is much faster on a
-GPU; pass ``--device cuda:0`` and ``--batch-size 8`` on the training host.
+No question codec encoding or model downloads are needed. --download optionally
+fetches only the explicitly requested dataset. Output must be a new directory.
 """
 
 from __future__ import annotations
@@ -33,17 +9,16 @@ from __future__ import annotations
 import argparse
 import io
 import json
+import sys
 from pathlib import Path
 
 import numpy as np
-import torch
 
 ROOT = Path(__file__).resolve().parents[1]
-import sys
 
 sys.path.insert(0, str(ROOT))
 
-from model.audio_codec import build_frozen_audio_codec  # noqa: E402
+from dataset.thinker_talker_s2s import load_waveform  # noqa: E402
 
 DATASET_ID = "gongjy/minimind-o_dataset"
 
@@ -60,11 +35,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--file-name", default="sft_a2a.parquet",
                         help="parquet file to use inside the dataset repo")
     parser.add_argument("--output", type=Path, default=Path("data/route_b/s2s"))
-    parser.add_argument("--codec-type", default="mimi", choices=("mimi", "encodec"))
-    parser.add_argument("--codec-model", default=None,
-                        help="codec model id or local dir (defaults per backend)")
-    parser.add_argument("--device", default="cpu", help="torch device for codec encoding")
-    parser.add_argument("--batch-size", type=int, default=4)
     parser.add_argument("--lang", default="zh", choices=("zh", "en", "all"),
                         help="keep rows whose assistant reply is mostly this language")
     parser.add_argument("--dev-rows", type=int, default=200,
@@ -73,8 +43,6 @@ def parse_args() -> argparse.Namespace:
                         help="drop rows whose answer exceeds this many frames")
     parser.add_argument("--limit", type=int, default=0, help="only process N rows (smoke test)")
     parser.add_argument("--seed", type=int, default=7)
-    parser.add_argument("--skip-prompt-encode", action="store_true",
-                        help="do not encode question audio (writes prompt_codes=null)")
     return parser.parse_args()
 
 
@@ -155,177 +123,78 @@ def decode_audio_bytes(data: bytes) -> tuple[np.ndarray, int] | None:
         return None
     if waveform.ndim > 1:
         waveform = waveform.mean(axis=1)
-    if waveform.size == 0:
+    if waveform.size == 0 or not np.isfinite(waveform).all():
         return None
     return waveform.astype(np.float32), int(rate)
 
 
 def main() -> None:
+    import soundfile as sf
     args = parse_args()
-    torch.manual_seed(args.seed)
-
+    if args.output.exists():
+        raise SystemExit("output already exists; choose a new directory")
+    if args.dev_rows < 1 or args.max_answer_frames < 1 or args.limit < 0:
+        raise SystemExit("dev-rows/max-answer-frames must be positive; limit nonnegative")
     parquet_path = args.parquet
-    if args.download or parquet_path is None:
+    if args.download:
         parquet_path = download_dataset(args)
-    if not parquet_path.exists():
-        raise SystemExit(f"parquet not found: {parquet_path}")
-
-    try:
-        import pyarrow.parquet as pq
-    except ImportError as error:  # pragma: no cover - environment dependent
-        raise SystemExit(
-            "pyarrow is required to read the parquet. Run: python -m pip install pyarrow"
-        ) from error
-
-    codec = None
-    if not args.skip_prompt_encode:
-        codec = build_frozen_audio_codec(args.codec_type, args.codec_model, args.device)
-
-    parquet_file = pq.ParquetFile(str(parquet_path))
-    columns = set(parquet_file.schema_arrow.names)
-    for required in ("conversations", "answer_audios"):
-        if required not in columns:
-            raise SystemExit(f"parquet is missing required column '{required}' (has {sorted(columns)})")
-    has_questions = "question_audios" in columns
-
-    num_codebooks = codec.num_codebooks if codec is not None else 8
-    codebook_size = codec.codebook_size if codec is not None else 2048
-
-    output: Path = args.output
-    code_dir = output / "codes"
-    code_dir.mkdir(parents=True, exist_ok=True)
-
-    rows: list[dict] = []
-    stats = {"rows": 0, "kept": 0, "no_answer": 0, "bad_answer": 0, "lang": 0,
-             "too_long": 0, "no_question": 0, "question_failed": 0}
-
-    # Collect candidates first so the codec can encode question audio in batches.
-    # The parquet is ~5.7 GB with nested list columns, so iterate row-group
-    # batches instead of materialising the whole table (which both blows up RAM
-    # and trips "Nested data conversions not implemented for chunked arrays").
-    pending: list[dict] = []
-    total_rows = parquet_file.metadata.num_rows
-    stop_at = total_rows if not args.limit else min(args.limit, total_rows)
-    wanted = [c for c in ("conversations", "answer_audios", "question_audios") if c in columns]
-    index = -1
-    for batch in parquet_file.iter_batches(batch_size=256, columns=wanted):
-        if index + 1 >= stop_at:
-            break
-        data = batch.to_pydict()
-        for offset in range(batch.num_rows):
-            index += 1
-            if index >= stop_at:
+    if parquet_path is None or not parquet_path.is_file():
+        raise SystemExit("provide an existing --parquet or explicitly request --download")
+    import pyarrow.parquet as pq
+    parquet = pq.ParquetFile(str(parquet_path))
+    required = ["conversations", "answer_audios", "question_audios"]
+    if not set(required).issubset(parquet.schema_arrow.names):
+        raise SystemExit("parquet requires conversations, answer_audios and question_audios")
+    output = args.output
+    output.mkdir(parents=True, exist_ok=False)
+    (output / "codes").mkdir()
+    (output / "audio").mkdir()
+    rows = []
+    stats = {"rows": 0, "kept": 0, "rejected": 0}
+    for batch in parquet.iter_batches(batch_size=64, columns=required):
+        for record in batch.to_pylist():
+            if args.limit and stats["rows"] >= args.limit:
                 break
+            index = stats["rows"]
             stats["rows"] += 1
-            conversations = json.loads(data["conversations"][offset])
-            assistant_turns = [t for t in conversations if t.get("role") == "assistant"]
-            if not assistant_turns:
-                stats["no_answer"] += 1
+            conversations = record["conversations"]
+            if isinstance(conversations, str):
+                conversations = json.loads(conversations)
+            users = [t for t in conversations if t.get("role") == "user"]
+            assistants = [t for t in conversations if t.get("role") == "assistant"]
+            questions = record["question_audios"] or []
+            answers = record["answer_audios"] or []
+            prompt = str(users[-1].get("content", "")).strip() if users else ""
+            answer = str(assistants[-1].get("content", "")).strip() if assistants else ""
+            codes = split_answer_tokens(answers[-1], 8, 2048) if answers else None
+            decoded = decode_audio_bytes(questions[-1]) if questions and questions[-1] else None
+            if (not prompt or not answer or not keep_language(answer, args.lang)
+                    or codes is None or codes.shape[1] > args.max_answer_frames or decoded is None):
+                stats["rejected"] += 1
                 continue
-            if not keep_language(str(assistant_turns[-1].get("content", "")), args.lang):
-                stats["lang"] += 1
-                continue
-
-            answer_audios = data["answer_audios"][offset] or []
-            if not answer_audios:
-                stats["no_answer"] += 1
-                continue
-            codes = split_answer_tokens(
-                [int(t) for t in answer_audios[-1]], num_codebooks, codebook_size
-            )
-            if codes is None:
-                stats["bad_answer"] += 1
-                continue
-            if codes.shape[1] > args.max_answer_frames:
-                stats["too_long"] += 1
-                continue
-
-            question_audio = None
-            if codec is not None and has_questions:
-                audios = data["question_audios"][offset] or []
-                if audios and audios[-1]:
-                    question_audio = audios[-1]
-                else:
-                    stats["no_question"] += 1
-            pending.append(
-                {"index": index, "codes": codes, "audio": question_audio,
-                 "answer_text": str(assistant_turns[-1].get("content", "")).strip()}
-            )
-        if index + 1 >= stop_at:
+            audio_rel = f"audio/{index:07d}.wav"
+            # Preserve the decoded mono question at its original rate; the shared
+            # loader resamples each utterance independently to 16 kHz at use time.
+            sf.write(output / audio_rel, decoded[0], decoded[1], subtype="FLOAT")
+            load_waveform(output / audio_rel)  # validate the exact artifact the trainer reads
+            code_rel = f"codes/{index:07d}_a.npy"
+            np.save(output / code_rel, codes)
+            rows.append(dict(prompt_audio=audio_rel, prompt_text=prompt, answer_text=answer,
+                             answer_codes=code_rel, frames=int(codes.shape[1]), task="speech_qa"))
+            stats["kept"] += 1
+        if args.limit and stats["rows"] >= args.limit:
             break
-
-    # Batch-encode question audio.
-    if codec is not None:
-        batch_size = max(1, args.batch_size)
-        for start in range(0, len(pending), batch_size):
-            chunk = pending[start : start + batch_size]
-            loaded = []
-            for item in chunk:
-                decoded = decode_audio_bytes(item["audio"]) if item["audio"] else None
-                loaded.append(decoded)
-            valid = [(item, dec) for item, dec in zip(chunk, loaded) if dec is not None]
-            if valid:
-                waveforms = [torch.from_numpy(dec[0]) for _, dec in valid]
-                lengths = torch.tensor([w.numel() for w in waveforms], dtype=torch.long)
-                padded = torch.nn.utils.rnn.pad_sequence(waveforms, batch_first=True)
-                rates = {dec[1] for _, dec in valid}
-                rate = rates.pop() if len(rates) == 1 else 16000
-                codes, code_lengths = codec.encode(padded, lengths, rate)
-                for (item, _), code, length in zip(valid, codes, code_lengths.tolist()):
-                    item["question_codes"] = code[:, :length].numpy().astype(np.int16)
-            for item in chunk:
-                if "question_codes" not in item:
-                    stats["question_failed"] += 1
-                    item["question_codes"] = None
-            print(f"[encode] {min(start + batch_size, len(pending))}/{len(pending)}", flush=True)
-
-    split_at = max(1, len(pending) - args.dev_rows)
-    for position, item in enumerate(pending):
-        split = "train" if position < split_at else "dev"
-        np.save(code_dir / f"{item['index']:07d}_a.npy", item["codes"])
-        prompt_rel = None
-        if item.get("question_codes") is not None:
-            np.save(code_dir / f"{item['index']:07d}_p.npy", item["question_codes"])
-            prompt_rel = f"codes/{item['index']:07d}_p.npy"
-        rows.append(
-            {
-                "split": split,
-                "prompt_codes": prompt_rel,
-                "answer_codes": f"codes/{item['index']:07d}_a.npy",
-                "task": "speech_qa",
-                "source": f"minimind_o/{args.file_name}",
-                "lang": args.lang if args.lang != "all" else "mixed",
-                "frames": int(item["codes"].shape[1]),
-                # Text reference, kept so round-trip ASR can compute CER/WER on
-                # the *answer* audio domain (zh and en) without re-reading the
-                # 5.7 GB parquet.
-                "answer_text": item.get("answer_text", ""),
-            }
-        )
-        stats["kept"] += 1
-
-    for split in ("train", "dev"):
-        subset = [r for r in rows if r["split"] == split]
-        manifest = output / f"{split}.jsonl"
-        with manifest.open("w", encoding="utf-8") as handle:
-            for row in subset:
-                handle.write(json.dumps({k: v for k, v in row.items() if k != "split"},
-                                        ensure_ascii=False) + "\n")
-        print(f"{split}: {len(subset)} rows -> {manifest}")
-
-    metadata = {
-        "source_parquet": str(parquet_path),
-        "codec_type": args.codec_type,
-        "codec_model": args.codec_model,
-        "num_codebooks": num_codebooks,
-        "codebook_size": codebook_size,
-        "lang": args.lang,
-        "stats": stats,
-    }
-    (output / "metadata.json").write_text(
-        json.dumps(metadata, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
-    )
-    print(json.dumps(stats, ensure_ascii=False))
+    if len(rows) < 2:
+        raise SystemExit("need at least two valid pairs for nonempty train/dev; inspect output artifacts")
+    split_at = max(1, len(rows) - args.dev_rows)
+    for split, subset in (("train", rows[:split_at]), ("dev", rows[split_at:])):
+        (output / f"{split}.jsonl").write_text(
+            "".join(json.dumps(row, ensure_ascii=False) + "\n" for row in subset), encoding="utf-8")
+        print(f"{split}: {len(subset)} rows")
+    metadata = dict(source_parquet=str(parquet_path), codec_type="mimi", num_codebooks=8,
+                    codebook_size=2048, input_type="sensevoice_waveform", stats=stats)
+    (output / "metadata.json").write_text(json.dumps(metadata, indent=2) + "\n")
+    print(json.dumps(stats))
 
 
 if __name__ == "__main__":

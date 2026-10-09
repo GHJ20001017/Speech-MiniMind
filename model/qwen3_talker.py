@@ -2,7 +2,8 @@
 
 Audio inputs are [batch, time, 8], with PAD2049 denoting an inactive stream.
 Codec IDs are 0..2047; STOP2050 is fed back; input/output vocabularies are 2112.
-The module never feeds audio embeddings into the Thinker.
+The default path keeps the Thinker text-only. Optional explicitly masked speech
+embeddings condition its prefix independently of generated answer audio feedback.
 """
 from __future__ import annotations
 
@@ -108,7 +109,7 @@ class TalkerModule(nn.Module):
 
 
 class Qwen3ThinkerTalker(nn.Module):
-    """Text-only Thinker with a differentiable middle-layer semantic bridge.
+    """Thinker with optional speech slots and differentiable semantic bridge.
 
     ``thinker`` may be Qwen3ForCausalLM or its Qwen3Model decoder. Returned
     caches are a pair of independent Transformers Cache instances. An attention
@@ -166,7 +167,8 @@ class Qwen3ThinkerTalker(nn.Module):
                     bridge_layer=self.bridge_layer, adapter_rank=self.adapter_rank)
 
     def forward_streams(self, input_ids, audio_inputs, attention_mask=None,
-                        past_key_values=None, use_cache=False):
+                        past_key_values=None, use_cache=False, speech_embeddings=None,
+                        speech_mask=None):
         if (input_ids.ndim != 2 or input_ids.dtype not in _INTEGER_DTYPES
                 or not all(input_ids.shape)):
             raise ValueError("input_ids must be nonempty integer [batch, time]")
@@ -202,6 +204,22 @@ class Qwen3ThinkerTalker(nn.Module):
         if use_cache and self.training and (getattr(self._thinker_decoder, "gradient_checkpointing", False)
                                             or getattr(self.audio_streams.decoder, "gradient_checkpointing", False)):
             raise ValueError("use_cache is incompatible with training gradient checkpointing")
+        thinker_inputs = {"input_ids": input_ids}
+        if (speech_embeddings is None) != (speech_mask is None):
+            raise ValueError("speech_embeddings and speech_mask must be supplied together")
+        if speech_embeddings is not None:
+            if (speech_embeddings.shape != (*input_ids.shape, self.config.hidden_size)
+                    or speech_embeddings.device != input_ids.device
+                    or speech_mask.shape != input_ids.shape or speech_mask.dtype != torch.bool
+                    or speech_mask.device != input_ids.device or not speech_mask.any()
+                    or not torch.isfinite(speech_embeddings).all()):
+                raise ValueError("invalid speech embeddings or boolean slot mask")
+            if cached_length or (attention_mask is not None and
+                                 (speech_mask & ~attention_mask[:, -input_ids.shape[1]:].bool()).any()):
+                raise ValueError("speech slots must be attended, uncached prefix positions")
+            embeddings = self.get_input_embeddings()(input_ids)
+            thinker_inputs = {"inputs_embeds": torch.where(
+                speech_mask.unsqueeze(-1), speech_embeddings.to(embeddings.dtype), embeddings)}
         # Validate all audio inputs before either mutable KV cache is advanced.
         codec = self.audio_streams.embed_audio(audio_inputs)
         pre_norm = []
@@ -212,7 +230,7 @@ class Qwen3ThinkerTalker(nn.Module):
                 lambda module, args: pre_norm.append(args[0]))
         try:
             text = self._thinker_decoder(
-                input_ids=input_ids, attention_mask=attention_mask,
+                **thinker_inputs, attention_mask=attention_mask,
                 past_key_values=thinker_cache, use_cache=use_cache,
                 output_hidden_states=True, return_dict=True,
             )
