@@ -344,19 +344,52 @@ CUDA_VISIBLE_DEVICES=6,7 torchrun --standalone --nproc_per_node=2 trainer/train_
   --wandb --wandb-project Speech-MiniMind --wandb-name s2s_all
 ```
 
-### 5. 真实语音到语音推理
+第二阶段训练过程中的 loss 曲线（仅供参考）：
 
-完整路径为 **问题波形 → 冻结 SenseVoice → 连续特征投影 → Thinker 回答文本 / Talker 回答 Mimi 码 → 冻结 Mimi 解码波形**，不是 ASR 文本级联或外部 TTS。必须先训练新前端；S2A epoch006 不能直接作为可理解语音的模型使用。
+| train/text_loss | train/audio_loss |
+|:---:|:---:|
+| ![Thinker–Talker 第二阶段文本损失](assets/s2s_all_text_loss.png) | ![Thinker–Talker 第二阶段音频损失](assets/s2s_all_audio_loss.png) |
+
+### 5. 真实语音到语音推理
 
 ```bash
 python scripts/infer_thinker_talker_s2s.py \
-  --audio examples/disgusted_to_happy.wav \
+  --audio examples/real_question_financial_privacy.wav \
   --checkpoint outputs/s2s_all/model_epoch_003 \
   --encoder /path/to/SenseVoiceSmall --mimi-model /path/to/mimi \
   --device cuda:0 --max-new-frames 500 --max-text-tokens 512 \
   --output outputs/s2s_answer
 ```
 
+
+#### S2S交互示例
+
+<table>
+<tr>
+<td width="50%" valign="top">
+<strong>天空为什么是蓝色的</strong>
+
+https://github.com/user-attachments/assets/2e9b794f-f97e-4295-bec9-1da57899a4b6
+
+</td>
+<td width="50%" valign="top">
+<strong>煮鸡蛋需要多久</strong>
+
+https://github.com/user-attachments/assets/54a555be-1367-4614-8805-51dd8edcf86c
+
+</td>
+</tr>
+</table>
+
+## 项目总结
+
+目前，我们已经打通了完整的训练流程，实现了一个初步的 Omni 模型：能“听”、能“说”，也能“回答”。不过，从实际生成效果来看，音质、音频与文字的一致性，以及吞字、漏词等方面仍有改进空间。
+
+1. **音质与杂音**：部分生成语音中仍能听到杂音。训练数据本身的清晰度和质量不够理想，是可能影响音质的因素之一，后续还需要进一步提升数据质量。
+2. **音频与文字的对应**：我们没有采用 Moshi 式的基于时间戳的文本—语音显式对齐，而是让模型在训练中自行学习文本语义与音频 Codec Token 之间的隐式对应关系。这让数据处理简单了很多，但生成语音能否准确对应文本，也更依赖模型学到的对齐能力。
+3. **吞字与生成节奏**：Qwen Omni 已经考虑到文本与语音生成节奏不一致的问题，并采用了相应的方法来改善两者的协调。同一段内容在文本侧和音频侧所需的 Token 数量、推进粒度差异很大，因此在我们当前的实现中，可能出现文本已经生成完毕，音频却还在表达前半部分的情况。这种节奏差异本身不等于吞字，但对齐不充分时，可能伴随漏词、重复或不连贯。后续可以探索 Moshi 式的显式对齐，或在统一时间轴上调度文本与语音 Token，通过控制两者的推进比例来改善同步。
+
+接下来，我们会在另一个端到端全双工项目中继续探索这些方向并开展训练，欢迎关注：[Full-Duplex-Model](https://github.com/GHJ20001017/Full-Duplex-Model)。
 
 ## 😊 鸣谢
 
